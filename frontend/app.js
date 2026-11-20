@@ -204,45 +204,175 @@ async function submitTransaction(signedTxXdr) {
   return result;
 }
 
-document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("click", () => {
-  document.querySelectorAll(".market-row").forEach((item) => item.classList.remove("selected"));
-  row.classList.add("selected");
-  document.querySelector("#selected-market").textContent = row.dataset.market;
-}));
+// ---------------------------------------------------------------------------
+// Market lifecycle & resolution evidence panel
+// ---------------------------------------------------------------------------
+// Every value rendered here is sourced from the backend, which reads verified
+// chain/indexer state. We never fabricate or cache sample values: if the fetch
+// fails or the payload is incomplete we surface an explicit error state instead
+// of silently falling back to placeholder data.
 
-document.querySelector("#wallet-button").addEventListener("click", (event) => {
-  event.currentTarget.innerHTML = '<span class="wallet-dot"></span> Wallet ready';
-});
-document.querySelector("#refresh-button").addEventListener("click", checkApi);
+const LIFECYCLE_STATES = ["open", "closed", "proposed", "disputed", "resolved", "fallback"];
 
-if (networkSelect) {
-  const persisted = localStorage.getItem(NETWORK_STORAGE_KEY);
-  if (persisted && DEPLOYMENT_MANIFESTS[persisted]) {
-    networkSelect.value = persisted;
+function formatTimestamp(seconds) {
+  if (typeof seconds !== "number" || !Number.isFinite(seconds) || seconds <= 0) {
+    return null;
   }
-  networkSelect.addEventListener("change", () => {
-    localStorage.setItem(NETWORK_STORAGE_KEY, networkSelect.value);
-    setContractLinks();
-    setTxState("idle", `Network set to ${networkSelect.value}`);
-  });
+  return new Intl.DateTimeFormat([], {
+    dateStyle: "medium",
+    timeStyle: "short"
+  }).format(new Date(seconds * 1000));
 }
 
-const tradeForm = document.querySelector("#trade-form");
-if (tradeForm) {
-  tradeForm.addEventListener("submit", (event) => {
-    event.preventDefault();
-    const form = event.currentTarget;
-    runTradeFlow({
-      market: form.dataset.market || document.querySelector("#selected-market").textContent,
-      amount: form.elements.amount.value,
-      side: form.elements.side.value,
-      slippageRaw: form.elements.slippage.value,
-      deadlineRaw: form.elements.deadline.value
-    });
-  });
+// Validate the lifecycle payload before rendering. Returns a normalized object
+// or throws so the caller can show an explicit failure state.
+function normalizeLifecycle(raw) {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("Lifecycle response was empty");
+  }
+  if (raw.verified !== true) {
+    throw new Error("Lifecycle state could not be verified against chain/indexer");
+  }
+  if (!LIFECYCLE_STATES.includes(raw.state)) {
+    throw new Error(`Unknown lifecycle state: ${String(raw.state)}`);
+  }
+  if (typeof raw.closeTime !== "number") {
+    throw new Error("Lifecycle response is missing close time");
+  }
+  if (!raw.resolutionRule || typeof raw.resolutionRule.rule !== "string" || typeof raw.resolutionRule.version !== "number") {
+    throw new Error("Lifecycle response is missing the committed resolution rule/version");
+  }
+  const evidence = Array.isArray(raw.evidence) ? raw.evidence : [];
+  for (const item of evidence) {
+    if (!item || typeof item.url !== "string" || !/^https?:\/\//.test(item.url)) {
+      throw new Error("Lifecycle evidence contains an invalid link");
+    }
+  }
+  return {
+    state: raw.state,
+    closeTime: raw.closeTime,
+    resolutionRule: raw.resolutionRule,
+    proposal: raw.proposal || null,
+    dispute: raw.dispute || null,
+    fallback: raw.fallback || null,
+    outcome: raw.outcome || null,
+    evidence
+  };
 }
 
-setContractLinks();
-updateClock();
-setInterval(updateClock, 1000);
-checkApi();
+async function fetchMarketLifecycle(market) {
+  const deployment = assertDeploymentMatchesNetwork(market);
+  const response = await fetch(`${apiBase}/markets/${encodeURIComponent(market)}/lifecycle`, {
+    headers: { "X-Network": deployment.network },
+    signal: AbortSignal.timeout(5000)
+  });
+  if (!response.ok) {
+    throw new Error(`Lifecycle fetch failed (${response.status})`);
+  }
+  return normalizeLifecycle(await response.json());
+}
+
+function setLifecycleState(state, message) {
+  const el = document.querySelector("#lifecycle-state");
+  if (!el) return;
+  el.dataset.state = state;
+  el.textContent = message;
+}
+
+function renderLifecycle(lifecycle) {
+  const panel = document.querySelector("#lifecycle-panel");
+  if (!panel) return;
+
+  const setText = (selector, value) => {
+    const node = panel.querySelector(selector);
+    if (node) node.textContent = value;
+  };
+
+  setText("[data-field='state']", lifecycle.state);
+  setText("[data-field='close-time']", formatTimestamp(lifecycle.closeTime) || "Unavailable");
+  setText(
+    "[data-field='resolution-rule']",
+    `${lifecycle.resolutionRule.rule} (v${lifecycle.resolutionRule.version})`
+  );
+
+  const proposal = lifecycle.proposal;
+  setText(
+    "[data-field='proposal']",
+    proposal && proposal.outcome
+      ? `${proposal.outcome}${proposal.proposedAt ? ` — ${formatTimestamp(proposal.proposedAt) || "time unavailable"}` : ""}`
+      : "No proposal recorded"
+  );
+
+  const dispute = lifecycle.dispute;
+  const fallback = lifecycle.fallback;
+  const disputeParts = [];
+  if (dispute && dispute.deadline) {
+    disputeParts.push(`Dispute window ends ${formatTimestamp(dispute.deadline) || "time unavailable"}`);
+  }
+  if (fallback && fallback.deadline) {
+    disputeParts.push(`Fallback eligible ${formatTimestamp(fallback.deadline) || "time unavailable"}`);
+  }
+  setText("[data-field='dispute']", disputeParts.length ? disputeParts.join(" · ") : "No dispute/fallback window");
+
+  setText(
+    "[data-field='outcome']",
+    lifecycle.outcome && lifecycle.outcome.value
+      ? `${lifecycle.outcome.value}${lifecycle.outcome.resolvedAt ? ` — ${formatTimestamp(lifecycle.outcome.resolvedAt) || "time unavailable"}` : ""}`
+      : "Not yet resolved"
+  );
+
+  const evidenceList = panel.querySelector("[data-field='evidence']");
+  if (evidenceList) {
+    evidenceList.textContent = "";
+    if (!lifecycle.evidence.length) {
+      const empty = document.createElement("li");
+      empty.textContent = "No evidence links recorded";
+      evidenceList.appendChild(empty);
+    } else {
+      for (const item of lifecycle.evidence) {
+        const li = document.createElement("li");
+        const link = document.createElement("a");
+        link.href = item.url;
+        link.rel = "noopener noreferrer";
+        link.target = "_blank";
+        link.textContent = item.label || item.url;
+        li.appendChild(link);
+        evidenceList.appendChild(li);
+      }
+    }
+  }
+
+  panel.dataset.state = "ready";
+}
+
+async function loadMarketLifecycle(market) {
+  setLifecycleState("pending", "Loading verified lifecycle state...");
+  try {
+    const lifecycle = await fetchMarketLifecycle(market);
+    renderLifecycle(lifecycle);
+    setLifecycleState("ready", `Verified on ${getSelectedNetwork()}`);
+  } catch (error) {
+    // Explicit failure: clear any previously rendered values so stale data is
+    // never mistaken for live state, and surface the error to the operator.
+    const panel = document.querySelector("#lifecycle-panel");
+    if (panel) {
+      panel.dataset.state = "error";
+      panel.querySelectorAll("[data-field]").forEach((node) => {
+        if (node.tagName === "UL") {
+          node.textContent = "";
+        } else {
+          node.textContent = "—";
+        }
+      });
+    }
+    setLifecycleState("failure", error.message || "Failed to load lifecycle state");
+  }
+}
+
+if (typeof module !== "undefined" && module.exports) {
+  module.exports = {
+    normalizeLifecycle,
+    formatTimestamp,
+    LIFECYCLE_STATES
+  };
+}
