@@ -48,6 +48,8 @@ const traceViewer = {
   state: TRACE_STATES.idle,
   traceId: null,
   content: null,
+  provenance: null,
+  verification: null,
   message: "",
   attempts: 0
 };
@@ -58,18 +60,66 @@ function setTraceState(state, message) {
   renderTraceViewer();
 }
 
+// Provenance fields we surface. These are descriptive metadata only; a valid
+// signature proves integrity/authenticity of the payload, NOT that the
+// strategy is economically sound.
+const PROVENANCE_FIELDS = [
+  ["registry", "Registry"],
+  ["agent", "Agent"],
+  ["key_identity", "Key identity"],
+  ["hash", "Hash"],
+  ["schema_version", "Schema version"]
+];
+
+function renderProvenance(container, provenance) {
+  container.textContent = "";
+  if (!provenance) return;
+  const dl = document.createElement("dl");
+  dl.className = "trace-provenance";
+  PROVENANCE_FIELDS.forEach(([key, label]) => {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    const value = provenance[key];
+    dd.textContent = value === undefined || value === null || value === "" ? "—" : String(value);
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  });
+  container.appendChild(dl);
+}
+
+function renderVerification(container, verification) {
+  container.textContent = "";
+  if (!verification) return;
+  const badge = document.createElement("span");
+  badge.className = "trace-verification";
+  badge.dataset.result = verification.result;
+  badge.textContent = verification.result === "verified" ? "Signature verified" : "Signature verification failed";
+  container.appendChild(badge);
+  const note = document.createElement("p");
+  note.className = "trace-verification-note";
+  note.textContent = "A valid signature proves payload integrity and signer identity only; it does not imply the strategy is economically sound.";
+  container.appendChild(note);
+}
+
 function renderTraceViewer() {
   const root = document.querySelector("#trace-viewer");
   if (!root) return;
   const status = root.querySelector("#trace-status");
   const body = root.querySelector("#trace-body");
   const retry = root.querySelector("#trace-retry");
+  const provenanceEl = root.querySelector("#trace-provenance");
+  const verificationEl = root.querySelector("#trace-verification");
+  const exportBtn = root.querySelector("#trace-export");
   if (!status || !body) return;
 
   status.dataset.state = traceViewer.state;
   status.textContent = traceViewer.message;
   body.textContent = "";
+  if (provenanceEl) renderProvenance(provenanceEl, traceViewer.provenance);
+  if (verificationEl) renderVerification(verificationEl, traceViewer.verification);
   if (retry) retry.hidden = traceViewer.state !== TRACE_STATES.unavailable && traceViewer.state !== TRACE_STATES.error;
+  if (exportBtn) exportBtn.hidden = traceViewer.state !== TRACE_STATES.verified;
 
   if (traceViewer.state === TRACE_STATES.verified && traceViewer.content) {
     const pre = document.createElement("pre");
@@ -96,9 +146,37 @@ async function verifyTrace(payload) {
   return expected === payload.hash;
 }
 
+// Build an offline-verifiable evidence bundle: the raw payload plus the
+// provenance and verification result, so an operator can re-check the hash
+// and signature without trusting this UI.
+function buildEvidenceExport() {
+  return {
+    trace_id: traceViewer.traceId,
+    exported_at: new Date().toISOString(),
+    provenance: traceViewer.provenance,
+    verification: traceViewer.verification,
+    content: traceViewer.content
+  };
+}
+
+function exportEvidence() {
+  if (traceViewer.state !== TRACE_STATES.verified) return;
+  const blob = new Blob([JSON.stringify(buildEvidenceExport(), null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `trace-evidence-${traceViewer.traceId || "unknown"}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
 async function loadTrace(traceId, { retry = false } = {}) {
   traceViewer.traceId = traceId;
   traceViewer.content = null;
+  traceViewer.provenance = null;
+  traceViewer.verification = null;
   traceViewer.attempts = retry ? traceViewer.attempts + 1 : 0;
   if (retry) setTraceState(TRACE_STATES.retrying, `Retrying trace fetch (attempt ${traceViewer.attempts + 1})…`);
   else setTraceState(TRACE_STATES.idle, "Requesting trace…");
@@ -143,11 +221,15 @@ async function loadTrace(traceId, { retry = false } = {}) {
     ok = false;
   }
   if (!ok) {
+    traceViewer.provenance = payload && payload.provenance ? payload.provenance : null;
+    traceViewer.verification = { result: "failed" };
     setTraceState(TRACE_STATES.invalid, "Trace failed hash/signature verification; content withheld.");
     return;
   }
 
   traceViewer.content = payload.content;
+  traceViewer.provenance = payload.provenance || null;
+  traceViewer.verification = { result: "verified" };
   setTraceState(TRACE_STATES.verified, "Verified trace content.");
 }
 
@@ -166,6 +248,10 @@ if (traceRetry) {
   traceRetry.addEventListener("click", () => {
     if (traceViewer.traceId) loadTrace(traceViewer.traceId, { retry: true });
   });
+}
+const traceExport = document.querySelector("#trace-export");
+if (traceExport) {
+  traceExport.addEventListener("click", exportEvidence);
 }
 renderTraceViewer();
 // ------------------------------------------------------------------------

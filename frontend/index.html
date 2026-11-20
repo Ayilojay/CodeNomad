@@ -70,6 +70,25 @@
           <p class="trace-viewer-message" id="trace-viewer-message">Enter a trace hash to request the paid trace. Content is shown only after payment and hash/signature verification.</p>
         </div>
         <div class="trace-viewer-content" id="trace-viewer-content" hidden></div>
+        <div class="trace-provenance" id="trace-provenance" hidden aria-labelledby="trace-provenance-title">
+          <div class="section-heading compact">
+            <div><p class="eyebrow">Provenance</p><h3 id="trace-provenance-title">Trace provenance &amp; verification</h3></div>
+            <span class="provenance-source" id="trace-provenance-source" data-source="unknown">Unknown source</span>
+          </div>
+          <dl class="provenance-grid" id="trace-provenance-grid">
+            <div class="provenance-item"><dt>Registry</dt><dd id="provenance-registry">—</dd></div>
+            <div class="provenance-item"><dt>Agent</dt><dd id="provenance-agent">—</dd></div>
+            <div class="provenance-item"><dt>Key identity</dt><dd id="provenance-key">—</dd></div>
+            <div class="provenance-item"><dt>Trace hash</dt><dd id="provenance-hash">—</dd></div>
+            <div class="provenance-item"><dt>Schema version</dt><dd id="provenance-schema">—</dd></div>
+            <div class="provenance-item"><dt>Signature</dt><dd id="provenance-signature" data-state="unknown">—</dd></div>
+          </dl>
+          <p class="provenance-disclaimer" id="provenance-disclaimer">A valid signature proves the trace was authored by the listed key and matches the on-chain hash. It does not prove the strategy is economically sound.</p>
+          <div class="provenance-actions">
+            <button class="text-button" id="provenance-export" type="button" disabled>Export evidence <span aria-hidden="true">↓</span></button>
+            <span class="provenance-export-note" id="provenance-export-note">Export is available only after verification succeeds.</span>
+          </div>
+        </div>
       </section>
     </main>
     <footer><span>ORACLE<span class="footer-accent">DESK</span> · AUTONOMOUS MARKETS</span><span>Built on Stellar / Soroban</span></footer>
