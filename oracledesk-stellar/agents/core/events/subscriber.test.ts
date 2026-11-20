@@ -162,3 +162,50 @@ test("filters beyond the RPC limits are rejected up front", async () => {
     /page limit/,
   );
 });
+
+test("event-driven wakeups drain the same poll path and keep periodic reconciliation", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  const id = s.rpc.emit(trade(1n, 1n, 1_001));
+  // A subscription notification wakes the loop; it must reuse pollOnce so the
+  // cursor/ack semantics are identical to the periodic reconciliation path.
+  assert.equal(await s.sub.wake(), 1);
+  assert.deepEqual(s.batches.flat().map((e) => e.id), [id]);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_001);
+  // A wake with nothing new is a no-op and does not disturb the checkpoint.
+  assert.equal(await s.sub.wake(), 0);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_001);
+});
+
+test("a dropped subscription falls back to polling and resumes from the persisted cursor", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  s.rpc.emit(trade(1n, 1n, 1_001));
+  await s.sub.wake();
+  // Simulate a disconnect: the subscription is gone, but the cursor is persisted.
+  s.sub.onDisconnect("stream closed");
+  s.rpc.emit(trade(1n, 2n, 1_002));
+  // Polling fallback still delivers the event that arrived while disconnected.
+  assert.equal(await s.sub.pollOnce(), 1);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_002);
+  assert.equal(s.batches.flat().length, 2);
+});
+
+test("duplicate wakeups for the same ledger/event identity are delivered once", async () => {
+  const checkpoints = new MemoryCheckpointStore();
+  const rpc = await FakeEventsRpc.create();
+  const seen: string[] = [];
+  const run = async () => {
+    const lru = new ProcessedLru(100, (await checkpoints.load()).processed);
+    const dispatcher = new Dispatcher({ lru, handlers: [{ name: "count", kinds: ["Trade"], handle: async (e) => void seen.push(e.id) }] });
+    return new EventSubscriber({ rpc, decoder: await testDecoder(), checkpoints, onBatch: (e) => dispatcher.dispatch(e), onResync: async () => undefined, processedIds: () => lru.toJSON() });
+  };
+  const sub = await run();
+  await sub.pollOnce();
+  const id = rpc.emit(trade(1n, 1n, 1_001));
+  // Two wakeups race for the same event (e.g. subscription + reconciliation).
+  await sub.wake();
+  await sub.wake();
+  assert.deepEqual(seen, [id]);
+  assert.ok(checkpoints.saved.processed.includes(id));
+});
