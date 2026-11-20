@@ -25,6 +25,16 @@ services:
       X402_LOCK_TTL_MS: "30000"
       X402_LOCK_WAIT_MS: "1000"
       X402_RESULT_TTL_MS: "600000"
+      # Rate limiting: per-client and global limits (requests per window).
+      # Client identity is derived from the immediate peer address unless that
+      # peer is listed in X402_TRUSTED_PROXIES, in which case the right-most
+      # untrusted hop of X-Forwarded-For is used. Arbitrary forwarded headers
+      # from untrusted peers are ignored.
+      X402_RATE_LIMIT_ENABLED: "true"
+      X402_RATE_LIMIT_WINDOW_MS: "60000"
+      X402_RATE_LIMIT_PER_CLIENT: "120"
+      X402_RATE_LIMIT_GLOBAL: "2000"
+      X402_TRUSTED_PROXIES: ""
       LOG_LEVEL: info
       PORT: "3000"
       METRICS_PORT: "9090"
@@ -51,6 +61,16 @@ services:
       X402_LOCK_TTL_MS: "30000"
       X402_LOCK_WAIT_MS: "1000"
       X402_RESULT_TTL_MS: "600000"
+      # Rate limiting: per-client and global limits (requests per window).
+      # Client identity is derived from the immediate peer address unless that
+      # peer is listed in X402_TRUSTED_PROXIES, in which case the right-most
+      # untrusted hop of X-Forwarded-For is used. Arbitrary forwarded headers
+      # from untrusted peers are ignored.
+      X402_RATE_LIMIT_ENABLED: "true"
+      X402_RATE_LIMIT_WINDOW_MS: "60000"
+      X402_RATE_LIMIT_PER_CLIENT: "120"
+      X402_RATE_LIMIT_GLOBAL: "2000"
+      X402_TRUSTED_PROXIES: ""
       LOG_LEVEL: info
       PORT: "3001"
       METRICS_PORT: "9091"
