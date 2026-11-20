@@ -2,9 +2,11 @@
   "name": "codenomad-frontend",
   "version": "0.1.0",
   "private": true,
+  "description": "CodeNomad frontend with explicit network selection (local, testnet, future networks)",
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.js",
+    "test": "node --test test/"
   },
   "engines": {
     "node": ">=18"

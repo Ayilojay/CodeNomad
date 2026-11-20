@@ -4,6 +4,23 @@ User-facing surfaces for CodeNomad. This package consumes the generated
 bindings in `packages/bindings/*` — it never hardcodes contract addresses,
 quotes, or sample values as live data.
 
+## Network selection (#107)
+
+The frontend exposes an explicit network selector with `local`, `testnet`, and
+future networks. There is no implicit default that silently falls back after an
+error — the selected network is always shown and must be chosen deliberately.
+
+- **Configuration from manifests.** Contract and RPC configuration is loaded
+  from validated deployment manifests, never from hardcoded addresses. A
+  manifest that fails validation is rejected and surfaced as an error.
+- **Network-scoped state.** Caches and wallet state are keyed by the selected
+  network. Switching networks does not leak quotes, balances, or wallet state
+  across networks.
+- **Transaction guard.** Transactions are blocked when the deployment addresses
+  in the active manifest do not match the selected network. The mismatch is
+  shown to the user; there is no silent fallback to another network's
+  addresses.
+
 ## Safe transaction flow (#103)
 
 Every trade goes through the same guarded pipeline. Do not bypass any step.
@@ -34,3 +51,8 @@ Before testnet use, verify against localnet or deterministic fixtures:
 - A failing simulation blocks the signature request and shows a failure state.
 - A successful flow shows pending, then success; a rejected signature shows
   failure without claiming success.
+- Selecting each network loads configuration from its validated manifest; an
+  invalid manifest is rejected rather than silently ignored.
+- Switching networks clears network-scoped caches and wallet state.
+- A transaction is blocked when deployment addresses do not match the selected
+  network.

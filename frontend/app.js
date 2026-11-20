@@ -1,25 +1,72 @@
-const deployment = {
-  market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
-  reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+// Validated deployment manifests keyed by network. Contract/RPC configuration is
+// loaded from here instead of being hardcoded, so each network resolves its own
+// addresses and endpoints. Unknown networks have no manifest and are blocked.
+const DEPLOYMENT_MANIFESTS = {
+  local: {
+    network: "local",
+    explorer: "https://stellar.expert/explorer/testnet/contract/",
+    rpcUrl: "http://localhost:8000/soroban/rpc",
+    contracts: {
+      market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+    }
+  },
+  testnet: {
+    network: "testnet",
+    explorer: "https://stellar.expert/explorer/testnet/contract/",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    contracts: {
+      market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+    }
+  }
 };
 
-const explorer = "https://stellar.expert/explorer/testnet/contract/";
+const NETWORK_STORAGE_KEY = "oracledeskNetwork";
 const apiBase = localStorage.getItem("oracledeskApiUrl") || "http://localhost:3000";
 const clock = document.querySelector("#clock");
 const apiStatus = document.querySelector("#api-status");
+const networkSelect = document.querySelector("#network-select");
 
 // Bounds for user-supplied trade parameters. Values outside these ranges are rejected
 // rather than silently clamped so the user always knows what they signed.
 const SLIPPAGE_BOUNDS = { min: 0, max: 5000 }; // basis points (0% - 50%)
 const DEADLINE_BOUNDS = { min: 30, max: 3600 }; // seconds
 
+// Resolve the active network from the selector, falling back to the persisted
+// choice. Returns null when the network has no validated manifest.
+function getSelectedNetwork() {
+  const raw = (networkSelect && networkSelect.value) || localStorage.getItem(NETWORK_STORAGE_KEY) || "local";
+  return DEPLOYMENT_MANIFESTS[raw] ? raw : null;
+}
+
+function getDeployment() {
+  const network = getSelectedNetwork();
+  return network ? DEPLOYMENT_MANIFESTS[network] : null;
+}
+
+// Scope caches and wallet state by network so switching networks never reuses
+// addresses or signatures from a different chain.
+function networkScopedKey(key) {
+  const network = getSelectedNetwork() || "unselected";
+  return `${key}:${network}`;
+}
+
 function updateClock() {
   clock.textContent = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date());
 }
 
 function setContractLinks() {
-  document.querySelector("#market-link").href = explorer + deployment.market_core;
-  document.querySelector("#registry-link").href = explorer + deployment.reasoning_registry;
+  const deployment = getDeployment();
+  const marketLink = document.querySelector("#market-link");
+  const registryLink = document.querySelector("#registry-link");
+  if (!deployment) {
+    marketLink.removeAttribute("href");
+    registryLink.removeAttribute("href");
+    return;
+  }
+  marketLink.href = deployment.explorer + deployment.contracts.market_core;
+  registryLink.href = deployment.explorer + deployment.contracts.reasoning_registry;
 }
 
 async function checkApi() {
@@ -92,8 +139,23 @@ function setTxState(state, message) {
   el.textContent = message;
 }
 
+// Block transactions when the selected network has no validated deployment
+// manifest or when the market address does not belong to that network.
+function assertDeploymentMatchesNetwork(market) {
+  const deployment = getDeployment();
+  if (!deployment) {
+    throw new Error("No validated deployment for the selected network; transactions are blocked");
+  }
+  const known = Object.values(deployment.contracts);
+  if (market && !known.includes(market)) {
+    throw new Error(`Market ${market} does not match the ${deployment.network} deployment; transactions are blocked`);
+  }
+  return deployment;
+}
+
 async function runTradeFlow({ market, amount, side, slippageRaw, deadlineRaw }) {
   try {
+    const deployment = assertDeploymentMatchesNetwork(market);
     const slippageBps = parseBoundedInt(slippageRaw, SLIPPAGE_BOUNDS, "Slippage (bps)");
     const deadlineSeconds = parseBoundedInt(deadlineRaw, DEADLINE_BOUNDS, "Deadline (seconds)");
 
@@ -104,7 +166,7 @@ async function runTradeFlow({ market, amount, side, slippageRaw, deadlineRaw }) 
     await simulateTransaction({ quoteId: quote.quoteId, slippageBps, deadlineSeconds });
 
     setTxState("pending", "Awaiting signature...");
-    const signed = await requestSignature({ quoteId: quote.quoteId, slippageBps, deadlineSeconds });
+    const signed = await requestSignature({ quoteId: quote.quoteId, slippageBps, deadlineSeconds, network: deployment.network });
 
     setTxState("pending", "Submitting transaction...");
     const submitted = await submitTransaction(signed);
@@ -152,6 +214,18 @@ document.querySelector("#wallet-button").addEventListener("click", (event) => {
   event.currentTarget.innerHTML = '<span class="wallet-dot"></span> Wallet ready';
 });
 document.querySelector("#refresh-button").addEventListener("click", checkApi);
+
+if (networkSelect) {
+  const persisted = localStorage.getItem(NETWORK_STORAGE_KEY);
+  if (persisted && DEPLOYMENT_MANIFESTS[persisted]) {
+    networkSelect.value = persisted;
+  }
+  networkSelect.addEventListener("change", () => {
+    localStorage.setItem(NETWORK_STORAGE_KEY, networkSelect.value);
+    setContractLinks();
+    setTxState("idle", `Network set to ${networkSelect.value}`);
+  });
+}
 
 const tradeForm = document.querySelector("#trade-form");
 if (tradeForm) {
