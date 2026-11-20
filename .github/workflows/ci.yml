@@ -157,3 +157,25 @@ jobs:
         run: |
           cd agents
           npm run test:chaos
+
+  frontend:
+    name: Frontend (wallet connect + network verification)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Focused package test/build for the wallet connection flow (#102):
+      # connect, public key + network display, network-mismatch rejection,
+      # and clean disconnect. Runs against deterministic fixtures — no
+      # live wallet or network access.
+      - name: frontend — install, test, build
+        run: |
+          cd frontend
+          npm ci
+          npm test
+          npm run build

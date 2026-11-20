@@ -5,8 +5,13 @@ const deployment = {
 
 const explorer = "https://stellar.expert/explorer/testnet/contract/";
 const apiBase = localStorage.getItem("oracledeskApiUrl") || "http://localhost:3000";
+const expectedNetwork = "TESTNET";
 const clock = document.querySelector("#clock");
 const apiStatus = document.querySelector("#api-status");
+const walletButton = document.querySelector("#wallet-button");
+const walletStatus = document.querySelector("#wallet-status");
+
+let walletState = { connected: false, publicKey: null, network: null };
 
 function updateClock() {
   clock.textContent = new Intl.DateTimeFormat([], { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(new Date());
@@ -28,17 +33,91 @@ async function checkApi() {
   }
 }
 
+function shortenKey(key) {
+  return `${key.slice(0, 6)}…${key.slice(-4)}`;
+}
+
+function renderWallet() {
+  if (!walletState.connected) {
+    walletButton.innerHTML = '<span class="wallet-dot"></span> Connect wallet';
+    if (walletStatus) walletStatus.textContent = "No wallet connected";
+    return;
+  }
+  walletButton.innerHTML = `<span class="wallet-dot"></span> ${shortenKey(walletState.publicKey)}`;
+  if (walletStatus) {
+    walletStatus.textContent = `Connected: ${walletState.publicKey} · Network: ${walletState.network}`;
+  }
+}
+
+function resetWallet() {
+  walletState = { connected: false, publicKey: null, network: null };
+  renderWallet();
+}
+
+function showWalletError(message) {
+  resetWallet();
+  if (walletStatus) walletStatus.textContent = message;
+}
+
+async function connectWallet() {
+  const freighter = window.freighterApi;
+  if (!freighter) {
+    showWalletError("Wallet unavailable: install a supported Stellar wallet (Freighter).");
+    return;
+  }
+  try {
+    const allowed = await freighter.isAllowed();
+    if (!allowed) {
+      const granted = await freighter.setAllowed();
+      if (!granted) {
+        showWalletError("Wallet access was not granted.");
+        return;
+      }
+    }
+    const publicKey = await freighter.getPublicKey();
+    if (!publicKey) {
+      showWalletError("Wallet did not return a public key.");
+      return;
+    }
+    const network = await freighter.getNetwork();
+    if (network !== expectedNetwork) {
+      showWalletError(`Network mismatch: wallet is on ${network}, expected ${expectedNetwork}.`);
+      return;
+    }
+    walletState = { connected: true, publicKey, network };
+    renderWallet();
+  } catch (error) {
+    showWalletError(`Wallet connection failed: ${error.message || error}`);
+  }
+}
+
+async function disconnectWallet() {
+  try {
+    if (window.freighterApi && window.freighterApi.disconnect) {
+      await window.freighterApi.disconnect();
+    }
+  } catch {
+    // Ignore disconnect errors; local state is reset regardless.
+  }
+  resetWallet();
+}
+
 document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("click", () => {
   document.querySelectorAll(".market-row").forEach((item) => item.classList.remove("selected"));
   row.classList.add("selected");
   document.querySelector("#selected-market").textContent = row.dataset.market;
 }));
 
-document.querySelector("#wallet-button").addEventListener("click", (event) => {
-  event.currentTarget.innerHTML = '<span class="wallet-dot"></span> Wallet ready';
+walletButton.addEventListener("click", () => {
+  if (walletState.connected) {
+    disconnectWallet();
+  } else {
+    connectWallet();
+  }
 });
 document.querySelector("#refresh-button").addEventListener("click", checkApi);
 setContractLinks();
+renderWallet();
 updateClock();
 setInterval(updateClock, 1000);
 checkApi();

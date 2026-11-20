@@ -4,7 +4,11 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "node server.mjs"
+    "start": "node server.mjs",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "@creit.tech/stellar-wallets-kit": "^1.7.1"
   },
   "engines": {
     "node": ">=18"
