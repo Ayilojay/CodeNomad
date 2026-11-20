@@ -307,3 +307,8 @@ authentic.
 ---
 
 *CodeNomad — ported to Stellar/Soroban.*
+
+## Handsoff notes
+
+<!-- handsoff-issue-122 -->
+- #122: [config] Add schema validation for deployment and environment files
