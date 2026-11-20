@@ -18,6 +18,61 @@ env:
   PYTHON_VERSION: "3.12"
 
 jobs:
+  security:
+    name: Security (secrets, dependencies, artifacts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Secret scanning over the full history. Fixtures must never contain
+      # usable credentials; any finding fails the job. Suppressions live in
+      # .gitleaks.toml with a documented rationale per allowlist entry.
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+
+      # Dependency scanning for the Rust workspace. `cargo audit` reads the
+      # committed Cargo.lock; advisories are surfaced as a hard failure.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit (Rust dependencies)
+        run: cargo audit --file Cargo.lock
+
+      # Dependency scanning for the Node packages. `npm audit` runs against
+      # each committed lockfile; high/critical findings fail the job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: npm audit (Node dependencies)
+        run: |
+          for dir in x402 agents; do
+            (cd "$dir" && npm audit --audit-level=high)
+          done
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
+            (cd "packages/bindings/$pkg" && npm audit --audit-level=high)
+          done
+
+      # Artifact check: every committed lockfile must be present and parseable
+      # so downstream installs are reproducible and auditable.
+      - name: Verify lockfiles are present and parseable
+        run: |
+          test -f Cargo.lock || { echo "::error::Cargo.lock is missing"; exit 1; }
+          for dir in x402 agents; do
+            test -f "$dir/package-lock.json" || { echo "::error::$dir/package-lock.json is missing"; exit 1; }
+            node -e "JSON.parse(require('fs').readFileSync('$dir/package-lock.json','utf8'))"
+          done
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
+            test -f "packages/bindings/$pkg/package-lock.json" || { echo "::error::packages/bindings/$pkg/package-lock.json is missing"; exit 1; }
+            node -e "JSON.parse(require('fs').readFileSync('packages/bindings/$pkg/package-lock.json','utf8'))"
+          done
+
   rust:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest

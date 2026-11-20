@@ -27,10 +27,37 @@ CI verifies reproducibility by:
 
 These checks fail loudly rather than falling back to unpinned versions or silently regenerating lockfiles.
 
+## Security checks
+
+CI runs repository-appropriate security checks on every push and pull request. All checks fail the job on findings; none fall back to a warning-only mode.
+
+### Dependency scanning
+
+- **Node**: `npm audit --audit-level=high` runs against the committed `package-lock.json`.
+- **Rust**: `cargo audit` runs against the committed `Cargo.lock`.
+
+### Secret scanning
+
+- `gitleaks` scans the full repository history for committed credentials.
+
+### Artifact checks
+
+- Build artifacts are produced from the pinned toolchains and lockfiles, and the working tree is asserted clean after the build so no artifact is generated from mutated inputs.
+
+### Suppressions
+
+Any suppression (audit advisory ignore, gitleaks allowlist entry) must be recorded with a rationale:
+
+- **Dependency advisories**: add the advisory ID and a short justification to the audit ignore configuration; remove the entry once the dependency is upgraded.
+- **Secret scanning**: add the path or fingerprint to the gitleaks allowlist only for non-usable test fixtures, with a comment explaining why the value is not a real credential.
+
+Test fixtures must never contain usable credentials. If a fixture needs a credential-shaped value, use an obviously fake placeholder and allowlist it with a rationale.
+
 ### Manual release / operator verification
 
 Before a release, on a clean checkout:
 
 1. Confirm the active tool versions match the pinned files (`rustc --version`, `node --version`, `python --version`).
 2. Run `npm ci` and `cargo build --locked` and confirm both succeed without modifying tracked files (`git status --porcelain` is empty).
-3. For deployment-specific behavior, verify against localnet or deterministic fixtures before testnet use.
+3. Run the dependency and secret scans locally (`npm audit --audit-level=high`, `cargo audit`, `gitleaks detect`) and confirm they pass or that every finding is a documented suppression.
+4. For deployment-specific behavior, verify against localnet or deterministic fixtures before testnet use.

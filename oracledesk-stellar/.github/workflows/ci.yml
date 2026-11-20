@@ -195,3 +195,79 @@ jobs:
             packages/bindings/reasoning-registry/package-lock.json \
             packages/bindings/timelock/package-lock.json \
             packages/bindings/router/package-lock.json
+
+  security:
+    name: Security (deps, secrets, artifacts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "node=$(tr -d '[:space:]' < .nvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.pinned.outputs.node }}
+
+      # Dependency scanning. `cargo audit` reads the committed Cargo.lock and
+      # fails on any advisory not explicitly ignored in .cargo/audit.toml
+      # (each ignore there carries a rationale comment).
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit (Rust dependencies)
+        run: cargo audit --deny warnings
+
+      - name: npm audit (Node dependencies)
+        run: |
+          for dir in x402 agents packages/bindings/market-core packages/bindings/resolver \
+                     packages/bindings/treasury packages/bindings/reasoning-registry \
+                     packages/bindings/timelock packages/bindings/router; do
+            echo "::group::npm audit ($dir)"
+            (cd "$dir" && npm audit --audit-level=high)
+            echo "::endgroup::"
+          done
+
+      # Secret scanning over the full history so a credential that was
+      # committed and later removed is still caught. Suppressions live in
+      # .gitleaks.toml with a rationale per allowlist entry.
+      - name: gitleaks (secret scanning)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Artifact checks: the committed lockfiles must be internally
+      # consistent and the vendored wasm hash pins must match the wasm bytes
+      # that are actually committed. This catches tampered or stale artifacts
+      # without needing a full rebuild.
+      - name: Verify lockfile integrity
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          for dir in x402 agents packages/bindings/market-core packages/bindings/resolver \
+                     packages/bindings/treasury packages/bindings/reasoning-registry \
+                     packages/bindings/timelock packages/bindings/router; do
+            (cd "$dir" && npm ci --ignore-scripts --dry-run > /dev/null)
+          done
+
+      - name: Verify vendored wasm hash pins
+        run: |
+          for pin in \
+            contracts/resolver/market_core.wasm.sha256 \
+            contracts/treasury/market_core.wasm.sha256 \
+            contracts/resolver/reasoning_registry.wasm.sha256; do
+            wasm="${pin%.sha256}"
+            expected=$(tr -d '[:space:]' < "$pin")
+            actual=$(sha256sum "$wasm" | awk '{print $1}')
+            if [ "$expected" != "$actual" ]; then
+              echo "::error file=$wasm::hash pin mismatch (expected $expected, got $actual)"
+              exit 1
+            fi
+          done
