@@ -157,3 +157,15 @@ jobs:
         run: |
           cd agents
           npm run test:chaos
+
+      # Frontend safe transaction flows (#103): quote-before-trade, explicit
+      # slippage/deadline bounds, simulate-before-sign, and pending/success/
+      # failure states. Runs the focused package test/build against the
+      # generated bindings built above; deterministic fixtures, no network.
+      - name: frontend — install, typecheck, test, build
+        run: |
+          cd frontend
+          npm ci
+          npm run typecheck
+          npm test
+          npm run build
