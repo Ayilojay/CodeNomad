@@ -162,3 +162,48 @@ test("filters beyond the RPC limits are rejected up front", async () => {
     /page limit/,
   );
 });
+
+test("stable event keys are derived from contract id and topic structure", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  const id = s.rpc.emit(trade(1n, 1n, 1_001));
+  await s.sub.pollOnce();
+  const event = s.batches.flat().find((e) => e.id === id);
+  assert.ok(event, "the emitted event is delivered");
+  // The id is the RPC-assigned stable key (contract + topics + tx), not a
+  // positional index, so it survives pagination and re-reads unchanged.
+  assert.equal(event.id, id);
+  assert.equal(event.contractId, IDS.market_core);
+});
+
+test("a corrected RPC ledger response re-delivers the event but the LRU suppresses reprocessing", async () => {
+  const checkpoints = new MemoryCheckpointStore();
+  const rpc = await FakeEventsRpc.create();
+  const seen: string[] = [];
+  const run = async () => {
+    const lru = new ProcessedLru(100, (await checkpoints.load()).processed);
+    const dispatcher = new Dispatcher({ lru, handlers: [{ name: "count", kinds: ["Trade"], handle: async (e) => void seen.push(e.id) }] });
+    return new EventSubscriber({ rpc, decoder: await testDecoder(), checkpoints, onBatch: (e) => dispatcher.dispatch(e), onResync: async () => undefined, processedIds: () => lru.toJSON() });
+  };
+  await (await run()).pollOnce();
+  const id = rpc.emit(trade(1n, 1n, 1_001));
+  await (await run()).pollOnce();
+  // RPC corrects its ledger view and the cursor is rewound to re-read the window.
+  checkpoints.saved = { ...checkpoints.saved, cursor: undefined, lastLedger: 1_000 };
+  await (await run()).pollOnce();
+  assert.deepEqual(seen, [id], "the corrected re-read does not double-process");
+});
+
+test("a rewind past the processed LRU window is surfaced as a resync, not silently skipped", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  s.rpc.emit(trade(1n, 1n, 1_001));
+  await s.sub.pollOnce();
+  // The RPC reports a lower latest ledger than the checkpoint (a correction
+  // that rewinds beyond what we can dedupe); the subscriber must resync.
+  s.rpc.latest = 900;
+  s.rpc.oldest = 800;
+  await s.sub.pollOnce();
+  assert.equal(s.resyncs.length, 1);
+  assert.match(s.resyncs[0], /rewind|corrected|behind/i);
+});

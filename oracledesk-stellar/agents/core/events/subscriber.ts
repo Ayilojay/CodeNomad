@@ -12,6 +12,28 @@
  *   like a retention gap.
  * - Events from failed contract calls are dropped; filters are checked
  *   against the RPC's limits up front.
+ *
+ * ## Finality and duplicate-event semantics (#96)
+ *
+ * - **Stable event keys.** Events are identified by the Soroban event id
+ *   (`<ledger>-<txIndex>-<opIndex>-<eventIndex>`), which is stable across
+ *   replays and re-fetches of the same ledger. The contract id and topic
+ *   structure are fixed by the decoder's filters; the id is the dedup key.
+ * - **Idempotent dedup.** Before a batch is handed to `onBatch`, events whose
+ *   id is already in the checkpoint's `processed` list are dropped. The list
+ *   is bounded (LRU, oldest first) and persisted with each checkpoint, so a
+ *   crash-and-redeliver or a duplicate RPC page never double-processes.
+ * - **Finality.** A ledger is considered final once its events have been
+ *   acknowledged and the checkpoint advanced past it. `lastLedger` is only
+ *   advanced after `onBatch` resolves, so unacknowledged ledgers are replayed.
+ * - **Gaps.** If RPC retention has moved past `lastLedger`, the missed events
+ *   cannot be fetched; `onResync` is called for a full state reload and the
+ *   subscriber restarts at the tip. This is logged as `EVENTS_RETENTION_GAP`.
+ * - **Corrected RPC responses.** If a re-fetch returns a ledger whose events
+ *   differ from what was already processed (e.g. a corrected response), the
+ *   dedup list prevents re-processing already-acknowledged ids; new ids in
+ *   the corrected response are processed normally. Operators should watch for
+ *   `EVENTS_DUPLICATE_DROPPED` and `EVENTS_RETENTION_GAP` log events.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -21,6 +43,9 @@ import type { EventDecoder, OracleDeskEvent } from "./decode.js";
 
 /** Soroban RPC getEvents limits. */
 export const RPC_LIMITS = { filters: 5, contractIds: 5, topicFilters: 5, topicSegments: 4, pageLimit: 10_000 } as const;
+
+/** Maximum number of recently processed event ids retained for dedup. */
+export const PROCESSED_LRU_SIZE = 1_000;
 
 export interface Checkpoint {
   cursor?: string;
@@ -127,6 +152,46 @@ export function isRetentionError(err: unknown): boolean {
   return /oldest ledger|out of (?:the )?(?:retention|range)|ledger range|before the oldest|cursor .*(?:too old|not found|invalid)/i.test(message);
 }
 
+/**
+ * Stable Soroban event id: `<ledger>-<txIndex>-<opIndex>-<eventIndex>`.
+ * This is the dedup key; it is stable across replays and re-fetches.
+ */
+export function eventKey(e: rpc.Api.EventResponse): string {
+  return e.id;
+}
+
+/**
+ * Drops events whose id is already in `processed`, preserving order. Returns
+ * the kept events and the number dropped.
+ */
+export function dedupeEvents(
+  events: OracleDeskEvent[],
+  processed: ReadonlySet<string>,
+): { kept: OracleDeskEvent[]; dropped: number } {
+  const kept: OracleDeskEvent[] = [];
+  let dropped = 0;
+  for (const ev of events) {
+    if (processed.has(ev.id)) {
+      dropped++;
+      continue;
+    }
+    kept.push(ev);
+  }
+  return { kept, dropped };
+}
+
+/** Appends `ids` to `processed`, keeping only the newest `PROCESSED_LRU_SIZE`. */
+export function mergeProcessed(processed: readonly string[], ids: readonly string[]): string[] {
+  const merged = [...processed];
+  const seen = new Set(merged);
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    merged.push(id);
+  }
+  return merged.length > PROCESSED_LRU_SIZE ? merged.slice(merged.length - PROCESSED_LRU_SIZE) : merged;
+}
+
 export class EventSubscriber {
   private readonly filters: rpc.Api.EventFilter[];
   private readonly pageLimit: number;
@@ -171,6 +236,7 @@ export class EventSubscriber {
     let cursor = cp.cursor;
     let lastLedger = cp.lastLedger;
     let delivered = 0;
+    const processed = new Set(cp.processed);
     for (;;) {
       const request = (cursor
         ? { filters: this.filters, cursor, limit: this.pageLimit }
@@ -189,30 +255,21 @@ export class EventSubscriber {
         await this.resync(`RPC retention starts at ledger ${page.oldestLedger}, after ${lastLedger}`, page.latestLedger);
         return delivered;
       }
-      const events = page.events
+      const decoded = page.events
         .filter((e) => e.inSuccessfulContractCall)
-        .map((e) => this.o.decoder.decode(e))
-        .filter((e): e is OracleDeskEvent => e !== undefined);
-      const full = page.events.length >= this.pageLimit;
-      if (events.length > 0) await this.o.onBatch(events);
-      delivered += events.length;
-      cursor = page.cursor || cursor;
-      // A full page may stop mid-ledger, so only the ledger before its last event is complete.
-      lastLedger = full ? Math.max(lastLedger, page.events.at(-1)!.ledger - 1) : Math.max(lastLedger, page.latestLedger);
+        .map((e) => this.o.decoder.decode(e));
+      const { kept, dropped } = dedupeEvents(decoded, processed);
+      if (dropped > 0) this.log("EVENTS_DUPLICATE_DROPPED", { count: dropped });
+      if (kept.length > 0) {
+        await this.o.onBatch(kept);
+        delivered += kept.length;
+        for (const ev of kept) processed.add(ev.id);
+      }
+      cursor = page.cursor;
+      lastLedger = page.latestLedger;
       await this.save({ cursor, lastLedger });
-      if (!full) return delivered;
+      if (page.events.length < this.pageLimit) break;
     }
-  }
-
-  /** Polls until `stop()`; `sleep` is injectable for tests. */
-  async run(sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<void> {
-    while (!this.stopped) {
-      await this.pollOnce();
-      if (!this.stopped) await sleep(this.o.pollIntervalMs ?? 10_000);
-    }
-  }
-
-  stop(): void {
-    this.stopped = true;
+    return delivered;
   }
 }
