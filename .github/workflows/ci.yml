@@ -11,8 +11,92 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  # Documented minimum supported toolchain versions. Bump these only when the
+  # README's "Supported toolchains" section is updated in the same PR.
+  MIN_RUST_VERSION: "1.84.0"
+  MIN_NODE_VERSION: "20"
+  MIN_STELLAR_CLI_VERSION: "27.1.0"
+  # Pinned CI toolchain versions (the release toolchain used for determinism).
+  PINNED_RUST_VERSION: "stable"
+  PINNED_NODE_VERSION: "22"
+  PINNED_STELLAR_CLI_VERSION: "27.1.0"
 
 jobs:
+  toolchain-matrix:
+    name: Toolchain matrix (${{ matrix.toolchain }}, rust ${{ matrix.rust }}, node ${{ matrix.node }}, stellar ${{ matrix.stellar }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - toolchain: minimum
+            rust: "1.84.0"
+            node: "20"
+            stellar: "27.1.0"
+          - toolchain: pinned
+            rust: "stable"
+            node: "22"
+            stellar: "27.1.0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          targets: wasm32v1-none
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "oracledesk-stellar -> target"
+
+      - name: Install stellar CLI (${{ matrix.stellar }})
+        run: cargo install --locked stellar-cli --version ${{ matrix.stellar }}
+
+      - name: Assert toolchain versions match the matrix
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          node --version
+          stellar --version
+          # Fail loudly (no silent fallback) if the resolved versions drift
+          # from the matrix entry this job claims to test.
+          if [ "${{ matrix.toolchain }}" = "minimum" ]; then
+            rustc --version | grep -q "${{ matrix.rust }}" || { echo "::error::rustc does not match minimum ${{ matrix.rust }}"; exit 1; }
+            node --version | grep -q "^v${{ matrix.node }}\." || { echo "::error::node does not match minimum ${{ matrix.node }}"; exit 1; }
+          fi
+          stellar --version | grep -q "${{ matrix.stellar }}" || { echo "::error::stellar CLI does not match ${{ matrix.stellar }}"; exit 1; }
+
+      - name: cargo test (toolchain compatibility)
+        run: cargo test --workspace
+
+      - name: Build contracts to wasm
+        run: stellar contract build
+
+      - name: Verify wasm determinism on the pinned release toolchain
+        if: matrix.toolchain == 'pinned'
+        run: |
+          set -euo pipefail
+          cp target/wasm32v1-none/release/market_core.wasm contracts/resolver/market_core.wasm
+          cp target/wasm32v1-none/release/market_core.wasm contracts/treasury/market_core.wasm
+          cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/resolver/reasoning_registry.wasm
+          cp target/wasm32v1-none/release/market_core.wasm contracts/router/market_core.wasm
+          cp target/wasm32v1-none/release/resolver.wasm contracts/router/resolver.wasm
+          cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/router/reasoning_registry.wasm
+          cp target/wasm32v1-none/release/resolver.wasm contracts/treasury/resolver.wasm
+          stellar contract build
+          git diff --exit-code -- \
+            contracts/resolver/market_core.wasm \
+            contracts/treasury/market_core.wasm \
+            contracts/treasury/resolver.wasm \
+            contracts/resolver/reasoning_registry.wasm \
+            contracts/router/market_core.wasm \
+            contracts/router/resolver.wasm \
+            contracts/router/reasoning_registry.wasm
+
   rust:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest

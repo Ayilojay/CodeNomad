@@ -68,6 +68,43 @@ Design decisions with real trade-offs are written up in `docs/adr/`:
 - Python 3.10+ (for `model/fpmm_model.py`'s property tests).
 - `jq` (used by the deploy/seed scripts).
 
+## Supported toolchains
+
+CI runs a toolchain matrix over the documented minimum and the pinned CI
+versions. A combination is **supported** only when every component is at or
+above its minimum; anything below a minimum is reported as unsupported and
+fails the job loudly (no silent fallback to a different toolchain).
+
+| Component    | Minimum (documented) | Pinned CI (release) |
+| ------------ | -------------------- | ------------------- |
+| Rust         | stable               | `rust-toolchain.toml` |
+| Node.js      | 22                   | 22                  |
+| Stellar CLI  | 27                   | 27                  |
+
+- The **minimum** leg exercises the documented floor so we notice when a
+  dependency silently raises it.
+- The **pinned** leg is the supported release toolchain. Generated bindings
+  (`packages/bindings/`) and contract WASM are rebuilt on this leg and diffed
+  against the committed artifacts; any drift fails the job, so bindings and
+  WASM stay deterministic.
+- Unsupported combinations (any component below its minimum) are expected to
+  fail; the matrix asserts that failure explicitly rather than skipping.
+
+### Manual release / operator verification
+
+Before tagging a release or deploying to testnet, an operator should confirm
+on the pinned toolchain:
+
+1. `make build` produces WASM byte-identical to the committed artifacts
+   (rebuild-and-diff, as CI does).
+2. `scripts/gen-bindings.sh` leaves `packages/bindings/` unchanged
+   (`git diff --exit-code packages/bindings`).
+3. `make test` and `make lint` pass on the pinned Rust/Node/Stellar CLI
+   versions above.
+
+Deployment-specific behavior is verified against localnet or deterministic
+fixtures (`make e2e-local`) before any testnet use.
+
 ## Quickstart
 
 ```bash
