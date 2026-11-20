@@ -98,6 +98,8 @@ export async function followTask(d: FollowDeps): Promise<Task & { queue: MarketQ
     decoder,
     checkpoints,
     pageLimit: d.cfg.events.pageLimit,
+    startLedger: d.cfg.events.startLedger,
+    maxBackfillPages: d.cfg.events.maxBackfillPages,
     pollIntervalMs: d.cfg.events.pollIntervalMs,
     onBatch: (events) => dispatcher.dispatch(events),
     // Events were lost: re-evaluate every market the trader could trade.
