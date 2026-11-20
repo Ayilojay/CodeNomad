@@ -143,6 +143,20 @@ jobs:
           npm run build
           npm test
 
+      # Validate the published OpenAPI contract (#88) and run client smoke
+      # tests that exercise the documented routes against deterministic
+      # fixtures. Fails the build if the spec is malformed or drifts from the
+      # routes the server actually serves.
+      - name: x402 — validate OpenAPI contract
+        run: |
+          cd x402
+          npm run openapi:validate
+
+      - name: x402 — OpenAPI client smoke tests
+        run: |
+          cd x402
+          npm run test:openapi
+
       - name: agents — install, typecheck, test
         run: |
           cd agents
