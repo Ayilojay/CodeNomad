@@ -166,3 +166,42 @@ jobs:
           npm install
           npm run build
           npm test
+
+  runbook:
+    name: Ops runbook (incident & recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Issue #124: the incident/recovery runbook is an operational artifact.
+      # This gate keeps it present and complete so operators always have a
+      # verified procedure for containment, key rotation, pausing,
+      # reconciliation, state restore and resumption.
+      - name: Verify incident & recovery runbook is present and complete
+        run: |
+          set -euo pipefail
+          runbook="docs/runbooks/incident-recovery.md"
+          if [ ! -f "$runbook" ]; then
+            echo "::error file=$runbook::Incident & recovery runbook is missing (#124)"
+            exit 1
+          fi
+          required=(
+            "Containment"
+            "Key rotation"
+            "Pausing"
+            "Reconciliation"
+            "State restore"
+            "Resumption"
+            "Evidence preservation"
+          )
+          missing=0
+          for section in "${required[@]}"; do
+            if ! grep -qi "$section" "$runbook"; then
+              echo "::error file=$runbook::Runbook is missing required section: $section (#124)"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+          echo "Runbook present with all required sections."
