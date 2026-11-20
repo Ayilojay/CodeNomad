@@ -68,6 +68,17 @@ export class FakeEventsRpc implements EventsRpc {
   private readonly events: (rpc.Api.EventResponse & { contractRaw: string })[] = [];
   private perLedger = new Map<number, number>();
 
+  /**
+   * Chaos knobs (#65): ambiguous transaction outcomes. When set, the next
+   * `getEvents` call throws (read partition) or the response is withheld
+   * (delayed finality) without advancing the cursor, so retries must be
+   * idempotent and must not re-execute economic actions.
+   */
+  failNextReads = 0;
+  delayNextReads = 0;
+  /** When true, `getLatestLedger` reports a lagging sequence (delayed finality). */
+  lagLatestBy = 0;
+
   constructor(private readonly specs: Record<ContractName, contract.Spec>) {}
 
   static async create(): Promise<FakeEventsRpc> {
@@ -105,12 +116,28 @@ export class FakeEventsRpc implements EventsRpc {
     return id;
   }
 
+  /** Re-emits an existing event id (duplicate delivery) without advancing state. */
+  duplicate(id: string): void {
+    const e = this.events.find((x) => x.id === id);
+    if (!e) throw new Error(`no event ${id}`);
+    this.events.push({ ...e });
+    this.events.sort((a, b) => (a.id < b.id ? -1 : 1));
+  }
+
   async getLatestLedger(): Promise<{ sequence: number }> {
-    return { sequence: this.latest };
+    return { sequence: Math.max(this.oldest, this.latest - this.lagLatestBy) };
   }
 
   async getEvents(request: rpc.Server.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
     this.requests.push(request);
+    if (this.failNextReads > 0) {
+      this.failNextReads -= 1;
+      throw { code: -32000, message: "chaos: read partition" };
+    }
+    if (this.delayNextReads > 0) {
+      this.delayNextReads -= 1;
+      throw { code: -32001, message: "chaos: delayed finality" };
+    }
     const r = request as { cursor?: string; startLedger?: number; limit?: number; filters: rpc.Api.EventFilter[] };
     if (r.startLedger !== undefined && (r.startLedger < this.oldest || r.startLedger > this.latest + 1)) {
       throw { code: -32600, message: `startLedger must be between the oldest ledger: ${this.oldest} and the latest ledger: ${this.latest}` };

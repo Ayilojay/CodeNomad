@@ -162,3 +162,163 @@ test("filters beyond the RPC limits are rejected up front", async () => {
     /page limit/,
   );
 });
+
+// --- Chaos: ambiguous transaction outcomes ---------------------------------
+//
+// These tests model the failure modes an agent faces when a submit/read
+// partition, delayed finality, duplicate events, or a restart during in-flight
+// work make the outcome of an economic action ambiguous. The invariant under
+// test is that retries never cause a duplicate economic action: the persisted
+// processed-id LRU plus the acknowledged-only checkpoint must make every
+// redelivery idempotent.
+
+async function chaosRig() {
+  const checkpoints = new MemoryCheckpointStore();
+  const rpc = await FakeEventsRpc.create();
+  const actions: string[] = [];
+  const run = async () => {
+    const lru = new ProcessedLru(100, (await checkpoints.load()).processed);
+    const dispatcher = new Dispatcher({
+      lru,
+      handlers: [{ name: "economic", kinds: ["Trade"], handle: async (e) => void actions.push(e.id) }],
+    });
+    return new EventSubscriber({
+      rpc,
+      decoder: await testDecoder(),
+      checkpoints,
+      onBatch: (e) => dispatcher.dispatch(e),
+      onResync: async () => undefined,
+      processedIds: () => lru.toJSON(),
+    });
+  };
+  return { rpc, checkpoints, actions, run };
+}
+
+test("chaos: submit succeeds but the read fails, retry does not duplicate the action", async () => {
+  const rig = await chaosRig();
+  await (await rig.run()).pollOnce();
+  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
+  // The submit landed on-chain, but the read that would confirm it fails.
+  const original = rig.rpc.getEvents.bind(rig.rpc);
+  let reads = 0;
+  (rig.rpc as unknown as { getEvents: typeof rig.rpc.getEvents }).getEvents = async (req) => {
+    if (reads++ === 0) throw new Error("read partition");
+    return original(req);
+  };
+  await assert.rejects((await rig.run()).pollOnce(), /read partition/);
+  assert.deepEqual(rig.actions, [], "no action recorded while the read is partitioned");
+  // The partition heals; the retry re-reads the same event exactly once.
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id]);
+  // A further retry (e.g. another ambiguous read) must not re-execute.
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id]);
+});
+
+test("chaos: read succeeds but the submit is ambiguous, retry does not duplicate the action", async () => {
+  const rig = await chaosRig();
+  await (await rig.run()).pollOnce();
+  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
+  // The handler performs the economic action, then the acknowledgement is lost
+  // (submit succeeded but the caller never saw the confirmation).
+  const lru = new ProcessedLru(100, (await rig.checkpoints.load()).processed);
+  let crash = true;
+  const dispatcher = new Dispatcher({
+    lru,
+    handlers: [
+      {
+        name: "economic",
+        kinds: ["Trade"],
+        handle: async (e) => {
+          rig.actions.push(e.id);
+          if (crash) {
+            crash = false;
+            throw new Error("submit ack lost");
+          }
+        },
+      },
+    ],
+  });
+  const sub = new EventSubscriber({
+    rpc: rig.rpc,
+    decoder: await testDecoder(),
+    checkpoints: rig.checkpoints,
+    onBatch: (e) => dispatcher.dispatch(e),
+    onResync: async () => undefined,
+    processedIds: () => lru.toJSON(),
+  });
+  await assert.rejects(sub.pollOnce(), /submit ack lost/);
+  // The retry redelivers the event; the LRU suppresses the duplicate action.
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id], "the economic action ran exactly once");
+});
+
+test("chaos: delayed finality does not cause a duplicate action on retry", async () => {
+  const rig = await chaosRig();
+  await (await rig.run()).pollOnce();
+  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
+  // Confirmation lags: the first poll sees the event but the checkpoint write
+  // is delayed, so the cursor is not advanced and the event is redelivered.
+  const saved = rig.checkpoints.saved;
+  const originalSave = rig.checkpoints.save.bind(rig.checkpoints);
+  let delay = true;
+  rig.checkpoints.save = async (state) => {
+    if (delay) {
+      delay = false;
+      // Simulate a lagging finality: persist the processed ids but not the cursor.
+      await originalSave({ ...state, cursor: saved.cursor, lastLedger: saved.lastLedger });
+      return;
+    }
+    await originalSave(state);
+  };
+  await (await rig.run()).pollOnce();
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id], "delayed finality did not duplicate the action");
+});
+
+test("chaos: duplicate events are handled idempotently", async () => {
+  const rig = await chaosRig();
+  await (await rig.run()).pollOnce();
+  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
+  await (await rig.run()).pollOnce();
+  // The RPC redelivers the same event (duplicate event stream).
+  rig.rpc.emit(trade(1n, 1n, 1_001));
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id], "duplicate events produced a single action");
+});
+
+test("chaos: restart during in-flight work does not re-execute the action", async () => {
+  const rig = await chaosRig();
+  await (await rig.run()).pollOnce();
+  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
+  // The action runs, then the process restarts before the checkpoint is saved.
+  const lru = new ProcessedLru(100, (await rig.checkpoints.load()).processed);
+  const dispatcher = new Dispatcher({
+    lru,
+    handlers: [
+      {
+        name: "economic",
+        kinds: ["Trade"],
+        handle: async (e) => {
+          rig.actions.push(e.id);
+          // Persist the processed id, then crash before the cursor advances.
+          await rig.checkpoints.save({ ...rig.checkpoints.saved, processed: lru.toJSON() });
+          throw new Error("restart during in-flight work");
+        },
+      },
+    ],
+  });
+  const sub = new EventSubscriber({
+    rpc: rig.rpc,
+    decoder: await testDecoder(),
+    checkpoints: rig.checkpoints,
+    onBatch: (e) => dispatcher.dispatch(e),
+    onResync: async () => undefined,
+    processedIds: () => lru.toJSON(),
+  });
+  await assert.rejects(sub.pollOnce(), /restart during in-flight work/);
+  // After the restart the cursor is stale, so the event is redelivered; the
+  // persisted processed ids suppress the duplicate economic action.
+  await (await rig.run()).pollOnce();
+  assert.deepEqual(rig.actions, [id], "restart did not re-execute the action");
+});

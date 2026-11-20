@@ -115,3 +115,204 @@ test("handlers only see the kinds they subscribe to", async () => {
   await new Dispatcher({ handlers: [{ name: "final", kinds: ["MarketResolved"], handle: async () => void (called = true) }] }).dispatch([e]);
   assert.equal(called, false);
 });
+
+// --- Chaos: ambiguous transaction outcomes ---------------------------------
+//
+// These tests model the failure modes an agent sees when a submit succeeds but
+// the read-back (or the reverse) is partitioned, when finality lags, when the
+// event stream duplicates an event, and when the process restarts mid-flight.
+// The invariant under test is that retries never cause a *duplicate economic
+// action*: the handler may be invoked again, but the economic side effect must
+// be applied at most once per event id.
+
+/**
+ * A tiny economic ledger keyed by event id. `apply` is idempotent: a second
+ * application of the same event id is a no-op, mirroring how an on-chain
+ * action keyed by a unique id cannot be re-executed. `attempts` counts every
+ * call so we can prove retries happened without duplicating the effect.
+ */
+class EconomicLedger {
+  readonly applied = new Map<string, bigint>();
+  attempts = 0;
+  apply(id: string, amount: bigint): void {
+    this.attempts++;
+    if (this.applied.has(id)) return;
+    this.applied.set(id, amount);
+  }
+  total(): bigint {
+    let sum = 0n;
+    for (const v of this.applied.values()) sum += v;
+    return sum;
+  }
+}
+
+/**
+ * Simulates a submit/read partition. `submitOk` controls whether the write
+ * lands; `readOk` controls whether the confirmation can be observed. A submit
+ * that lands but whose read fails is the classic ambiguous outcome: the caller
+ * cannot tell success from failure and must retry safely.
+ */
+class PartitionedSubmitter {
+  submitOk = true;
+  readOk = true;
+  submits = 0;
+  reads = 0;
+  async submit(): Promise<{ landed: boolean }> {
+    this.submits++;
+    if (!this.submitOk) throw new Error("submit partition: write rejected");
+    return { landed: true };
+  }
+  async read(): Promise<{ confirmed: boolean }> {
+    this.reads++;
+    if (!this.readOk) throw new Error("read partition: confirmation unavailable");
+    return { confirmed: true };
+  }
+}
+
+test("chaos: submit succeeds but read fails, retry does not duplicate the economic action", async () => {
+  const [e] = await events([[1n, 10]]);
+  const ledger = new EconomicLedger();
+  const net = new PartitionedSubmitter();
+  net.readOk = false; // submit lands, confirmation is partitioned away
+  let attempts = 0;
+  const dispatcher = new Dispatcher({
+    maxAttempts: 4,
+    sleep: noSleep,
+    deadLetterPath: join(mkdtempSync(join(tmpdir(), "dl-")), "dead-letter.jsonl"),
+    handlers: [
+      {
+        name: "settle",
+        kinds: ["Trade"],
+        async handle(ev) {
+          if (ev.kind !== "Trade") return;
+          attempts++;
+          await net.submit();
+          // Read-back is partitioned on the first attempt; the retry observes it.
+          if (attempts === 1) await net.read();
+          ledger.apply(ev.id, ev.collateral);
+        },
+      },
+    ],
+  });
+  await dispatcher.dispatch([e]);
+  assert.equal(attempts, 2, "the ambiguous outcome forced exactly one retry");
+  assert.equal(net.submits, 2, "submit was retried");
+  assert.equal(ledger.applied.size, 1, "only one economic action landed");
+  assert.equal(ledger.total(), e.kind === "Trade" ? e.collateral : 0n);
+});
+
+test("chaos: submit fails but read succeeds, retry does not duplicate the economic action", async () => {
+  const [e] = await events([[1n, 10]]);
+  const ledger = new EconomicLedger();
+  const net = new PartitionedSubmitter();
+  net.submitOk = false; // write is partitioned away, read still answers
+  let attempts = 0;
+  const dispatcher = new Dispatcher({
+    maxAttempts: 4,
+    sleep: noSleep,
+    deadLetterPath: join(mkdtempSync(join(tmpdir(), "dl-")), "dead-letter.jsonl"),
+    handlers: [
+      {
+        name: "settle",
+        kinds: ["Trade"],
+        async handle(ev) {
+          if (ev.kind !== "Trade") return;
+          attempts++;
+          if (attempts === 1) {
+            await assert.rejects(net.submit());
+            return; // no economic action on the failed submit
+          }
+          await net.submit();
+          ledger.apply(ev.id, ev.collateral);
+        },
+      },
+    ],
+  });
+  await dispatcher.dispatch([e]);
+  assert.equal(attempts, 2);
+  assert.equal(ledger.applied.size, 1, "the failed submit did not double-apply");
+});
+
+test("chaos: delayed finality does not duplicate the economic action on retry", async () => {
+  const [e] = await events([[1n, 10]]);
+  const ledger = new EconomicLedger();
+  let attempts = 0;
+  const dispatcher = new Dispatcher({
+    maxAttempts: 4,
+    sleep: noSleep,
+    deadLetterPath: join(mkdtempSync(join(tmpdir(), "dl-")), "dead-letter.jsonl"),
+    handlers: [
+      {
+        name: "settle",
+        kinds: ["Trade"],
+        async handle(ev) {
+          if (ev.kind !== "Trade") return;
+          attempts++;
+          // Confirmation lags: the first attempt times out waiting for finality.
+          if (attempts === 1) throw new Error("finality timeout");
+          ledger.apply(ev.id, ev.collateral);
+        },
+      },
+    ],
+  });
+  await dispatcher.dispatch([e]);
+  assert.equal(attempts, 2, "the lagging confirmation forced a retry");
+  assert.equal(ledger.applied.size, 1, "delayed finality did not double-apply");
+});
+
+test("chaos: duplicate events are handled idempotently", async () => {
+  const [e] = await events([[1n, 10]]);
+  const ledger = new EconomicLedger();
+  const lru = new ProcessedLru(64);
+  const dispatcher = new Dispatcher({
+    lru,
+    sleep: noSleep,
+    handlers: [{ name: "settle", kinds: ["Trade"], handle: async (ev) => { if (ev.kind === "Trade") ledger.apply(ev.id, ev.collateral); } }],
+  });
+  // The same event arrives three times (reorg replay / duplicate stream).
+  await dispatcher.dispatch([e]);
+  await dispatcher.dispatch([e]);
+  await dispatcher.dispatch([e]);
+  assert.equal(ledger.attempts, 1, "the LRU suppressed duplicate deliveries");
+  assert.equal(ledger.applied.size, 1);
+});
+
+test("chaos: restart during in-flight work does not re-execute the economic action", async () => {
+  const [e] = await events([[1n, 10]]);
+  const ledger = new EconomicLedger();
+  const lru = new ProcessedLru(64);
+  // First process: the handler applies the economic action then "crashes"
+  // before the dispatcher can record completion. We simulate the crash by
+  // throwing after the effect lands, so the event is retried.
+  let crashed = false;
+  const first = new Dispatcher({
+    lru,
+    maxAttempts: 2,
+    sleep: noSleep,
+    deadLetterPath: join(mkdtempSync(join(tmpdir(), "dl-")), "dead-letter.jsonl"),
+    handlers: [
+      {
+        name: "settle",
+        kinds: ["Trade"],
+        async handle(ev) {
+          if (ev.kind !== "Trade") return;
+          ledger.apply(ev.id, ev.collateral);
+          if (!crashed) {
+            crashed = true;
+            throw new Error("process restart mid-flight");
+          }
+        },
+      },
+    ],
+  });
+  await first.dispatch([e]);
+  // Second process: a fresh dispatcher replays the same event from the stream.
+  const second = new Dispatcher({
+    lru,
+    sleep: noSleep,
+    handlers: [{ name: "settle", kinds: ["Trade"], handle: async (ev) => { if (ev.kind === "Trade") ledger.apply(ev.id, ev.collateral); } }],
+  });
+  await second.dispatch([e]);
+  assert.equal(ledger.applied.size, 1, "recovery did not re-execute the economic action");
+  assert.equal(ledger.total(), e.kind === "Trade" ? e.collateral : 0n);
+});
