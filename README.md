@@ -61,3 +61,8 @@ Before a release, on a clean checkout:
 2. Run `npm ci` and `cargo build --locked` and confirm both succeed without modifying tracked files (`git status --porcelain` is empty).
 3. Run the dependency and secret scans locally (`npm audit --audit-level=high`, `cargo audit`, `gitleaks detect`) and confirm they pass or that every finding is a documented suppression.
 4. For deployment-specific behavior, verify against localnet or deterministic fixtures before testnet use.
+
+## Handsoff notes
+
+<!-- handsoff-issue-78 -->
+- #78: [x402] Reconcile indeterminate facilitator settlements
