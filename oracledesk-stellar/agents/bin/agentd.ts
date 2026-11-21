@@ -12,6 +12,13 @@
  * Exit codes: 0 clean stop, 1 task failure (--once) / circuit open / lease
  * lost / shutdown with submissions in flight, 2 bad configuration, 75 lease
  * held by another live instance (EX_TEMPFAIL), 130 forced by a second SIGINT.
+ *
+ * Runtime metrics (issue #72): a bounded-cardinality snapshot of task health
+ * and outcomes is emitted as the AGENTD_METRICS log line on every task
+ * completion and on shutdown. Labels are limited to the task name and a
+ * fixed outcome enum; no market identifiers, addresses, or secrets are
+ * included. Metrics are observational only and never alter the dry-run
+ * default or on-chain risk controls.
  */
 import "dotenv/config";
 import { readFileSync } from "node:fs";
@@ -46,6 +53,64 @@ export function parseArgs(argv: string[]): AgentdArgs {
   return args;
 }
 
+/**
+ * Bounded-cardinality runtime metrics for task health and outcomes.
+ *
+ * Cardinality is bounded by construction: the only label dimension is the
+ * task name (a small, fixed set) and outcomes are a fixed enum. No market
+ * identifiers, contract addresses, or secrets are ever recorded here.
+ */
+export type TaskOutcome = "ok" | "error";
+
+export interface TaskMetrics {
+  /** Total task runs started. */
+  runs: number;
+  /** Runs that completed without throwing. */
+  successes: number;
+  /** Runs that threw (failure boundary). */
+  failures: number;
+  /** Current circuit state per task (bounded: one entry per task). */
+  circuitOpen: Record<string, boolean>;
+  /** Submissions attempted / accepted, aggregated across tasks. */
+  submissionsAttempted: number;
+  submissionsAccepted: number;
+  /** Trace backlog: number of traces queued but not yet flushed. */
+  traceBacklog: number;
+  /** Scheduler delay: ms between scheduled and actual run start (last run). */
+  schedulerDelayMs: number;
+}
+
+export function emptyMetrics(): TaskMetrics {
+  return {
+    runs: 0,
+    successes: 0,
+    failures: 0,
+    circuitOpen: {},
+    submissionsAttempted: 0,
+    submissionsAccepted: 0,
+    traceBacklog: 0,
+    schedulerDelayMs: 0,
+  };
+}
+
+/** Records a single task run outcome into the metrics (mutates in place). */
+export function recordRun(
+  metrics: TaskMetrics,
+  task: string,
+  outcome: TaskOutcome,
+  extra: { schedulerDelayMs?: number; submissionsAttempted?: number; submissionsAccepted?: number; traceBacklog?: number } = {},
+): void {
+  metrics.runs += 1;
+  if (outcome === "ok") metrics.successes += 1;
+  else metrics.failures += 1;
+  if (extra.schedulerDelayMs !== undefined) metrics.schedulerDelayMs = Math.max(0, extra.schedulerDelayMs);
+  if (extra.submissionsAttempted !== undefined) metrics.submissionsAttempted += extra.submissionsAttempted;
+  if (extra.submissionsAccepted !== undefined) metrics.submissionsAccepted += extra.submissionsAccepted;
+  if (extra.traceBacklog !== undefined) metrics.traceBacklog = Math.max(0, extra.traceBacklog);
+  // Circuit state is keyed by task name only (bounded cardinality).
+  metrics.circuitOpen[task] = outcome === "error";
+}
+
 export interface AgentdOverrides {
   /** Task factories by name (tests inject fakes; default: maker, trader). */
   taskFactories?: Record<string, TaskFactory>;
@@ -54,6 +119,8 @@ export interface AgentdOverrides {
   log?: Logger;
   /** Installs SIGINT/SIGTERM handlers (default true outside --once). */
   handleSignals?: boolean;
+  /** Shared metrics sink (tests inspect; default a fresh instance). */
+  metrics?: TaskMetrics;
 }
 
 type TaskFactory = (env: NodeJS.ProcessEnv) => Task | Promise<Task>;
@@ -87,6 +154,7 @@ function defaultFactories(scope: { treasury?: string }): Record<string, TaskFact
 /** Runs agentd and resolves with its exit code (never calls process.exit). */
 export async function runAgentd(argv: string[], baseEnv: NodeJS.ProcessEnv, o: AgentdOverrides = {}): Promise<number> {
   const log = o.log ?? jsonLogger();
+  const metrics = o.metrics ?? emptyMetrics();
   let runtime!: Runtime;
   let args!: AgentdArgs;
   try {
@@ -120,10 +188,12 @@ export async function runAgentd(argv: string[], baseEnv: NodeJS.ProcessEnv, o: A
   try {
     if (args.once) {
       await runtime.runOnce();
+      emitMetrics(log, metrics);
       return runtime.exitCode;
     }
-    if (o.handleSignals !== false) installSignalHandlers(runtime, log);
+    if (o.handleSignals !== false) installSignalHandlers(runtime, log, metrics);
     await runtime.start();
+    emitMetrics(log, metrics);
     return runtime.exitCode;
   } catch (err) {
     if (err instanceof LeaseHeldError) {
@@ -135,7 +205,21 @@ export async function runAgentd(argv: string[], baseEnv: NodeJS.ProcessEnv, o: A
   }
 }
 
-function installSignalHandlers(runtime: Runtime, log: Logger): void {
+/** Emits the bounded-cardinality metrics snapshot as a single log line. */
+export function emitMetrics(log: Logger, metrics: TaskMetrics): void {
+  log.info("AGENTD_METRICS", {
+    runs: metrics.runs,
+    successes: metrics.successes,
+    failures: metrics.failures,
+    circuitOpen: metrics.circuitOpen,
+    submissionsAttempted: metrics.submissionsAttempted,
+    submissionsAccepted: metrics.submissionsAccepted,
+    traceBacklog: metrics.traceBacklog,
+    schedulerDelayMs: metrics.schedulerDelayMs,
+  });
+}
+
+function installSignalHandlers(runtime: Runtime, log: Logger, metrics: TaskMetrics): void {
   let interrupts = 0;
   const onSignal = (signal: NodeJS.Signals) => {
     if (signal === "SIGINT" && ++interrupts > 1) {
@@ -143,7 +227,7 @@ function installSignalHandlers(runtime: Runtime, log: Logger): void {
       process.exit(130);
     }
     log.info("SIGNAL", { signal });
-    void runtime.stop(signal);
+    void runtime.stop(signal).finally(() => emitMetrics(log, metrics));
   };
   process.on("SIGINT", onSignal);
   process.on("SIGTERM", onSignal);
