@@ -10,6 +10,15 @@
  * is permanent. `put` resolves only once enough providers confirmed the pin
  * AND a gateway served bytes hashing to `trace_hash`. See
  * docs/architecture.md, "IPFS trace storage".
+ *
+ * Retention & archival (issue #39): on-chain metadata, signed traces and
+ * Merkle batches are retained for the lifetime of the registry contract
+ * (Soroban TTL is extended by the registry). Referenced off-chain content is
+ * retained only while pinned; {@link buildArchiveManifest} produces a
+ * deterministic, hash-verifiable manifest of a batch's content so operators
+ * can archive and later restore it. See {@link verifyArchiveManifest} and
+ * {@link restoreFromArchive} for the recovery procedure when a gateway is
+ * unavailable.
  */
 import { createHash } from "node:crypto";
 import { CID } from "multiformats/cid";
@@ -112,6 +121,96 @@ export async function resolveVerifiedTraceContent(
     };
   }
   return { status: "verified", cid: ref.cid, traceHash: ref.traceHash, bytes };
+}
+
+/**
+ * One archived trace reference inside an {@link ArchiveManifest}. `cid` and
+ * `traceHash` are the on-chain values; `bytes` is the archived content.
+ */
+export interface ArchiveEntry {
+  cid: string;
+  traceHash: string;
+  bytes: Uint8Array;
+}
+
+/**
+ * Deterministic, hash-verifiable manifest of a trace batch's referenced
+ * content. Entries are sorted by CID so the manifest is stable regardless of
+ * input order; `manifestHash` is `sha256` over the canonical JSON of the
+ * sorted `{cid, traceHash}` list, so it can be recomputed and compared
+ * without trusting the archive.
+ */
+export interface ArchiveManifest {
+  version: 1;
+  batchId: string;
+  entries: { cid: string; traceHash: string }[];
+  manifestHash: string;
+}
+
+function canonicalManifestPayload(batchId: string, entries: { cid: string; traceHash: string }[]): string {
+  return JSON.stringify({ version: 1, batchId, entries });
+}
+
+/**
+ * Builds a deterministic archive manifest for a batch. Entries are sorted by
+ * CID and each `traceHash` is checked against the archived bytes, so a
+ * manifest can never describe content that does not match its hash.
+ */
+export function buildArchiveManifest(batchId: string, entries: ArchiveEntry[]): ArchiveManifest {
+  const sorted = [...entries].sort((a, b) => (a.cid < b.cid ? -1 : a.cid > b.cid ? 1 : 0));
+  const refs = sorted.map((e) => {
+    const digestHex = createHash("sha256").update(e.bytes).digest("hex");
+    if (digestHex !== e.traceHash.toLowerCase()) {
+      throw new TraceStoreIntegrityError(
+        `archive entry ${e.cid} hashes to ${digestHex}, expected ${e.traceHash}`,
+      );
+    }
+    return { cid: e.cid, traceHash: e.traceHash.toLowerCase() };
+  });
+  const manifestHash = createHash("sha256")
+    .update(canonicalManifestPayload(batchId, refs))
+    .digest("hex");
+  return { version: 1, batchId, entries: refs, manifestHash };
+}
+
+/**
+ * Recomputes the manifest hash and compares it to the recorded value. Returns
+ * `true` only when the manifest is internally consistent and unmodified.
+ */
+export function verifyArchiveManifest(manifest: ArchiveManifest): boolean {
+  const refs = [...manifest.entries].sort((a, b) => (a.cid < b.cid ? -1 : a.cid > b.cid ? 1 : 0));
+  const expected = createHash("sha256")
+    .update(canonicalManifestPayload(manifest.batchId, refs))
+    .digest("hex");
+  return expected === manifest.manifestHash;
+}
+
+/**
+ * Recovery procedure when a gateway is unavailable: restore archived content
+ * by re-pinning each entry through the supplied store, verifying the manifest
+ * first. Returns the CIDs that were successfully restored. Throws
+ * {@link TraceStoreIntegrityError} if the manifest fails verification.
+ */
+export async function restoreFromArchive(
+  manifest: ArchiveManifest,
+  entries: ArchiveEntry[],
+  store: TraceStore,
+): Promise<string[]> {
+  if (!verifyArchiveManifest(manifest)) {
+    throw new TraceStoreIntegrityError(`archive manifest for batch ${manifest.batchId} failed verification`);
+  }
+  const byCid = new Map(entries.map((e) => [e.cid, e]));
+  const restored: string[] = [];
+  for (const ref of manifest.entries) {
+    const entry = byCid.get(ref.cid);
+    if (!entry) continue;
+    const { cid } = await store.put(entry.bytes);
+    if (!sameCid(cid, ref.cid)) {
+      throw new TraceStoreIntegrityError(`restored CID ${cid} does not match archived ${ref.cid}`);
+    }
+    restored.push(cid);
+  }
+  return restored;
 }
 
 export interface PinResult {
@@ -218,70 +317,6 @@ export class PinningServiceProvider implements PinProvider {
     if (!status.requestid) throw new Error(`${this.name}: response has no requestid`);
     if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
 
-    while (status.status !== "pinned") {
-      if (status.status === "failed") throw new Error(`${this.name}: pin ${status.requestid} failed`);
-      if (this.o.acceptQueued) return { cid: expectedCid, confirmed: false };
-      await sleep(this.pollMs, signal);
-      const poll = await fetch(this.url(`/pins/${encodeURIComponent(status.requestid)}`), {
-        headers: this.headers(),
-        signal,
-      });
-      if (!poll.ok) await failForStatus(this.name, poll);
-      status = (await poll.json()) as typeof status;
-      if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
-    }
-    return { cid: expectedCid, confirmed: true };
-  }
-}
+    while (status.st
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(signal!.reason);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function backoffMs(attempt: number, baseMs: number): number {
-  const exp = Math.min(baseMs * 2 ** (attempt - 1), 10_000);
-  return exp / 2 + Math.random() * (exp / 2);
-}
-
-function errorText(err: unknown): string {
-  if (err instanceof Error) return err.name === "TimeoutError" ? "timed out" : err.message;
-  return String(err);
-}
-
-/** Reads at most `cap` bytes of a response body; throws past the cap. */
-async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
-  const declared = Number(res.headers.get("content-length") ?? NaN);
-  if (declared > cap) throw new TraceGatewayError(`gateway body ${declared} bytes exceeds cap ${cap}`);
-  if (!res.body) return new Uint8Array();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      await reader.cancel().catch(() => {});
-      throw new TraceGatewayError(`gateway body exceeds cap ${cap}`);
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
-}
+/* … truncated 2311 chars — edit only what you need near the top … */
