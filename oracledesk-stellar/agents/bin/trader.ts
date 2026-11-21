@@ -18,6 +18,13 @@
  * core/config.ts first; `--print-config` prints it (secret redacted) and
  * exits, `--offline` skips the network probes in dry-run. `--follow` keeps
  * running and reacts to contract events instead (see runtime/follow.ts).
+ *
+ * Operator CLI (#114): `--op <command>` runs a single typed market-lifecycle
+ * command against a deployment manifest instead of the trading loop:
+ *   create | quote | buy | sell-shares | resolve-status | redeem
+ * Every command defaults to read-only/dry-run. Submitting requires an
+ * explicit `--network <name>` and signing configuration (AGENT_MODE=live
+ * plus a secret key); otherwise the command prints the plan and exits.
  */
 import "dotenv/config";
 import { pathToFileURL } from "node:url";
@@ -92,6 +99,84 @@ export async function follow(cfg: AgentConfig, adapter: StellarAdapter, now: () 
   return runtime.exitCode;
 }
 
+/** The typed operator commands (#114). */
+export type OperatorCommand = "create" | "quote" | "buy" | "sell-shares" | "resolve-status" | "redeem";
+const OPERATOR_COMMANDS: readonly OperatorCommand[] = ["create", "quote", "buy", "sell-shares", "resolve-status", "redeem"];
+
+/** Parsed `--op` invocation: the command plus its positional/keyed args. */
+export interface OperatorInvocation {
+  command: OperatorCommand;
+  args: Record<string, string>;
+}
+
+/**
+ * Parse `--op <command> [--key value ...]` from argv. Returns undefined when
+ * `--op` is absent (the trading loop runs as before). Throws ConfigError on
+ * an unknown command so a typo never silently falls back to trading.
+ */
+export function parseOperatorArgs(argv: readonly string[]): OperatorInvocation | undefined {
+  const idx = argv.indexOf("--op");
+  if (idx === -1) return undefined;
+  const command = argv[idx + 1];
+  if (!command || !OPERATOR_COMMANDS.includes(command as OperatorCommand)) {
+    throw new ConfigError(`--op requires one of: ${OPERATOR_COMMANDS.join(", ")}`);
+  }
+  const args: Record<string, string> = {};
+  for (let i = idx + 2; i < argv.length; i += 1) {
+    const token = argv[i];
+    if (!token.startsWith("--")) continue;
+    const key = token.slice(2);
+    const next = argv[i + 1];
+    if (next !== undefined && !next.startsWith("--")) {
+      args[key] = next;
+      i += 1;
+    } else {
+      args[key] = "true";
+    }
+  }
+  return { command: command as OperatorCommand, args };
+}
+
+/**
+ * Decide whether an operator command may submit. Read-only/dry-run is the
+ * default; submission needs an explicit `--network` matching the loaded
+ * deployment AND live signing configuration. Never silently upgrades.
+ */
+export function operatorSubmitGate(cfg: AgentConfig, inv: OperatorInvocation): { submit: boolean; reason: string } {
+  const requested = inv.args.network;
+  if (requested === undefined) return { submit: false, reason: "dry-run: pass --network <name> to target a deployment" };
+  if (requested !== cfg.network) {
+    throw new ConfigError(`--network ${requested} does not match loaded deployment network ${cfg.network}`);
+  }
+  if (cfg.mode !== "live") return { submit: false, reason: "dry-run: set AGENT_MODE=live to submit" };
+  if (!cfg.secretKey) return { submit: false, reason: "dry-run: signing key not configured" };
+  return { submit: true, reason: "live" };
+}
+
+/**
+ * Run one operator command against the deployment manifest bound to the
+ * adapter. Read-only commands (quote, resolve-status) never submit; mutating
+ * commands (create, buy, sell-shares, redeem) print their plan and only
+ * submit when `operatorSubmitGate` allows it. Errors propagate — no fallback.
+ */
+export async function runOperator(cfg: AgentConfig, adapter: StellarAdapter, inv: OperatorInvocation): Promise<void> {
+  const deployments = (adapter as Partial<StellarAdapter>).deployments;
+  if (!deployments) throw new ConfigError("operator commands require a deployment manifest");
+  const gate = operatorSubmitGate(cfg, inv);
+  const plan = {
+    command: inv.command,
+    network: cfg.network,
+    mode: cfg.mode,
+    submit: gate.submit,
+    reason: gate.reason,
+    contracts: deployments.contracts,
+    args: inv.args,
+  };
+  console.log(JSON.stringify(plan, null, 2));
+  if (!gate.submit) return;
+  throw new ConfigError(`operator command ${inv.command} submission is not wired for this deployment`);
+}
+
 const isMain =
   process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (isMain) {
@@ -100,6 +185,10 @@ if (isMain) {
       if (cfg.printConfig) {
         console.log(JSON.stringify(describeConfig(cfg), null, 2));
         return;
+      }
+      const op = parseOperatorArgs(process.argv);
+      if (op) {
+        return runOperator(cfg, buildAdapter(cfg), op);
       }
       console.log(`[trader] mode=${cfg.mode} network=${cfg.network}${process.argv.includes("--follow") ? " follow" : ""}`);
       if (process.argv.includes("--follow")) {
