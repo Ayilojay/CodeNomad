@@ -150,14 +150,45 @@ export interface TreasuryActivityRecord {
   sourceEventId: string;
 }
 
+/**
+ * Capital-flow accounting records (#36).
+ *
+ * A stable, auditable trail linking deposits, withdrawals, trading, fees,
+ * Blend allocation and realized PnL to the current capital views. Each record
+ * carries a unique `operationId` (derived from the source event) and the
+ * ledger timestamp at which the flow was observed, so an off-chain reconciler
+ * can replay the trail and prove the indexed total matches contract balances.
+ */
+export type CapitalFlowKind =
+  | "deposit"
+  | "withdrawal"
+  | "trade"
+  | "fee"
+  | "blend_allocation"
+  | "realized_pnl";
+
+export interface CapitalFlowRecord {
+  /** Unique, stable operation identifier for this flow. */
+  operationId: string;
+  kind: CapitalFlowKind;
+  /** Signed amount in stroops: positive increases capital, negative decreases. */
+  amount: bigint;
+  /** Ledger close time (Unix seconds) at which the flow was observed. */
+  ledgerTimestamp: bigint;
+  /** Source event identity, for dedupe and replay. */
+  sourceEventId: string;
+}
+
 export interface ReadModels {
   lifecycle: Map<bigint, MarketLifecycleRecord>;
   trades: TradeRecord[];
   treasury: TreasuryActivityRecord[];
+  /** Capital-flow accounting trail (#36). */
+  capitalFlows: CapitalFlowRecord[];
 }
 
 export function emptyReadModels(): ReadModels {
-  return { lifecycle: new Map(), trades: [], treasury: [] };
+  return { lifecycle: new Map(), trades: [], treasury: [], capitalFlows: [] };
 }
 
 /** Stable identity for an event, used to dedupe incremental updates. */
@@ -167,6 +198,62 @@ export function sourceEventId(e: OracleDeskEvent): string {
     return `${anyE.txHash}:${anyE.eventIndex}`;
   }
   return `${e.kind}:${String(anyE.ledger ?? "")}:${JSON.stringify(e)}`;
+}
+
+/**
+ * Maps a canonical event to a capital-flow record, or undefined when the event
+ * does not represent a capital flow. Amounts are signed stroops.
+ */
+export function capitalFlowFor(e: OracleDeskEvent): CapitalFlowRecord | undefined {
+  const id = sourceEventId(e);
+  const anyE = e as unknown as { closedAt?: bigint; amount?: bigint; collateral?: bigint; fee?: bigint };
+  const at = anyE.closedAt ?? 0n;
+  const make = (kind: CapitalFlowKind, amount: bigint): CapitalFlowRecord => ({
+    operationId: id,
+    kind,
+    amount,
+    ledgerTimestamp: at,
+    sourceEventId: id,
+  });
+  switch (e.kind) {
+    case "Deposit":
+      return make("deposit", anyE.amount ?? 0n);
+    case "Withdrawal":
+      return make("withdrawal", -(anyE.amount ?? 0n));
+    case "Trade":
+      return make("trade", -(anyE.collateral ?? 0n));
+    case "FeeCharged":
+      return make("fee", -(anyE.fee ?? anyE.amount ?? 0n));
+    case "BlendAllocation":
+      return make("blend_allocation", -(anyE.amount ?? 0n));
+    case "RealizedPnl":
+      return make("realized_pnl", anyE.amount ?? 0n);
+    default:
+      return undefined;
+  }
+}
+
+/**
+ * Off-chain reconciler (#36): sums the indexed capital-flow trail and compares
+ * it against the contract's reported balance. Returns a proof object so
+ * operators can see both sides of the check.
+ */
+export interface ReconciliationResult {
+  indexedTotal: bigint;
+  contractBalance: bigint;
+  /** True when the indexed total matches the contract balance. */
+  reconciled: boolean;
+  /** Signed difference (indexedTotal - contractBalance). */
+  difference: bigint;
+}
+
+export function reconcileCapital(
+  flows: readonly CapitalFlowRecord[],
+  contractBalance: bigint,
+): ReconciliationResult {
+  const indexedTotal = flows.reduce((sum, f) => sum + f.amount, 0n);
+  const difference = indexedTotal - contractBalance;
+  return { indexedTotal, contractBalance, reconciled: difference === 0n, difference };
 }
 
 const STAGE_RANK: Record<MarketLifecycleRecord["stage"], number> = {
@@ -185,7 +272,11 @@ export function applyEvent(models: ReadModels, e: OracleDeskEvent): boolean {
   const id = sourceEventId(e);
   if (models.trades.some((t) => t.sourceEventId === id)) return false;
   if (models.treasury.some((t) => t.sourceEventId === id)) return false;
+  if (models.capitalFlows.some((f) => f.sourceEventId === id)) return false;
   if (models.lifecycle.get((e as { marketId?: bigint }).marketId ?? -1n)?.sourceEventId === id) return false;
+
+  const flow = capitalFlowFor(e);
+  if (flow) models.capitalFlows.push(flow);
 
   switch (e.kind) {
     case "MarketOpened": {
@@ -226,7 +317,7 @@ export function applyEvent(models: ReadModels, e: OracleDeskEvent): boolean {
       return true;
     }
     default:
-      return false;
+      return flow !== undefined;
   }
 }
 
@@ -235,22 +326,11 @@ function setStage(
   marketId: bigint,
   stage: MarketLifecycleRecord["stage"],
   outcome: string | undefined,
-  updatedAt: bigint,
+  at: bigint,
   sourceEventId: string,
 ): boolean {
   const prev = models.lifecycle.get(marketId);
   if (prev && STAGE_RANK[prev.stage] > STAGE_RANK[stage]) return false;
-  models.lifecycle.set(marketId, { marketId, stage, outcome, updatedAt, sourceEventId });
+  models.lifecycle.set(marketId, { marketId, stage, outcome, updatedAt: at, sourceEventId });
   return true;
-}
-
-/**
- * Full rebuild: replays every canonical event from scratch. Because
- * `applyEvent` is idempotent and order-stable per stage, the result is
- * identical to applying the same events incrementally.
- */
-export function rebuildReadModels(events: Iterable<OracleDeskEvent>): ReadModels {
-  const models = emptyReadModels();
-  for (const e of events) applyEvent(models, e);
-  return models;
 }

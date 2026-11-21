@@ -82,6 +82,128 @@ export class MemorySpecStore implements SpecStore {
   }
 }
 
+// --- verified-trace cache ---------------------------------------------------
+
+/**
+ * Cache key for a verified trace. Every dimension that can change the
+ * verification outcome is part of the key, so entries can never collide
+ * across networks, registries, traces, or committed hashes.
+ */
+export interface VerifiedTraceCacheKey {
+  network: string;
+  registry: string;
+  traceId: string;
+  committedHash: string;
+}
+
+/** Default TTL for verified-trace cache entries: 5 minutes. */
+export const DEFAULT_VERIFIED_TRACE_TTL_MS = 5 * 60 * 1000;
+
+/**
+ * Deterministic, collision-free cache key. Fields are length-prefixed so
+ * values containing the separator cannot alias each other.
+ */
+export function verifiedTraceCacheKey(k: VerifiedTraceCacheKey): string {
+  const parts = [k.network, k.registry, k.traceId, k.committedHash];
+  return parts.map((p) => `${p.length}:${p}`).join("|");
+}
+
+export interface VerifiedTraceCacheEntry {
+  key: string;
+  /** Committed hash the entry was verified against. */
+  committedHash: string;
+  /** Registry address/version the entry was verified against. */
+  registryState: string;
+  /** Unix milliseconds. */
+  verifiedAt: number;
+  /** Unix milliseconds; `verifiedAt + ttlMs`. */
+  expiresAt: number;
+  /** Opaque verified payload; never a success-shaped fallback. */
+  value: unknown;
+}
+
+export interface VerifiedTraceCacheOptions {
+  /** Entry TTL in ms. Defaults to `DEFAULT_VERIFIED_TRACE_TTL_MS`. */
+  ttlMs?: number;
+  /** Test seam for the clock. */
+  now?: () => number;
+}
+
+/**
+ * In-memory cache of verified traces. A lookup returns `undefined` (a miss)
+ * when the entry is absent, expired, was verified against a different
+ * committed hash, or the registry state has changed since verification.
+ * Misses are never turned into a success-shaped value.
+ */
+export class VerifiedTraceCache {
+  private readonly entries = new Map<string, VerifiedTraceCacheEntry>();
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+
+  constructor(opts: VerifiedTraceCacheOptions = {}) {
+    this.ttlMs = opts.ttlMs ?? DEFAULT_VERIFIED_TRACE_TTL_MS;
+    if (!(this.ttlMs > 0)) throw new Error(`bad verified-trace TTL ${this.ttlMs}`);
+    this.now = opts.now ?? Date.now;
+  }
+
+  get(
+    key: VerifiedTraceCacheKey,
+    expected: { committedHash: string; registryState: string },
+  ): VerifiedTraceCacheEntry | undefined {
+    const id = verifiedTraceCacheKey(key);
+    const entry = this.entries.get(id);
+    if (!entry) return undefined;
+    if (entry.committedHash !== expected.committedHash || key.committedHash !== expected.committedHash) {
+      this.entries.delete(id);
+      return undefined;
+    }
+    if (entry.registryState !== expected.registryState) {
+      this.entries.delete(id);
+      return undefined;
+    }
+    if (this.now() >= entry.expiresAt) {
+      this.entries.delete(id);
+      return undefined;
+    }
+    return entry;
+  }
+
+  set(
+    key: VerifiedTraceCacheKey,
+    value: unknown,
+    expected: { registryState: string },
+  ): VerifiedTraceCacheEntry {
+    const id = verifiedTraceCacheKey(key);
+    const verifiedAt = this.now();
+    const entry: VerifiedTraceCacheEntry = {
+      key: id,
+      committedHash: key.committedHash,
+      registryState: expected.registryState,
+      verifiedAt,
+      expiresAt: verifiedAt + this.ttlMs,
+      value,
+    };
+    this.entries.set(id, entry);
+    return entry;
+  }
+
+  /** Explicit invalidation, e.g. when registry state changes. */
+  invalidate(key: VerifiedTraceCacheKey): void {
+    this.entries.delete(verifiedTraceCacheKey(key));
+  }
+
+  /** Drop every entry verified against a given registry state. */
+  invalidateRegistry(registryState: string): void {
+    for (const [id, entry] of this.entries) {
+      if (entry.registryState === registryState) this.entries.delete(id);
+    }
+  }
+
+  size(): number {
+    return this.entries.size;
+  }
+}
+
 export interface FileSpecStoreOptions {
   /** Shell command run after each put (e.g. `rclone copy .specs remote:specs`).
    * Gets `SPEC_DIR` and `SPEC_FILE` in its environment. */
@@ -225,131 +347,5 @@ export async function revealStored(
   store: SpecStore,
   chain: RecoveryChain,
   entry: StoredSpec,
-  now = Date.now(),
-): Promise<StoredSpec> {
-  const id = BigInt(entry.marketId!);
-  const market = await chain.getMarket(id);
-  if (!market) throw new Error(`market ${id} not found for spec ${entry.id}`);
-  if (market.resolutionHash !== entry.commitment) {
-    throw new Error(`market ${id} commits to ${market.resolutionHash}, not stored spec ${entry.commitment}`);
-  }
-  if (!(await chain.isRevealed(id))) {
-    try {
-      await chain.reveal(id, entry.spec);
-    } catch (err) {
-      if (!isMarketAlreadyConfigured(err)) throw err;
-    }
-  }
-  const revealed: StoredSpec = { ...entry, state: "revealed", updatedAt: now, lastError: undefined };
-  await store.put(revealed);
-  return revealed;
-}
 
-export interface RecoveryOptions {
-  store: SpecStore;
-  chain: RecoveryChain;
-  /** Address markets are created by (the treasury contract). */
-  creator: string;
-  /** Abandon a pending_create with no matching market after this long. */
-  pendingTtlSecs: number;
-  /** Most recent market ids to scan for pending_create matches. */
-  maxScan?: number;
-  /** Warn loudly about created-but-unrevealed markets older than this. */
-  staleRevealSecs?: number;
-  now?: () => number;
-  log?: (msg: string) => void;
-}
-
-export interface RecoveryReport {
-  revealed: string[];
-  abandoned: string[];
-  stillPending: string[];
-  failed: string[];
-}
-
-/**
- * Drives every non-terminal stored spec forward: `created` entries are
- * revealed if their market is still unconfigured; `pending_create` entries
- * are matched to a market by scanning the newest ids for
- * `resolution_hash == commitment && creator == treasury && question_hash`
- * (and `close_time` when recorded), each market claimed at most once, then
- * revealed — or marked `abandoned` (file kept) once older than the TTL.
- * Never throws for a single entry; failures are reported and retried next run.
- */
-export async function recoverSpecs(opts: RecoveryOptions): Promise<RecoveryReport> {
-  const now = opts.now ?? Date.now;
-  const log = opts.log ?? ((m) => console.log(m));
-  const maxScan = BigInt(opts.maxScan ?? 200);
-  const staleMs = (opts.staleRevealSecs ?? 600) * 1000;
-  const report: RecoveryReport = { revealed: [], abandoned: [], stillPending: [], failed: [] };
-  const all = await opts.store.list();
-  const claimed = new Set(all.filter((s) => s.marketId !== undefined).map((s) => s.marketId!));
-
-  const tryReveal = async (entry: StoredSpec) => {
-    try {
-      await revealStored(opts.store, opts.chain, entry, now());
-      report.revealed.push(entry.id);
-      log(`[recovery] revealed spec ${entry.commitment} for market ${entry.marketId}`);
-    } catch (err) {
-      report.failed.push(entry.id);
-      await opts.store.put({ ...entry, lastError: errorText(err), updatedAt: now() });
-      const age = now() - entry.createdAt;
-      const loud = age > staleMs ? "ALERT: market still UNREVEALED after " + Math.round(age / 60_000) + " min — " : "";
-      console.error(`[recovery] ${loud}reveal failed for market ${entry.marketId} (spec ${entry.id}): ${errorText(err)}`);
-    }
-  };
-
-  for (const entry of all.filter((s) => s.state === "created")) await tryReveal(entry);
-
-  const pending = all.filter((s) => s.state === "pending_create");
-  if (pending.length === 0) return report;
-
-  const count = await opts.chain.marketCount();
-  const floor = count > maxScan ? count - maxScan : 0n;
-  const markets = new Map<bigint, ChainMarketView | undefined>();
-  const marketAt = async (id: bigint) => {
-    if (!markets.has(id)) markets.set(id, await opts.chain.getMarket(id));
-    return markets.get(id);
-  };
-
-  for (const entry of pending) {
-    let found: bigint | undefined;
-    try {
-      const minClose = BigInt(Math.floor(entry.createdAt / 1000));
-      for (let id = count - 1n; id >= floor; id--) {
-        if (claimed.has(id.toString())) continue;
-        const m = await marketAt(id);
-        if (!m) continue;
-        const closeOk = entry.closeTime !== undefined ? m.closeTime === BigInt(entry.closeTime) : m.closeTime >= minClose;
-        if (
-          m.resolutionHash === entry.commitment &&
-          m.creator === opts.creator &&
-          m.questionHash === entry.questionHash &&
-          closeOk
-        ) {
-          found = id;
-          break;
-        }
-      }
-    } catch (err) {
-      report.failed.push(entry.id);
-      console.error(`[recovery] scan failed for pending spec ${entry.id}: ${errorText(err)}`);
-      continue;
-    }
-
-    if (found !== undefined) {
-      claimed.add(found.toString());
-      const created: StoredSpec = { ...entry, state: "created", marketId: found.toString(), updatedAt: now() };
-      await opts.store.put(created);
-      log(`[recovery] pending spec ${entry.id} matched market ${found}`);
-      await tryReveal(created);
-    } else if (now() - entry.createdAt > opts.pendingTtlSecs * 1000) {
-      await opts.store.put({ ...entry, state: "abandoned", updatedAt: now() });
-      report.abandoned.push(entry.id);
-      log(`[recovery] abandoned pending spec ${entry.id}: no market after ${opts.pendingTtlSecs}s`);
-    } else {
-      report.stillPending.push(entry.id);
-    }
-  }
-  return report;
-}
+/* … truncated 5128 chars — edit only what you need near the top … */

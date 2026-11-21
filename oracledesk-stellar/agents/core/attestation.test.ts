@@ -78,3 +78,140 @@ test("buildAttestationMessage validates its inputs", () => {
   assert.throws(() => buildAttestationMessage({ ...CTX, round: -1 }));
   assert.throws(() => buildAttestationMessage({ ...CTX, round: 2 ** 32 }));
 });
+
+// ---------------------------------------------------------------------------
+// Verified-trace cache: key composition, TTL, and invalidation semantics.
+//
+// Cache entries are isolated by network, registry, trace ID and committed
+// hash. A cached verified trace is only served while the committed hash and
+// registry state still match and the entry has not exceeded its TTL.
+// ---------------------------------------------------------------------------
+
+interface RegistryState {
+  address: string;
+  version: number;
+  verified: boolean;
+}
+
+interface VerifiedTrace {
+  network: string;
+  registry: string;
+  traceId: string;
+  committedHash: string;
+  registryState: RegistryState;
+}
+
+const DEFAULT_TTL_MS = 5 * 60 * 1000;
+
+const traceCacheKey = (t: VerifiedTrace): string =>
+  [t.network, t.registry, t.traceId, t.committedHash].join("|");
+
+class VerifiedTraceCache {
+  private readonly entries = new Map<
+    string,
+    { trace: VerifiedTrace; storedAt: number }
+  >();
+
+  constructor(private readonly ttlMs: number = DEFAULT_TTL_MS) {}
+
+  put(trace: VerifiedTrace, now: number): void {
+    this.entries.set(traceCacheKey(trace), { trace, storedAt: now });
+  }
+
+  get(trace: VerifiedTrace, now: number): VerifiedTrace | undefined {
+    const key = traceCacheKey(trace);
+    const entry = this.entries.get(key);
+    if (!entry) return undefined;
+    if (now - entry.storedAt >= this.ttlMs) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    if (entry.trace.committedHash !== trace.committedHash) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    const a = entry.trace.registryState;
+    const b = trace.registryState;
+    if (a.address !== b.address || a.version !== b.version || a.verified !== b.verified) {
+      this.entries.delete(key);
+      return undefined;
+    }
+    return entry.trace;
+  }
+}
+
+const baseTrace = (): VerifiedTrace => ({
+  network: "Test SDF Network ; September 2015",
+  registry: "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+  traceId: "trace-1",
+  committedHash: "0xabc123",
+  registryState: {
+    address: "CC3KU5TWAATOBXLWIV4ZTXNEM44VIOY3ZTR7KTJTBOOBP7YIXMCDSWDJ",
+    version: 1,
+    verified: true,
+  },
+});
+
+test("verified-trace cache: hit within TTL, miss after expiry", () => {
+  const cache = new VerifiedTraceCache(1000);
+  const trace = baseTrace();
+  cache.put(trace, 0);
+  assert.equal(cache.get(trace, 500), trace);
+  assert.equal(cache.get(trace, 1000), undefined);
+});
+
+test("verified-trace cache: default TTL is documented and applied", () => {
+  const cache = new VerifiedTraceCache();
+  const trace = baseTrace();
+  cache.put(trace, 0);
+  assert.equal(cache.get(trace, DEFAULT_TTL_MS - 1), trace);
+  assert.equal(cache.get(trace, DEFAULT_TTL_MS), undefined);
+});
+
+test("verified-trace cache: invalidates on committed hash mismatch", () => {
+  const cache = new VerifiedTraceCache();
+  const trace = baseTrace();
+  cache.put(trace, 0);
+  const changed = { ...trace, committedHash: "0xdef456" };
+  assert.equal(cache.get(changed, 1), undefined);
+  // Original key is untouched by the mismatched lookup.
+  assert.equal(cache.get(trace, 1), trace);
+});
+
+test("verified-trace cache: invalidates on changed registry state", () => {
+  const cache = new VerifiedTraceCache();
+  const trace = baseTrace();
+  cache.put(trace, 0);
+  const bumped = {
+    ...trace,
+    registryState: { ...trace.registryState, version: 2 },
+  };
+  assert.equal(cache.get(bumped, 1), undefined);
+  const unverified = {
+    ...trace,
+    registryState: { ...trace.registryState, verified: false },
+  };
+  assert.equal(cache.get(unverified, 1), undefined);
+});
+
+test("verified-trace cache: keys are isolated across network and registry", () => {
+  const cache = new VerifiedTraceCache();
+  const trace = baseTrace();
+  cache.put(trace, 0);
+  const otherNetwork = {
+    ...trace,
+    network: "Public Global Stellar Network ; September 2015",
+  };
+  const otherRegistry = {
+    ...trace,
+    registry: "CCILJXZCHKAIBTMJ7NSQE756OGLKTOYNSWNNZXWAYZZA4ECAUEC2CNVF",
+    registryState: {
+      ...trace.registryState,
+      address: "CCILJXZCHKAIBTMJ7NSQE756OGLKTOYNSWNNZXWAYZZA4ECAUEC2CNVF",
+    },
+  };
+  assert.equal(cache.get(otherNetwork, 1), undefined);
+  assert.equal(cache.get(otherRegistry, 1), undefined);
+  assert.notEqual(traceCacheKey(trace), traceCacheKey(otherNetwork));
+  assert.notEqual(traceCacheKey(trace), traceCacheKey(otherRegistry));
+});

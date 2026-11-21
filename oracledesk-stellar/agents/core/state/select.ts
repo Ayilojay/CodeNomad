@@ -74,6 +74,45 @@ export function existingQuestionHashes(snapshot: Snapshot): Set<string> {
 }
 
 /**
+ * Canonical trace intent: the minimal, deterministic description of a trace
+ * publication. Two intents that describe the same decision must serialize to
+ * the same string regardless of key ordering or process restart.
+ */
+export interface TraceIntent {
+  network: string;
+  contractId: string;
+  marketId: string;
+  decision: string;
+  /** Stable identifier of the reasoning payload (e.g. content hash). */
+  payloadHash: string;
+}
+
+/**
+ * Derive a deterministic idempotency key from the canonical trace intent.
+ * The key is stable across agent restarts so a producer that crashed after
+ * publication but before local acknowledgement can reconcile the previous
+ * result instead of publishing a duplicate decision.
+ */
+export function traceIdempotencyKey(intent: TraceIntent): string {
+  const canonical = JSON.stringify([
+    intent.network,
+    intent.contractId,
+    intent.marketId,
+    intent.decision,
+    intent.payloadHash,
+  ]);
+  // FNV-1a 64-bit over the canonical intent; deterministic and dependency-free.
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < canonical.length; i++) {
+    hash ^= BigInt(canonical.charCodeAt(i));
+    hash = (hash * prime) & mask;
+  }
+  return `trace:${hash.toString(16).padStart(16, "0")}`;
+}
+
+/**
  * Shared lease backend for multi-host deployment.
  *
  * A lease grants a single host the right to submit transactions for a scope.
