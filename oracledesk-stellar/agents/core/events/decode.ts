@@ -1,21 +1,37 @@
 /**
- * Typed decoding of OracleDesk contract events (#105).
+ * Typed decoding of OracleDesk contract events (#105, #93).
  *
  * Every event is decoded with the contract specification embedded in the
  * generated bindings (packages/bindings/*), via the SDK's `Spec.parseEvent`:
  * no XDR layouts are written by hand here. Events this module does not map
  * to a typed variant, and events that do not decode, become `Unknown`.
+ *
+ * Versioned decoding (#93): each contract interface version has its own
+ * generated bindings package. `EventDecoder.fromBindings` loads the spec for
+ * the configured version; unknown event variants and undecodable payloads are
+ * retained as `Unknown` with the raw XDR so no data is dropped or fabricated.
  */
 import type { contract, rpc } from "@stellar/stellar-sdk";
 
 export type ContractName = "market_core" | "resolver" | "treasury" | "reasoning_registry";
 
-/** Binding package per contract; each exports a `Client` carrying the spec. */
-export const BINDINGS: Record<ContractName, string> = {
-  market_core: "@oracledesk/bindings-market-core",
-  resolver: "@oracledesk/bindings-resolver",
-  treasury: "@oracledesk/bindings-treasury",
-  reasoning_registry: "@oracledesk/bindings-reasoning-registry",
+/** Interface versions with generated bindings. */
+export type InterfaceVersion = "v1" | "v2";
+
+/** Binding package per contract and interface version. */
+export const BINDINGS: Record<InterfaceVersion, Record<ContractName, string>> = {
+  v1: {
+    market_core: "@oracledesk/bindings-market-core",
+    resolver: "@oracledesk/bindings-resolver",
+    treasury: "@oracledesk/bindings-treasury",
+    reasoning_registry: "@oracledesk/bindings-reasoning-registry",
+  },
+  v2: {
+    market_core: "@oracledesk/bindings-market-core-v2",
+    resolver: "@oracledesk/bindings-resolver-v2",
+    treasury: "@oracledesk/bindings-treasury-v2",
+    reasoning_registry: "@oracledesk/bindings-reasoning-registry-v2",
+  },
 };
 
 export type Side = "Yes" | "No";
@@ -31,6 +47,14 @@ export interface EventMeta {
   txHash: string;
   contract: ContractName;
   contractId: string;
+  /** Interface version whose spec decoded this event. */
+  version: InterfaceVersion;
+}
+
+/** Raw XDR retained for events that could not be typed. */
+export interface RawXdr {
+  topic: string[];
+  value: string;
 }
 
 export type OracleDeskEvent = EventMeta &
@@ -54,13 +78,11 @@ export type OracleDeskEvent = EventMeta &
     | { kind: "ResolutionFinalized"; marketId: bigint; outcome: AttestedOutcome; finalizedAt: bigint }
     | { kind: "PriceResolution"; marketId: bigint; price: bigint; priceTimestamp: bigint; outcome: Side; fromSnapshot: boolean }
     | { kind: "TracePublished"; traceId: bigint; marketId: bigint; agent: string; action: string; traceHash: string; ipfsCid: string }
-    /** Treasury activity: fees collected, payouts, and deposits/withdrawals. */
-    | { kind: "FeeCollected"; marketId: bigint; amount: bigint; recipient: string }
-    | { kind: "PayoutClaimed"; marketId: bigint; claimant: string; outcome: Side; shares: bigint; amount: bigint }
-    | { kind: "TreasuryDeposit"; from: string; amount: bigint }
-    | { kind: "TreasuryWithdrawal"; to: string; amount: bigint }
-    /** Not a typed variant: `name` is the spec event name when it decoded. */
-    | { kind: "Unknown"; name?: string; data?: Record<string, unknown> }
+    /**
+     * Not a typed variant: `name` is the spec event name when it decoded.
+     * `raw` always carries the original XDR so unknown variants are retained.
+     */
+    | { kind: "Unknown"; name?: string; data?: Record<string, unknown>; raw: RawXdr }
   );
 
 export type EventKind = OracleDeskEvent["kind"];
@@ -74,26 +96,35 @@ type Tagged = { tag: string };
 const tag = (v: unknown): string => (v as Tagged).tag;
 const side = (v: unknown): Side => tag(v) as Side;
 
+/** Serializes an XDR value to its base64 string form for retention. */
+const xdrString = (v: unknown): string => {
+  const s = v as { toXDR?: (format?: string) => string };
+  return typeof s.toXDR === "function" ? s.toXDR("base64") : String(v);
+};
+
 /** Decodes raw RPC events with the four contracts' binding specs. */
 export class EventDecoder {
-  private readonly byId: Map<string, { name: ContractName; spec: contract.Spec }>;
+  private readonly byId: Map<string, { name: ContractName; version: InterfaceVersion; spec: contract.Spec }>;
 
-  constructor(contracts: Partial<Record<ContractName, { id: string; spec: contract.Spec }>>) {
+  constructor(contracts: Partial<Record<ContractName, { id: string; spec: contract.Spec }>>, version: InterfaceVersion = "v1") {
     this.byId = new Map(
-      (Object.entries(contracts) as [ContractName, { id: string; spec: contract.Spec }][]).map(([name, c]) => [c.id, { name, spec: c.spec }]),
+      (Object.entries(contracts) as [ContractName, { id: string; spec: contract.Spec }][]).map(([name, c]) => [
+        c.id,
+        { name, version, spec: c.spec },
+      ]),
     );
   }
 
-  /** Loads each contract's spec from its generated bindings package. */
-  static async fromBindings(ids: Record<ContractName, string>): Promise<EventDecoder> {
+  /** Loads each contract's spec from its generated bindings package for `version`. */
+  static async fromBindings(ids: Record<ContractName, string>, version: InterfaceVersion = "v1"): Promise<EventDecoder> {
     const contracts: Partial<Record<ContractName, { id: string; spec: contract.Spec }>> = {};
-    for (const name of Object.keys(BINDINGS) as ContractName[]) {
-      const mod = (await import(BINDINGS[name])) as { Client: new (o: unknown) => { spec: contract.Spec } };
+    for (const name of Object.keys(BINDINGS[version]) as ContractName[]) {
+      const mod = (await import(BINDINGS[version][name])) as { Client: new (o: unknown) => { spec: contract.Spec } };
       // The spec is embedded in the generated Client; nothing here talks to an RPC.
       const client = new mod.Client({ contractId: ids[name], networkPassphrase: "", rpcUrl: "https://unused.invalid" });
       contracts[name] = { id: ids[name], spec: client.spec };
     }
-    return new EventDecoder(contracts);
+    return new EventDecoder(contracts, version);
   }
 
   contractIds(): string[] {
@@ -118,9 +149,17 @@ export class EventDecoder {
       txHash: raw.txHash,
       contract: known.name,
       contractId,
+      version: known.version,
     };
-    const parsed = known.spec.parseEvent(raw.topic, raw.value);
-    if (!parsed) return { ...meta, kind: "Unknown" };
+    const rawXdr: RawXdr = { topic: raw.topic.map(xdrString), value: xdrString(raw.value) };
+    let parsed: ReturnType<contract.Spec["parseEvent"]>;
+    try {
+      parsed = known.spec.parseEvent(raw.topic, raw.value);
+    } catch {
+      // Undecodable payload: retain raw XDR rather than fabricating a variant.
+      return { ...meta, kind: "Unknown", raw: rawXdr };
+    }
+    if (!parsed) return { ...meta, kind: "Unknown", raw: rawXdr };
     const d = parsed.data as Record<string, unknown>;
     switch (`${known.name}.${parsed.name}`) {
       case "market_core.Trade":
@@ -198,7 +237,7 @@ export class EventDecoder {
       case "treasury.Withdrawal":
         return { ...meta, kind: "TreasuryWithdrawal", to: d.to as string, amount: d.amount as bigint };
       default:
-        return { ...meta, kind: "Unknown", name: parsed.name, data: d };
+        return { ...meta, kind: "Unknown", name: parsed.name, data: d, raw: rawXdr };
     }
   }
 }

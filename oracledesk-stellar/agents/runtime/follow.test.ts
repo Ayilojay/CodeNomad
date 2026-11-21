@@ -57,7 +57,7 @@ async function setup(exposure: Record<string, bigint> = {}) {
   const task = await followTask({
     cfg: {
       network: "testnet",
-      events: { stateDir, tradeThresholdStroops: 1_000n, pollIntervalMs: 1, pageLimit: 100, concurrency: 2, maxAttempts: 2, disputeWindowSecs: 600 },
+      events: { stateDir, tradeThresholdStroops: 1_000n, pollIntervalMs: 1, pageLimit: 100, maxBackfillPages: 10, concurrency: 2, maxAttempts: 2, disputeWindowSecs: 600 },
     },
     adapter: fakeAdapter(buys, exposure),
     trader: {

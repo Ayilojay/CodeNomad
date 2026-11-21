@@ -1,6 +1,12 @@
 /**
  * ChainStateReader: concurrent Soroban RPC reads for market and portfolio state.
  * Uses getLedgerEntries for atomic multi-key reads to ensure ledger consistency.
+ *
+ * Network/deployment isolation: every reader is bound to a network identity
+ * (e.g. "testnet", "mainnet", "localnet") and the contract deployment ids it
+ * reads from. Snapshots carry that identity so downstream indexer keys and
+ * cursors can be scoped to it, and cursors from a different network or
+ * deployment are rejected rather than silently reused.
  */
 import type { Server as StellarServer } from "@stellar/stellar-sdk/rpc";
 import { Address, xdr } from "@stellar/stellar-sdk";
@@ -16,7 +22,39 @@ interface RpcLedgerEntry {
   liveUntilLedgerSeq?: number;
 }
 
+/**
+ * Identity of the network + contract deployment a reader is bound to.
+ * Used to scope indexer keys and to validate cursors.
+ */
+export interface DeploymentIdentity {
+  /** Network identity, e.g. "testnet", "mainnet", "localnet". */
+  network: string;
+  /** Market contract id for this deployment. */
+  marketContractId: string;
+  /** Portfolio contract id for this deployment. */
+  portfolioContractId: string;
+}
+
+/**
+ * A cursor is only valid for the deployment identity it was produced under.
+ * Reusing a cursor across networks/deployments is prohibited.
+ */
+export interface ScopedCursor {
+  identity: DeploymentIdentity;
+  /** Opaque cursor payload (e.g. last processed ledger). */
+  value: string;
+}
+
+export class CursorIdentityMismatchError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "CursorIdentityMismatchError";
+  }
+}
+
 export interface ChainStateReaderOptions {
+  /** Network identity, e.g. "testnet", "mainnet", "localnet". */
+  network: string;
   marketContractId: string;
   portfolioContractId: string;
   server: StellarServer;
@@ -28,10 +66,59 @@ export class ChainStateReader {
   private readonly opts: ChainStateReaderOptions;
 
   constructor(opts: ChainStateReaderOptions) {
+    if (!opts.network || opts.network.trim() === "") {
+      throw new Error("ChainStateReader requires a non-empty network identity");
+    }
+    if (!opts.marketContractId || !opts.portfolioContractId) {
+      throw new Error("ChainStateReader requires market and portfolio contract ids");
+    }
     this.opts = opts;
   }
 
-  async readSnapshot(marketIds: bigint[]): Promise<Snapshot> {
+  /** Identity this reader is bound to; use to scope indexer keys. */
+  get identity(): DeploymentIdentity {
+    return {
+      network: this.opts.network,
+      marketContractId: this.opts.marketContractId,
+      portfolioContractId: this.opts.portfolioContractId,
+    };
+  }
+
+  /**
+   * Build a deployment-scoped indexer key. Every key must include the network
+   * and contract deployment identity so data from different configurations
+   * cannot collide.
+   */
+  scopedKey(suffix: string): string {
+    const id = this.identity;
+    return `${id.network}:${id.marketContractId}:${id.portfolioContractId}:${suffix}`;
+  }
+
+  /**
+   * Validate that a cursor belongs to this reader's deployment identity.
+   * Throws CursorIdentityMismatchError on any mismatch or missing identity.
+   */
+  assertCursor(cursor: ScopedCursor | null | undefined): void {
+    if (!cursor) return;
+    const expected = this.identity;
+    const actual = cursor.identity;
+    if (
+      !actual ||
+      actual.network !== expected.network ||
+      actual.marketContractId !== expected.marketContractId ||
+      actual.portfolioContractId !== expected.portfolioContractId
+    ) {
+      throw new CursorIdentityMismatchError(
+        `cursor identity mismatch: expected ${expected.network}/${expected.marketContractId}/${expected.portfolioContractId}, ` +
+          `got ${actual?.network ?? "<missing>"}/${actual?.marketContractId ?? "<missing>"}/${actual?.portfolioContractId ?? "<missing>"}`,
+      );
+    }
+  }
+
+  async readSnapshot(marketIds: bigint[], cursor?: ScopedCursor | null): Promise<Snapshot> {
+    // Prohibit cursor reuse across different network/deployment configurations.
+    this.assertCursor(cursor);
+
     const errors: Snapshot["errors"] = [];
 
     // Fetch portfolio and markets concurrently
@@ -226,9 +313,18 @@ function defaultPortfolio(): PortfolioState {
   };
 }
 
-async function withTimeout<T>(promise: Promise<T>, ms: number, msg: string): Promise<T> {
-  return Promise.race([
-    promise,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(msg)), ms)),
-  ]);
+function withTimeout<T>(promise: Promise<T>, ms: number, message: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(message)), ms);
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
 }
