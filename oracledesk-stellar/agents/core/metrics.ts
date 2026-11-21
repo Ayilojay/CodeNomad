@@ -237,128 +237,207 @@ export interface BacktestResult {
   benchmarkReturn: number;
   /** Maximum peak-to-trough drawdown of the strategy (fractional, >= 0). */
   maxDrawdown: number;
-  /** Brier score of the strategy's directional predictions (lower is better). */
-  calibration: number;
-  /** Number of steps where the missing-data policy was applied. */
-  missingSteps: number;
+  /** Mean absolute calibration error of predicted vs realized returns. */
+  calibrationError: number;
 }
 
 /**
- * Strategy callback: receives only the observations available up to and
- * including `index` (no look-ahead) and returns a target position fraction.
+ * Strategy tournament evaluation with risk-adjusted scoring (issue #63).
+ *
+ * Design constraints:
+ * - Variants are compared across a SHARED set of seeds. A comparison is only
+ *   valid when every variant was evaluated on the identical seed set; unpaired
+ *   comparisons are rejected rather than silently reported.
+ * - Risk-adjusted metrics are computed per variant: drawdown, tail loss
+ *   (worst-case / CVaR-style), turnover, calibration error and capital use.
+ * - Uncertainty intervals are reported for each metric so that differences
+ *   between variants are not over-interpreted.
+ * - Pure evaluation only: this module has no control-flow authority and never
+ *   bypasses the safe dry-run default or on-chain risk controls.
  */
-export type BacktestStrategy = (
-  history: readonly BacktestObservation[],
-  index: number,
-) => number;
 
-function clampPosition(position: number, maxFraction: number): number {
-  if (!Number.isFinite(position)) {
+export interface TournamentMetrics {
+  /** Mean total return across seeds (fractional). */
+  meanReturn: number;
+  /** Mean maximum drawdown across seeds (fractional, >= 0). */
+  meanDrawdown: number;
+  /** Mean tail loss: average of the worst-quantile seed returns (fractional). */
+  tailLoss: number;
+  /** Mean turnover: average absolute position change per step. */
+  meanTurnover: number;
+  /** Mean calibration error across seeds (fractional, >= 0). */
+  meanCalibrationError: number;
+  /** Mean capital use: average absolute position fraction per step. */
+  meanCapitalUse: number;
+}
+
+export interface Interval {
+  /** Lower bound of the uncertainty interval. */
+  low: number;
+  /** Upper bound of the uncertainty interval. */
+  high: number;
+}
+
+export interface TournamentVariantResult {
+  /** Per-seed metric samples, keyed by seed. */
+  samples: Record<string, TournamentMetrics>;
+  /** Aggregated point estimates across seeds. */
+  metrics: TournamentMetrics;
+  /** Uncertainty intervals for each aggregated metric. */
+  intervals: Record<keyof TournamentMetrics, Interval>;
+  /** Risk-adjusted score (higher is better); see `riskAdjustedScore`. */
+  score: number;
+}
+
+export interface TournamentResult {
+  /** Ordered list of seeds shared by every variant. */
+  seeds: string[];
+  /** Per-variant results, keyed by variant name. */
+  variants: Record<string, TournamentVariantResult>;
+  /** Variant names ranked by risk-adjusted score (best first). */
+  ranking: string[];
+}
+
+/** A single variant's per-seed metric sample. */
+export interface TournamentSample {
+  seed: string;
+  metrics: TournamentMetrics;
+}
+
+export interface TournamentVariant {
+  name: string;
+  samples: TournamentSample[];
+}
+
+/** Fraction of the worst seeds used to compute tail loss (e.g. 0.2 = worst 20%). */
+const TAIL_QUANTILE = 0.2;
+/** Two-sided z-score for a ~95% uncertainty interval. */
+const Z_95 = 1.96;
+
+function mean(values: number[]): number {
+  if (values.length === 0) {
     return 0;
   }
-  const cap = Math.max(0, maxFraction);
-  return Math.max(-cap, Math.min(cap, position));
+  let sum = 0;
+  for (const v of values) {
+    sum += v;
+  }
+  return sum / values.length;
+}
+
+function stddev(values: number[]): number {
+  if (values.length < 2) {
+    return 0;
+  }
+  const m = mean(values);
+  let acc = 0;
+  for (const v of values) {
+    const d = v - m;
+    acc += d * d;
+  }
+  return Math.sqrt(acc / (values.length - 1));
 }
 
 /**
- * Run a walk-forward backtest over time-ordered observations.
- *
- * Each step evaluates the strategy using only `observations[0..i]`, applies
- * fees on the traded notional, clamps the position to the configured cap, and
- * applies the missing-data policy when the current price is `null`.
+ * Compute a mean and a ~95% uncertainty interval for a metric sample.
+ * With fewer than two samples the interval collapses to the point estimate.
  */
-export function runWalkForwardBacktest(
-  observations: readonly BacktestObservation[],
-  strategy: BacktestStrategy,
-  config: BacktestConfig,
-): BacktestResult {
-  const steps: BacktestStep[] = [];
-  const feeRate = Number.isFinite(config.feeRate) && config.feeRate > 0 ? config.feeRate : 0;
-  const maxFraction =
-    Number.isFinite(config.maxPositionFraction) && config.maxPositionFraction > 0
-      ? config.maxPositionFraction
-      : 0;
-  const policy = config.missingDataPolicy;
+function interval(values: number[]): Interval {
+  const m = mean(values);
+  if (values.length < 2) {
+    return { low: m, high: m };
+  }
+  const half = (Z_95 * stddev(values)) / Math.sqrt(values.length);
+  return { low: m - half, high: m + half };
+}
 
-  let strategyEquity = 1;
-  let benchmarkEquity = 1;
-  let prevPosition = 0;
-  let prevPrice: number | null = null;
-  let peak = 1;
-  let maxDrawdown = 0;
-  let missingSteps = 0;
-  let brierSum = 0;
-  let brierCount = 0;
+/**
+ * Risk-adjusted score for a variant: reward return, penalize drawdown, tail
+ * loss, turnover and calibration error. Higher is better. Capital use is
+ * reported but not scored (it is a constraint, not a reward).
+ */
+export function riskAdjustedScore(metrics: TournamentMetrics): number {
+  return (
+    metrics.meanReturn -
+    metrics.meanDrawdown -
+    metrics.tailLoss -
+    metrics.meanTurnover -
+    metrics.meanCalibrationError
+  );
+}
 
-  for (let i = 0; i < observations.length; i += 1) {
-    const obs = observations[i];
-    const missing = obs.price === null || !Number.isFinite(obs.price as number);
-
-    let targetPosition: number;
-    if (missing) {
-      missingSteps += 1;
-      if (policy === "flat") {
-        targetPosition = 0;
-      } else if (policy === "hold") {
-        targetPosition = prevPosition;
-      } else {
-        // "skip": leave the position unchanged and do not trade this step.
-        targetPosition = prevPosition;
-      }
-    } else {
-      // No look-ahead: only history up to and including the current index.
-      const history = observations.slice(0, i + 1);
-      targetPosition = clampPosition(strategy(history, i), maxFraction);
-    }
-
-    const price = missing ? prevPrice : (obs.price as number);
-
-    if (!missing && prevPrice !== null && price !== null) {
-      const priceReturn = prevPrice === 0 ? 0 : price / prevPrice - 1;
-      // Strategy earns the return on the position held into this step.
-      strategyEquity *= 1 + prevPosition * priceReturn;
-      // Benchmark is buy-and-hold from the first available price.
-      benchmarkEquity *= 1 + priceReturn;
-
-      // Calibration: did the strategy's directional call match the move?
-      if (prevPosition !== 0) {
-        const predictedUp = prevPosition > 0 ? 1 : 0;
-        const actualUp = priceReturn > 0 ? 1 : 0;
-        brierSum += (predictedUp - actualUp) ** 2;
-        brierCount += 1;
-      }
-    }
-
-    // Apply fees on the traded notional when the position changes.
-    if (!missing && targetPosition !== prevPosition) {
-      const tradedNotional = Math.abs(targetPosition - prevPosition) * strategyEquity;
-      strategyEquity -= tradedNotional * feeRate;
-    }
-
-    prevPosition = targetPosition;
-    if (!missing) {
-      prevPrice = price;
-    }
-
-    peak = Math.max(peak, strategyEquity);
-    const drawdown = peak === 0 ? 0 : (peak - strategyEquity) / peak;
-    maxDrawdown = Math.max(maxDrawdown, drawdown);
-
-    steps.push({
-      timestamp: obs.timestamp,
-      position: targetPosition,
-      equity: strategyEquity,
-      benchmarkEquity,
-      missing,
-    });
+/**
+ * Evaluate a strategy tournament across variants on a shared seed set.
+ *
+ * Throws when variants are not evaluated on identical seed sets, preventing
+ * unpaired comparisons. Each variant must supply exactly one sample per seed.
+ */
+export function evaluateTournament(
+  variants: TournamentVariant[],
+): TournamentResult {
+  if (variants.length === 0) {
+    return { seeds: [], variants: {}, ranking: [] };
   }
 
-  return {
-    steps,
-    strategyReturn: strategyEquity - 1,
-    benchmarkReturn: benchmarkEquity - 1,
-    maxDrawdown,
-    calibration: brierCount === 0 ? 0 : brierSum / brierCount,
-    missingSteps,
-  };
+  const referenceSeeds = variants[0].samples.map((s) => s.seed).sort();
+  const referenceKey = referenceSeeds.join("\u0000");
+
+  for (const variant of variants) {
+    const seeds = variant.samples.map((s) => s.seed).sort();
+    if (seeds.join("\u0000") !== referenceKey) {
+      throw new Error(
+        `Unpaired comparison: variant "${variant.name}" was not evaluated on the shared seed set`,
+      );
+    }
+  }
+
+  const results: Record<string, TournamentVariantResult> = {};
+
+  for (const variant of variants) {
+    const bySeed: Record<string, TournamentMetrics> = {};
+    for (const sample of variant.samples) {
+      bySeed[sample.seed] = sample.metrics;
+    }
+
+    const ordered = referenceSeeds.map((seed) => bySeed[seed]);
+    const returns = ordered.map((m) => m.meanReturn);
+    const drawdowns = ordered.map((m) => m.meanDrawdown);
+    const turnovers = ordered.map((m) => m.meanTurnover);
+    const calibrations = ordered.map((m) => m.meanCalibrationError);
+    const capitalUses = ordered.map((m) => m.meanCapitalUse);
+
+    // Tail loss: average of the worst TAIL_QUANTILE fraction of seed returns.
+    const sortedReturns = [...returns].sort((a, b) => a - b);
+    const tailCount = Math.max(1, Math.ceil(sortedReturns.length * TAIL_QUANTILE));
+    const tailLoss = -mean(sortedReturns.slice(0, tailCount));
+
+    const metrics: TournamentMetrics = {
+      meanReturn: mean(returns),
+      meanDrawdown: mean(drawdowns),
+      tailLoss,
+      meanTurnover: mean(turnovers),
+      meanCalibrationError: mean(calibrations),
+      meanCapitalUse: mean(capitalUses),
+    };
+
+    results[variant.name] = {
+      samples: bySeed,
+      metrics,
+      intervals: {
+        meanReturn: interval(returns),
+        meanDrawdown: interval(drawdowns),
+        tailLoss: interval(ordered.map((m) => -m.meanReturn)),
+        meanTurnover: interval(turnovers),
+        meanCalibrationError: interval(calibrations),
+        meanCapitalUse: interval(capitalUses),
+      },
+      score: riskAdjustedScore(metrics),
+    };
+  }
+
+  const ranking = Object.keys(results).sort(
+    (a, b) => results[b].score - results[a].score,
+  );
+
+  return { seeds: referenceSeeds, variants: results, ranking };
 }
