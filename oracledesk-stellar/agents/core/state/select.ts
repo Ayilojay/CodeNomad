@@ -229,3 +229,179 @@ export async function canSubmit(
     return false;
   }
 }
+
+/**
+ * Runtime state file versioning and migration.
+ *
+ * State files carry a `version` field. On load, files at an older supported
+ * version are upgraded through a sequential migration chain; each step is
+ * validated against the current schema before the next step runs. Files at an
+ * unknown (future) version fail closed without being overwritten, so an
+ * unresolved intent is never silently discarded by an older binary.
+ *
+ * Writes are atomic (temp file + rename) and a bounded set of pre-migration
+ * backups is retained so operators can recover from a bad upgrade.
+ */
+export const CURRENT_STATE_VERSION = 2;
+const MAX_STATE_BACKUPS = Number(process.env.AGENT_STATE_BACKUPS ?? 5);
+
+/** A single forward migration from `from` to `from + 1`. */
+export interface StateMigration {
+  from: number;
+  migrate: (state: Record<string, unknown>) => Record<string, unknown>;
+}
+
+/**
+ * Sequential migration chain. Each entry upgrades exactly one version step so
+ * the chain can be applied in order and validated between steps.
+ */
+export const STATE_MIGRATIONS: StateMigration[] = [
+  {
+    from: 1,
+    migrate: (state) => {
+      // v1 -> v2: intents gained an explicit `status` field; older files only
+      // tracked pending intents, so default them to "pending".
+      const intents = Array.isArray(state.intents) ? state.intents : [];
+      return {
+        ...state,
+        intents: intents.map((intent) => {
+          const record = intent as Record<string, unknown>;
+          return { status: "pending", ...record };
+        }),
+      };
+    },
+  },
+];
+
+/** Validate that a migrated state object matches the current schema. */
+export function validateState(state: unknown): asserts state is Record<string, unknown> {
+  if (typeof state !== "object" || state === null || Array.isArray(state)) {
+    throw new Error("state file corrupted: expected a JSON object");
+  }
+  const record = state as Record<string, unknown>;
+  if (record.version !== CURRENT_STATE_VERSION) {
+    throw new Error(
+      `state file corrupted: expected version ${CURRENT_STATE_VERSION}, got ${String(record.version)}`,
+    );
+  }
+  if (!Array.isArray(record.intents)) {
+    throw new Error("state file corrupted: `intents` must be an array");
+  }
+  for (const intent of record.intents) {
+    if (typeof intent !== "object" || intent === null) {
+      throw new Error("state file corrupted: intent entries must be objects");
+    }
+    if (typeof (intent as Record<string, unknown>).status !== "string") {
+      throw new Error("state file corrupted: intent entries require a string `status`");
+    }
+  }
+}
+
+/**
+ * Migrate a parsed state object to the current version. Unknown future
+ * versions throw before any mutation so callers never overwrite them.
+ */
+export function migrateState(raw: unknown): Record<string, unknown> {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error("state file corrupted: expected a JSON object");
+  }
+  let state = raw as Record<string, unknown>;
+  const version = state.version;
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
+    throw new Error(`state file corrupted: invalid version ${String(version)}`);
+  }
+  if (version > CURRENT_STATE_VERSION) {
+    throw new Error(
+      `state file version ${version} is newer than supported ${CURRENT_STATE_VERSION}; refusing to overwrite`,
+    );
+  }
+  while ((state.version as number) < CURRENT_STATE_VERSION) {
+    const current = state.version as number;
+    const step = STATE_MIGRATIONS.find((m) => m.from === current);
+    if (!step) {
+      throw new Error(`no migration path from state version ${current}`);
+    }
+    state = { ...step.migrate(state), version: current + 1 };
+    validateState(state);
+  }
+  validateState(state);
+  return state;
+}
+
+/**
+ * Load, migrate, and atomically persist a runtime state file.
+ *
+ * - Unknown future versions throw without touching the file.
+ * - Corrupted input throws without touching the file.
+ * - A pre-migration backup is written before replacement, bounded by
+ *   MAX_STATE_BACKUPS.
+ * - The new state is written to a temp file and renamed into place so a
+ *   failed write never leaves a partially written state file.
+ */
+export async function loadAndMigrateState(filePath: string): Promise<Record<string, unknown>> {
+  const fs = await import("node:fs/promises");
+  const path = await import("node:path");
+
+  let rawText: string;
+  try {
+    rawText = await fs.readFile(filePath, "utf8");
+  } catch (err) {
+    throw new Error(`state file unreadable: ${(err as Error).message}`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawText);
+  } catch (err) {
+    throw new Error(`state file corrupted: invalid JSON (${(err as Error).message})`);
+  }
+
+  const originalVersion =
+    typeof parsed === "object" && parsed !== null
+      ? (parsed as Record<string, unknown>).version
+      : undefined;
+  const migrated = migrateState(parsed);
+
+  // Only rewrite when a migration actually changed the version.
+  if (originalVersion === CURRENT_STATE_VERSION) {
+    return migrated;
+  }
+
+  const dir = path.dirname(filePath);
+  const base = path.basename(filePath);
+  const backupPath = path.join(dir, `${base}.v${String(originalVersion)}.bak`);
+  await fs.writeFile(backupPath, rawText, "utf8");
+  await pruneBackups(dir, base, fs, path);
+
+  const tmpPath = path.join(dir, `.${base}.${process.pid}.${Date.now()}.tmp`);
+  await fs.writeFile(tmpPath, JSON.stringify(migrated, null, 2), "utf8");
+  await fs.rename(tmpPath, filePath);
+  return migrated;
+}
+
+/** Retain only the newest MAX_STATE_BACKUPS backups for a state file. */
+async function pruneBackups(
+  dir: string,
+  base: string,
+  fs: typeof import("node:fs/promises"),
+  path: typeof import("node:path"),
+): Promise<void> {
+  const prefix = `${base}.v`;
+  let entries: string[];
+  try {
+    entries = await fs.readdir(dir);
+  } catch {
+    return;
+  }
+  const backups = entries
+    .filter((name) => name.startsWith(prefix) && name.endsWith(".bak"))
+    .sort();
+  const excess = backups.length - MAX_STATE_BACKUPS;
+  for (let i = 0; i < excess; i++) {
+    try {
+      await fs.unlink(path.join(dir, backups[i]));
+    } catch {
+      // Best-effort pruning; never fail the migration over cleanup.
+    }
+  }
+}
