@@ -73,6 +73,17 @@ async function gateway(t: test.TestContext, body: () => Uint8Array, opts: { dela
   return { url: `${url}/ipfs`, hits: () => hits };
 }
 
+/** Gateway mock that 404s (missing content) for any CID. */
+async function missingGateway(t: test.TestContext) {
+  let hits = 0;
+  const url = await serve(t, (_req, res) => {
+    hits++;
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+  return { url: `${url}/ipfs`, hits: () => hits };
+}
+
 const fast = { retries: 2, backoffBaseMs: 1, pinTimeoutMs: 2_000 };
 
 test("rawCidForBytes digest equals sha256 hex of the bytes", async () => {
@@ -183,7 +194,7 @@ test("put fails with TracePinError listing attempts when minPins not met", async
   assert.equal(gw.hits(), 0, "no gateway check when pins are missing");
 });
 
-test("transient provider failures are retried", async (t) => {
+test("get returns verified bytes from the first healthy gateway", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
   let calls = 0;
   const k = await kubo(t, () => cid);
