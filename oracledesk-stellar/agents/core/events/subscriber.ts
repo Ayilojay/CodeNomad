@@ -32,6 +32,9 @@ import type { EventDecoder, OracleDeskEvent } from "./decode.js";
 /** Soroban RPC getEvents limits. */
 export const RPC_LIMITS = { filters: 5, contractIds: 5, topicFilters: 5, topicSegments: 4, pageLimit: 10_000 } as const;
 
+/** Maximum number of recently processed event ids retained for dedup. */
+export const PROCESSED_LRU_SIZE = 1_000;
+
 export interface Checkpoint {
   cursor?: string;
   /** Highest ledger whose events have all been acknowledged. */
@@ -151,6 +154,46 @@ export function isRetentionError(err: unknown): boolean {
   return /oldest ledger|out of (?:the )?(?:retention|range)|ledger range|before the oldest|cursor .*(?:too old|not found|invalid)/i.test(message);
 }
 
+/**
+ * Stable Soroban event id: `<ledger>-<txIndex>-<opIndex>-<eventIndex>`.
+ * This is the dedup key; it is stable across replays and re-fetches.
+ */
+export function eventKey(e: rpc.Api.EventResponse): string {
+  return e.id;
+}
+
+/**
+ * Drops events whose id is already in `processed`, preserving order. Returns
+ * the kept events and the number dropped.
+ */
+export function dedupeEvents(
+  events: OracleDeskEvent[],
+  processed: ReadonlySet<string>,
+): { kept: OracleDeskEvent[]; dropped: number } {
+  const kept: OracleDeskEvent[] = [];
+  let dropped = 0;
+  for (const ev of events) {
+    if (processed.has(ev.id)) {
+      dropped++;
+      continue;
+    }
+    kept.push(ev);
+  }
+  return { kept, dropped };
+}
+
+/** Appends `ids` to `processed`, keeping only the newest `PROCESSED_LRU_SIZE`. */
+export function mergeProcessed(processed: readonly string[], ids: readonly string[]): string[] {
+  const merged = [...processed];
+  const seen = new Set(merged);
+  for (const id of ids) {
+    if (seen.has(id)) continue;
+    seen.add(id);
+    merged.push(id);
+  }
+  return merged.length > PROCESSED_LRU_SIZE ? merged.slice(merged.length - PROCESSED_LRU_SIZE) : merged;
+}
+
 export class EventSubscriber {
   private readonly filters: rpc.Api.EventFilter[];
   private readonly pageLimit: number;
@@ -231,7 +274,7 @@ export class EventSubscriber {
         await this.retentionGap(`RPC retention starts at ledger ${page.oldestLedger}, after ${lastLedger}`, lastLedger, page.latestLedger, page.oldestLedger);
         return delivered;
       }
-      const events = page.events
+      const decoded = page.events
         .filter((e) => e.inSuccessfulContractCall)
         .map((e) => this.o.decoder.decode(e));
       if (events.length > 0) {

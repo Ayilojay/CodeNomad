@@ -118,14 +118,19 @@ function setContractLinks() {
   registryLink.href = base + deployment.reasoning_registry;
 }
 
+function setApiStatus(state) {
+  apiStatus.classList.toggle("online", state === "online");
+  apiStatus.innerHTML = `<span class="status-dot" aria-hidden="true"></span>${state === "online" ? "Online" : "Offline"}`;
+  apiStatus.setAttribute("aria-label", `API status: ${state === "online" ? "online" : "offline"}`);
+}
+
 async function checkApi() {
   try {
     const response = await fetch(`${apiBase}/health`, { signal: AbortSignal.timeout(2500) });
     if (!response.ok) throw new Error("unhealthy");
-    apiStatus.classList.add("online");
-    apiStatus.innerHTML = '<span class="status-dot"></span>Online';
+    setApiStatus("online");
   } catch {
-    apiStatus.innerHTML = '<span class="status-dot"></span>Offline';
+    setApiStatus("offline");
   }
 }
 

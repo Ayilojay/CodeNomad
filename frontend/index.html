@@ -8,6 +8,7 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="topbar">
       <a class="wordmark" href="/" aria-label="CodeNomad home"><span class="mark">C</span> CodeNomad</a>
       <div class="network"><span class="pulse"></span> <span id="network-label">Stellar testnet</span> <span class="divider"></span> <span id="clock">--:--:--</span></div>
@@ -21,7 +22,7 @@
       <button class="wallet-button" id="wallet-button" type="button"><span class="wallet-dot"></span> Connect wallet</button>
     </header>
 
-    <main>
+    <main id="main-content" tabindex="-1">
       <section class="intro reveal">
         <div>
           <p class="eyebrow">Operator console / 01</p>
@@ -38,26 +39,26 @@
         <article class="stat"><span class="stat-label">Markets indexed</span><strong>12</strong><span class="trend up">+3 this week</span></article>
         <article class="stat"><span class="stat-label">Capital deployed</span><strong>$8,420<span class="unit">.00</span></strong><span class="trend">USDC · 7 decimals</span></article>
         <article class="stat"><span class="stat-label">Traces verified</span><strong>98.7<span class="unit">%</span></strong><span class="trend up">+1.4% this month</span></article>
-        <article class="stat status-stat"><span class="stat-label">System status</span><strong><span class="status-dot"></span>Operational</strong><span class="trend">Last checked just now</span></article>
+        <article class="stat status-stat"><span class="stat-label">System status</span><strong><span class="status-dot" aria-hidden="true"></span>Operational</strong><span class="trend">Last checked just now</span></article>
       </section>
 
-      <section class="workspace reveal">
-        <div class="section-heading"><div><p class="eyebrow">Active markets</p><h2>Watch the pulse</h2></div><button class="text-button" type="button" id="refresh-button">Refresh data <span aria-hidden="true">↻</span></button></div>
+      <section class="workspace reveal" aria-labelledby="markets-heading">
+        <div class="section-heading"><div><p class="eyebrow">Active markets</p><h2 id="markets-heading">Watch the pulse</h2></div><button class="text-button" type="button" id="refresh-button" aria-label="Refresh market data">Refresh data <span aria-hidden="true">↻</span></button></div>
         <div class="market-layout">
-          <div class="market-list">
-            <button class="market-row selected" type="button" data-market="Election turnout over 70%">
-              <span class="market-icon coral">↑</span><span class="market-copy"><strong>Election turnout over 70%</strong><small>Closes in 4d 12h · #0012</small></span><span class="market-price"><strong>64¢</strong><small>YES <span class="positive">+4.2%</span></small></span>
+          <div class="market-list" role="group" aria-label="Market selection">
+            <button class="market-row selected" type="button" data-market="Election turnout over 70%" aria-pressed="true" aria-label="Election turnout over 70%, closes in 4 days 12 hours, market 0012, YES price 64 cents, up 4.2 percent">
+              <span class="market-icon coral" aria-hidden="true">↑</span><span class="market-copy"><strong>Election turnout over 70%</strong><small>Closes in 4d 12h · #0012</small></span><span class="market-price"><strong>64¢</strong><small>YES <span class="positive">+4.2%</span></small></span>
             </button>
-            <button class="market-row" type="button" data-market="BTC above $120k by June">
-              <span class="market-icon green">↗</span><span class="market-copy"><strong>BTC above $120k by June</strong><small>Closes in 19d 06h · #0011</small></span><span class="market-price"><strong>38¢</strong><small>YES <span class="negative">−1.8%</span></small></span>
+            <button class="market-row" type="button" data-market="BTC above $120k by June" aria-pressed="false" aria-label="BTC above 120 thousand dollars by June, closes in 19 days 6 hours, market 0011, YES price 38 cents, down 1.8 percent">
+              <span class="market-icon green" aria-hidden="true">↗</span><span class="market-copy"><strong>BTC above $120k by June</strong><small>Closes in 19d 06h · #0011</small></span><span class="market-price"><strong>38¢</strong><small>YES <span class="negative">−1.8%</span></small></span>
             </button>
-            <button class="market-row" type="button" data-market="Fed holds rates in May">
-              <span class="market-icon gold">=</span><span class="market-copy"><strong>Fed holds rates in May</strong><small>Closes in 2d 03h · #0010</small></span><span class="market-price"><strong>72¢</strong><small>YES <span class="positive">+0.6%</span></small></span>
+            <button class="market-row" type="button" data-market="Fed holds rates in May" aria-pressed="false" aria-label="Fed holds rates in May, closes in 2 days 3 hours, market 0010, YES price 72 cents, up 0.6 percent">
+              <span class="market-icon gold" aria-hidden="true">=</span><span class="market-copy"><strong>Fed holds rates in May</strong><small>Closes in 2d 03h · #0010</small></span><span class="market-price"><strong>72¢</strong><small>YES <span class="positive">+0.6%</span></small></span>
             </button>
           </div>
-          <div class="chart-panel">
+          <div class="chart-panel" role="region" aria-labelledby="selected-market" aria-live="polite">
             <div class="chart-top"><div><span class="chart-kicker">Selected market</span><h3 id="selected-market">Election turnout over 70%</h3></div><span class="chart-change">+4.2%</span></div>
-            <div class="chart"><div class="grid-line one"></div><div class="grid-line two"></div><div class="grid-line three"></div><svg viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Market price rising from 48 to 64 cents"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#e56b52" stop-opacity=".24" /><stop offset="1" stop-color="#e56b52" stop-opacity="0" /></linearGradient></defs><path class="chart-area" d="M0 177 C45 171 55 145 92 157 S140 128 176 142 S222 121 260 131 S305 96 341 111 S390 92 422 104 S467 75 502 83 S550 59 580 66 S615 45 640 51 V220 H0 Z" /><path class="chart-line" d="M0 177 C45 171 55 145 92 157 S140 128 176 142 S222 121 260 131 S305 96 341 111 S390 92 422 104 S467 75 502 83 S550 59 580 66 S615 45 640 51" /></svg><div class="axis"><span>10:00</span><span>14:00</span><span>18:00</span><span>22:00</span></div></div>
+            <div class="chart"><div class="grid-line one"></div><div class="grid-line two"></div><div class="grid-line three"></div><svg viewBox="0 0 640 220" preserveAspectRatio="none" role="img" aria-label="Market price rising from 48 to 64 cents"><defs><linearGradient id="area" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#e56b52" stop-opacity=".24" /><stop offset="1" stop-color="#e56b52" stop-opacity="0" /></linearGradient></defs><path class="chart-area" d="M0 177 C45 171 55 145 92 157 S140 128 176 142 S222 121 260 131 S305 96 341 111 S390 92 422 104 S467 75 502 83 S550 59 580 66 S615 45 640 51 V220 H0 Z" /><path class="chart-line" d="M0 177 C45 171 55 145 92 157 S140 128 176 142 S222 121 260 131 S305 96 341 111 S390 92 422 104 S467 75 502 83 S550 59 580 66 S615 45 640 51" /></svg><div class="axis" aria-hidden="true"><span>10:00</span><span>14:00</span><span>18:00</span><span>22:00</span></div></div>
           </div>
         </div>
       </section>
