@@ -17,6 +17,17 @@
  * The message is signed raw (never pre-hashed), matching the contract's
  * `ed25519_verify`. The golden vectors in attestation.test.ts are shared with
  * the Rust test `golden_attestation_message_and_signature`.
+ *
+ * Verified-trace cache
+ * --------------------
+ * `VerifiedTraceCache` memoizes the result of verifying a trace so callers do
+ * not re-run Ed25519 checks on every read. Entries are keyed by a deterministic
+ * composite of network, registry, trace ID and committed hash, so a trace can
+ * never be served from a cache entry belonging to a different network,
+ * registry, trace or commit. Entries expire after a configurable TTL
+ * (`DEFAULT_VERIFIED_TRACE_TTL_MS`, 5 minutes) and are invalidated eagerly when
+ * the committed hash no longer matches the verified trace or when the registry
+ * state (address/version or verification status) changes.
  */
 
 import { createHash } from "node:crypto";
@@ -97,4 +108,127 @@ export function verifyAttestation(
   const message = Buffer.from(buildAttestationMessage(ctx));
   const key = Keypair.fromPublicKey(StrKey.encodeEd25519PublicKey(Buffer.from(pubkey)));
   return key.verify(message, Buffer.from(sig));
+}
+
+/** Default TTL for verified-trace cache entries: 5 minutes. */
+export const DEFAULT_VERIFIED_TRACE_TTL_MS = 5 * 60 * 1000;
+
+/** Registry state that a verified-trace cache entry is bound to. */
+export interface RegistryState {
+  /** Registry contract address (`C...`). */
+  address: string;
+  /** Registry version / schema identifier. */
+  version: string;
+  /** Whether the registry currently considers the trace verified. */
+  verified: boolean;
+}
+
+/** Inputs that identify a verified trace for caching. */
+export interface VerifiedTraceKey {
+  /** Network passphrase (e.g. `Test SDF Network ; September 2015`). */
+  networkPassphrase: string;
+  /** Registry contract address (`C...`). */
+  registry: string;
+  /** Trace identifier. */
+  traceId: string;
+  /** Committed hash of the trace (hex or base64 string). */
+  committedHash: string;
+}
+
+/**
+ * Deterministic cache key isolating entries by network, registry, trace ID and
+ * committed hash. Each component is length-prefixed so distinct tuples can
+ * never collide into the same key.
+ */
+export function verifiedTraceCacheKey(key: VerifiedTraceKey): string {
+  const parts = [key.networkPassphrase, key.registry, key.traceId, key.committedHash];
+  return parts.map((p) => `${Buffer.byteLength(p, "utf8")}:${p}`).join("|");
+}
+
+interface CacheEntry<T> {
+  value: T;
+  committedHash: string;
+  registry: RegistryState;
+  expiresAt: number;
+}
+
+export interface VerifiedTraceCacheOptions {
+  /** Entry TTL in milliseconds. Defaults to `DEFAULT_VERIFIED_TRACE_TTL_MS`. */
+  ttlMs?: number;
+  /** Injectable clock for deterministic tests. Defaults to `Date.now`. */
+  now?: () => number;
+}
+
+/**
+ * Cache of verified traces. A `get` only returns a value when the entry is
+ * unexpired, its committed hash still matches, and the registry state is
+ * unchanged; otherwise the entry is dropped and `undefined` is returned so the
+ * caller re-verifies. This never fabricates a success: a miss forces a fresh
+ * verification.
+ */
+export class VerifiedTraceCache<T = unknown> {
+  private readonly entries = new Map<string, CacheEntry<T>>();
+  private readonly ttlMs: number;
+  private readonly now: () => number;
+
+  constructor(options: VerifiedTraceCacheOptions = {}) {
+    const ttl = options.ttlMs ?? DEFAULT_VERIFIED_TRACE_TTL_MS;
+    if (!Number.isFinite(ttl) || ttl <= 0) {
+      throw new Error(`ttlMs must be a positive number, got ${ttl}`);
+    }
+    this.ttlMs = ttl;
+    this.now = options.now ?? Date.now;
+  }
+
+  set(key: VerifiedTraceKey, value: T, registry: RegistryState): void {
+    this.entries.set(verifiedTraceCacheKey(key), {
+      value,
+      committedHash: key.committedHash,
+      registry: { ...registry },
+      expiresAt: this.now() + this.ttlMs,
+    });
+  }
+
+  get(key: VerifiedTraceKey, registry: RegistryState): T | undefined {
+    const cacheKey = verifiedTraceCacheKey(key);
+    const entry = this.entries.get(cacheKey);
+    if (!entry) return undefined;
+    if (this.now() >= entry.expiresAt) {
+      this.entries.delete(cacheKey);
+      return undefined;
+    }
+    if (entry.committedHash !== key.committedHash) {
+      this.entries.delete(cacheKey);
+      return undefined;
+    }
+    if (
+      entry.registry.address !== registry.address ||
+      entry.registry.version !== registry.version ||
+      entry.registry.verified !== registry.verified
+    ) {
+      this.entries.delete(cacheKey);
+      return undefined;
+    }
+    return entry.value;
+  }
+
+  /** Drop a single entry (e.g. on an observed hash mismatch). */
+  invalidate(key: VerifiedTraceKey): void {
+    this.entries.delete(verifiedTraceCacheKey(key));
+  }
+
+  /** Drop every entry bound to a registry address (e.g. on registry upgrade). */
+  invalidateRegistry(registryAddress: string): void {
+    for (const [cacheKey, entry] of this.entries) {
+      if (entry.registry.address === registryAddress) this.entries.delete(cacheKey);
+    }
+  }
+
+  clear(): void {
+    this.entries.clear();
+  }
+
+  get size(): number {
+    return this.entries.size;
+  }
 }
