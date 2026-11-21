@@ -35,6 +35,9 @@ services:
       X402_RATE_LIMIT_PER_CLIENT: "120"
       X402_RATE_LIMIT_GLOBAL: "2000"
       X402_TRUSTED_PROXIES: ""
+      # Health checks: liveness is dependency-free; readiness probes RPC,
+      # registry, facilitator and storage with a per-dependency timeout.
+      X402_HEALTH_READINESS_TIMEOUT_MS: "2000"
       LOG_LEVEL: info
       PORT: "3000"
       METRICS_PORT: "9090"
@@ -45,7 +48,8 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      # Liveness: dependency-free, only asserts the process is serving.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health/live"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -71,6 +75,9 @@ services:
       X402_RATE_LIMIT_PER_CLIENT: "120"
       X402_RATE_LIMIT_GLOBAL: "2000"
       X402_TRUSTED_PROXIES: ""
+      # Health checks: liveness is dependency-free; readiness probes RPC,
+      # registry, facilitator and storage with a per-dependency timeout.
+      X402_HEALTH_READINESS_TIMEOUT_MS: "2000"
       LOG_LEVEL: info
       PORT: "3001"
       METRICS_PORT: "9091"
@@ -81,7 +88,8 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+      # Liveness: dependency-free, only asserts the process is serving.
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health/live"]
       interval: 30s
       timeout: 5s
       retries: 3
