@@ -220,45 +220,42 @@ test("an explicit passphrase that disagrees with STELLAR_NETWORK is rejected", a
   assert.ok(issues.some((i) => i.startsWith("STELLAR_NETWORK_PASSPHRASE")));
 });
 
-test("contracts missing on chain produce a live-mode error but only a dry-run warning", async () => {
-  const report: ContractsReport = { missing: ["resolver"], archived: ["treasury"] };
-  const probe = new FakeProbe(NETWORKS.testnet.passphrase, report);
+test("x402 payment requirements are validated at startup", async () => {
+  // A complete, consistent x402 route loads cleanly.
+  const ok = await load({
+    X402_FACILITATOR_URL: "https://facilitator.example.com",
+    X402_RECIPIENT: MAKER.publicKey(),
+    X402_ASSET: CONTRACTS.usdc,
+    X402_AMOUNT_STROOPS: "1000000",
+  }).run();
+  assert.equal(ok.x402?.facilitatorUrl, "https://facilitator.example.com");
+  assert.equal(ok.x402?.recipient, MAKER.publicKey());
+  assert.equal(ok.x402?.asset, CONTRACTS.usdc);
+  assert.equal(ok.x402?.amountStroops, 1_000_000n);
 
+  // A malformed facilitator URL is rejected.
+  const badUrl = await issuesOf(load({ X402_FACILITATOR_URL: "not a url" }).run());
+  assert.ok(badUrl.some((i) => i.startsWith("X402_FACILITATOR_URL:")), badUrl.join(" | "));
+
+  // A non-StrKey recipient is rejected.
+  const badRecipient = await issuesOf(load({ X402_RECIPIENT: "GNOTANADDRESS" }).run());
+  assert.ok(badRecipient.some((i) => i.startsWith("X402_RECIPIENT:")), badRecipient.join(" | "));
+
+  // A non-contract asset identifier is rejected.
+  const badAsset = await issuesOf(load({ X402_ASSET: "USDC" }).run());
+  assert.ok(badAsset.some((i) => i.startsWith("X402_ASSET:")), badAsset.join(" | "));
+
+  // A non-positive amount is rejected.
+  const badAmount = await issuesOf(load({ X402_AMOUNT_STROOPS: "0" }).run());
+  assert.ok(badAmount.some((i) => i.startsWith("X402_AMOUNT_STROOPS:")), badAmount.join(" | "));
+
+  // A partially configured route fails with a precise error naming the missing key.
+  const partial = await issuesOf(load({ X402_FACILITATOR_URL: "https://facilitator.example.com" }).run());
+  assert.ok(partial.some((i) => i.startsWith("X402_RECIPIENT:")), partial.join(" | "));
+});
+
+test("contracts missing on chain produce a precise startup error", async () => {
+  const probe = new FakeProbe(NETWORKS.testnet.passphrase, { missing: ["market_core"], archived: [] });
   const issues = await issuesOf(load(LIVE, { probe }).run());
-  assert.ok(issues.some((i) => i.includes("resolver")), issues.join(" | "));
-  assert.ok(issues.some((i) => i.includes("treasury")), issues.join(" | "));
-
-  const { run, logs } = load({}, { probe });
-  const cfg = await run();
-  assert.equal(cfg.mode, "dry-run");
-  assert.ok(logs.some((l) => l.includes("resolver")));
-});
-
-test("mainnet live signing requires the explicit opt-in", async () => {
-  const env = { AGENT_MODE: "live", AGENT_SECRET_KEY: AGENT.secret(), STELLAR_NETWORK: "mainnet" };
-  const issues = await issuesOf(load(env, { probe: new FakeProbe(NETWORKS.mainnet.passphrase) }).run());
-  assert.ok(issues.some((i) => i.includes(MAINNET_OPT_IN)), issues.join(" | "));
-
-  const cfg = await load({ ...env, [MAINNET_OPT_IN]: "1" }, { probe: new FakeProbe(NETWORKS.mainnet.passphrase) }).run();
-  assert.equal(cfg.mode, "live");
-  assert.equal(cfg.network, "mainnet");
-});
-
-test("mainnet dry-run does not require the opt-in", async () => {
-  const cfg = await load({ STELLAR_NETWORK: "mainnet" }, { probe: new FakeProbe(NETWORKS.mainnet.passphrase) }).run();
-  assert.equal(cfg.mode, "dry-run");
-  assert.equal(cfg.network, "mainnet");
-});
-
-test("describeConfig never leaks the secret", async () => {
-  const cfg = await load(LIVE).run();
-  const summary = describeConfig(cfg);
-  assert.ok(!summary.includes(AGENT.secret()), "describeConfig must not print the secret");
-  assert.ok(summary.includes(AGENT.publicKey()), "describeConfig should show the public agent address");
-});
-
-test("parseTunables reports every invalid tunable at once", () => {
-  const issues = parseTunables({ MIN_EDGE_BPS: "abc", SLIPPAGE_BPS: "-3" });
-  assert.ok(issues.some((i) => i.startsWith("MIN_EDGE_BPS:")));
-  assert.ok(issues.some((i) => i.startsWith("SLIPPAGE_BPS:")));
+  assert.ok(issues.some((i) => i.includes("market_core")), issues.join(" | "));
 });

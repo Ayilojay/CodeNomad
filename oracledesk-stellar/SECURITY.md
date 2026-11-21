@@ -72,3 +72,125 @@ arbitrary cancellations:
   (`MAX_CANCELS_PER_MARKET`) to prevent indefinite griefing.
 - **Mandatory reason codes and public audit trail**: Every guardian action emits
   a `GuardianAction` event recording a typed `GuardianReason` and timestamp.
+
+## Incident and recovery runbook (agent and payment services)
+
+This runbook covers the off-chain `agents/` and `x402/` services. It is
+written for testnet operations; the same steps apply on any future network
+but the blast radius and the people to notify differ. Every step below is
+meant to be executed by an on-call operator and recorded in the incident
+ticket. **Never** present sample or cached data as live, and **never** bypass
+signature/chain verification or silently fall back after an error — if a
+check cannot be completed, stop and escalate.
+
+### 0. Detect and declare
+
+- Trigger sources: failed health checks, x402 verification errors, agent
+  spend-cap rejections, treasury pause events, or a report via the private
+  advisory channel above.
+- Open an incident ticket immediately and record: UTC start time, the
+  affected service(s), the observed symptom, and the first evidence pointer
+  (log line, tx hash, dashboard link).
+- Decide severity: **SEV1** = funds at risk or payment verification
+  compromised; **SEV2** = service degraded but funds safe; **SEV3** =
+  cosmetic/observability only. SEV1 pages the maintainer on call.
+
+### 1. Containment
+
+Goal: stop the bleeding without destroying evidence.
+
+- **Preserve evidence first.** Before restarting or redeploying anything,
+  snapshot logs, the current config, and any in-flight request/response
+  bodies to the incident ticket. Do not `rm` logs, rotate them away, or
+  truncate the DB.
+- **Agent services:** stop the agent process (or scale replicas to zero) so
+  it cannot submit further transactions. Do not edit its config in place
+  while it is running.
+- **Payment services (x402):** stop serving paid traces. If the verifier is
+  suspect, take the endpoint offline rather than serving unverified content.
+- **On-chain containment:** if a key is suspected compromised, use the
+  treasury `pause` (instant, admin-only) to halt agent spending and queued
+  withdrawals. Pausing is a containment action, not a fix — record the tx
+  hash of the pause in the ticket.
+- Do **not** attempt to "fix forward" by disabling a verification check.
+
+### 2. Key rotation
+
+Rotate any key that could have been exposed. Rotate in this order so the
+new key is live before the old one is retired:
+
+1. Generate the replacement key offline; never paste it into a ticket, chat,
+   or commit. Store it in the same secret store the service already reads
+   from.
+2. For agent/operator keys: update the role binding on-chain (the treasury
+   and resolver role checks are the source of truth), confirm the new key is
+   authorized, then revoke the old key.
+3. For the treasury admin key: `set_successor` to the new admin, confirm the
+   successor is active, then retire the old key. Remember the admin can
+   pause instantly and migrate positions — treat a leaked admin key as a
+   custody incident (SEV1).
+4. For x402 payment/signing keys: deploy the new key to the verifier, confirm
+   a known-good trace verifies end-to-end, then remove the old key.
+5. Record every rotation (which key, old/new public identifier, tx hashes,
+   UTC time) in the ticket. Never record the secret itself.
+
+### 3. Pausing
+
+- **Treasury:** `pause` halts agent spending and queued withdrawals
+  immediately. Use it for any suspected key compromise or anomalous spend.
+  Unpausing is a deliberate, logged decision — confirm the root cause is
+  understood and the offending key is rotated before resuming.
+- **Agents:** stopping the process is the pause. Confirm no transactions are
+  in flight (check the mempool/explorer for the agent address) before
+  declaring the agent paused.
+- **x402:** taking the endpoint offline is the pause. Confirm no paid traces
+  are being served from cache or a fallback path.
+- Pausing must never silently fall back to serving stale data; a paused
+  service returns an explicit error, not sample content.
+
+### 4. Uncertain transaction / payment reconciliation
+
+When a transaction or payment's final state is unknown (timeout, dropped
+connection, ambiguous explorer result), **do not resubmit blindly**. Resolve
+it with these decision points:
+
+1. **Look up the tx hash on-chain.** If it is confirmed, record the ledger
+   and treat it as done — do not resubmit.
+2. **If not found after the expected confirmation window,** check whether it
+   was dropped (never entered a ledger) vs. still pending. Only a confirmed
+   *drop* permits a resubmit, and the resubmit must reuse the same logical
+   intent (same amount, same recipient) with a fresh nonce/idempotency key.
+3. **For x402 payments,** reconcile the payment reference against the
+   on-chain record and the trace hash. A trace is only served when the hash
+   matches the on-chain record; if it does not match, treat it as a failed
+   verification (SEV1) and do not serve it.
+4. **For treasury withdrawals,** reconcile the queued withdrawal against the
+   vault's recorded state. Never manually credit a withdrawal that the vault
+   does not show as satisfied.
+5. Record the decision (confirmed / dropped / mismatched), the evidence, and
+   the resulting action in the ticket. If any step is ambiguous, escalate
+   rather than guess.
+
+### 5. State restore and service resumption
+
+- Restore from the last known-good snapshot/config, not from an ad-hoc edit.
+  Record the snapshot identifier in the ticket.
+- Re-run the focused package tests/build for the affected service before
+  resuming (see the package's own test command); a service does not resume on
+  a red build.
+- Resume in this order: verifier/x402 first (confirm a known-good trace
+  verifies), then agents (confirm spend caps and role bindings are correct),
+  then unpause the treasury last.
+- After resumption, watch the service for at least one full reconciliation
+  window and confirm no new anomalies before closing the incident.
+- Write a short post-incident note: timeline, root cause, what was contained,
+  keys rotated, and any follow-up issues filed.
+
+### Manual operator verification
+
+Some steps above are inherently manual (key rotation, on-chain pause/unpause,
+reconciliation against the explorer). For these, verify on **localnet or with
+deterministic fixtures** before doing them on testnet, and record the
+verification in the ticket. Automated coverage for the code paths these steps
+rely on (verification, spend caps, pause behavior) lives in the focused
+package tests; the runbook itself is verified by a dry run on localnet.

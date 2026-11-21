@@ -259,3 +259,45 @@ jobs:
         run: |
           cd agents
           npm run test:chaos
+
+  lint:
+    name: Lint & format (agents, x402, SDK, frontend)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Each package owns its own ESLint flat config + Prettier config and
+      # exposes `lint` / `format:check` scripts. Generated bindings are
+      # excluded from linting to avoid churn on regenerated code.
+      - name: agents — lint & format check
+        run: |
+          cd agents
+          npm install
+          npm run lint
+          npm run format:check
+
+      - name: x402 — lint & format check
+        run: |
+          cd x402
+          npm ci
+          npm run lint
+          npm run format:check
+
+      - name: SDK — lint & format check
+        run: |
+          cd sdk
+          npm install
+          npm run lint
+          npm run format:check
+
+      - name: frontend — lint & format check
+        run: |
+          cd frontend
+          npm install
+          npm run lint
+          npm run format:check

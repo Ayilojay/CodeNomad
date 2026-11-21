@@ -9,9 +9,54 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Reads the documented minimum and pinned CI toolchain versions once so the
+  # matrix jobs below stay in sync with rust-toolchain.toml / stellar-cli.version
+  # / .nvmrc instead of hard-coding them in several places.
+  toolchain-versions:
+    name: Resolve toolchain versions
+    runs-on: ubuntu-latest
+    outputs:
+      rust: ${{ steps.pinned.outputs.rust }}
+      rust_min: ${{ steps.pinned.outputs.rust_min }}
+      stellar_cli: ${{ steps.pinned.outputs.stellar_cli }}
+      node: ${{ steps.pinned.outputs.node }}
+      node_min: ${{ steps.pinned.outputs.node_min }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read pinned and minimum toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "rust_min=$(tr -d '[:space:]' < rust-minimum-version.txt)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+          echo "node=$(tr -d '[:space:]' < .nvmrc)" >> "$GITHUB_OUTPUT"
+          echo "node_min=$(tr -d '[:space:]' < node-minimum-version.txt)" >> "$GITHUB_OUTPUT"
+
+  # Focused test that asserts the supported/unsupported toolchain combinations
+  # and fails loudly (no silent fallback) on unsupported ones. Runs on the
+  # pinned release toolchain so the check itself is deterministic.
+  toolchain-matrix:
+    name: Toolchain matrix (supported/unsupported)
+    runs-on: ubuntu-latest
+    needs: toolchain-versions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.toolchain-versions.outputs.rust }}
+      - name: Assert supported/unsupported toolchain combinations
+        env:
+          RUST_PINNED: ${{ needs.toolchain-versions.outputs.rust }}
+          RUST_MIN: ${{ needs.toolchain-versions.outputs.rust_min }}
+          STELLAR_CLI_PINNED: ${{ needs.toolchain-versions.outputs.stellar_cli }}
+          NODE_PINNED: ${{ needs.toolchain-versions.outputs.node }}
+          NODE_MIN: ${{ needs.toolchain-versions.outputs.node_min }}
+        run: ./scripts/ci/assert-toolchain-matrix.sh
+
   rust:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest
+    needs: toolchain-versions
     steps:
       - uses: actions/checkout@v4
         with:
@@ -25,7 +70,7 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ steps.pinned.outputs.rust }}
+          toolchain: ${{ needs.toolchain-versions.outputs.rust }}
           targets: wasm32v1-none
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -34,7 +79,7 @@ jobs:
       # (`cargo install stellar-cli` — verified against the actual crate
       # name behind the `stellar` binary, not a guessed GitHub Action).
       - name: Install stellar CLI
-        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
+        run: cargo install --locked stellar-cli --version ${{ needs.toolchain-versions.outputs.stellar_cli }}
 
       - name: cargo fmt --check
         run: |
@@ -73,25 +118,38 @@ jobs:
           name: contract-wasm
           path: target/wasm32v1-none/release/*.wasm
 
+  # Builds the workspace on the documented minimum Rust toolchain to prove the
+  # minimum is actually supported. Determinism is only asserted on the pinned
+  # release toolchain (see reproducible-wasm) since wasm output is not expected
+  # to be byte-identical across compiler versions.
+  rust-minimum:
+    name: Rust minimum (${{ needs.toolchain-versions.outputs.rust_min }})
+    runs-on: ubuntu-latest
+    needs: toolchain-versions
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ needs.toolchain-versions.outputs.rust_min }}
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo test on minimum Rust
+        run: cargo test --workspace
+
   reproducible-wasm:
     name: Reproducible wasm (two clean builds)
     runs-on: ubuntu-latest
+    needs: toolchain-versions
     steps:
       - uses: actions/checkout@v4
 
-      - name: Read pinned toolchain versions
-        id: pinned
-        run: |
-          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
-          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
-
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ steps.pinned.outputs.rust }}
+          toolchain: ${{ needs.toolchain-versions.outputs.rust }}
           targets: wasm32v1-none
 
       - name: Install stellar CLI
-        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
+        run: cargo install --locked stellar-cli --version ${{ needs.toolchain-versions.outputs.stellar_cli }}
 
       # Builds the workspace twice into separate target directories, compares
       # every wasm byte-for-byte, then checks the vendored copies against a
@@ -119,7 +177,7 @@ jobs:
   node:
     name: Node (x402, agents)
     runs-on: ubuntu-latest
-    needs: rust
+    needs: [rust, toolchain-versions]
     steps:
       - uses: actions/checkout@v4
         with:
