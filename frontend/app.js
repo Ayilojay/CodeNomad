@@ -24,33 +24,13 @@ const DEPLOYMENT_MANIFESTS = {
 
 const NETWORK_STORAGE_KEY = "oracledeskNetwork";
 const apiBase = localStorage.getItem("oracledeskApiUrl") || "http://localhost:3000";
+const expectedNetwork = "TESTNET";
 const clock = document.querySelector("#clock");
 const apiStatus = document.querySelector("#api-status");
-const networkSelect = document.querySelector("#network-select");
+const walletButton = document.querySelector("#wallet-button");
+const walletStatus = document.querySelector("#wallet-status");
 
-// Bounds for user-supplied trade parameters. Values outside these ranges are rejected
-// rather than silently clamped so the user always knows what they signed.
-const SLIPPAGE_BOUNDS = { min: 0, max: 5000 }; // basis points (0% - 50%)
-const DEADLINE_BOUNDS = { min: 30, max: 3600 }; // seconds
-
-// Resolve the active network from the selector, falling back to the persisted
-// choice. Returns null when the network has no validated manifest.
-function getSelectedNetwork() {
-  const raw = (networkSelect && networkSelect.value) || localStorage.getItem(NETWORK_STORAGE_KEY) || "local";
-  return DEPLOYMENT_MANIFESTS[raw] ? raw : null;
-}
-
-function getDeployment() {
-  const network = getSelectedNetwork();
-  return network ? DEPLOYMENT_MANIFESTS[network] : null;
-}
-
-// Scope caches and wallet state by network so switching networks never reuses
-// addresses or signatures from a different chain.
-function networkScopedKey(key) {
-  const network = getSelectedNetwork() || "unselected";
-  return `${key}:${network}`;
-}
+let walletState = { connected: false, publicKey: null, network: null };
 
 // --- Explicit network selection (#107) ---
 // Networks are declared explicitly. Only networks with a validated deployment
@@ -384,8 +364,12 @@ document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("
   loadLifecycle(row.dataset.market);
 }));
 
-document.querySelector("#wallet-button").addEventListener("click", (event) => {
-  event.currentTarget.innerHTML = '<span class="wallet-dot"></span> Wallet ready';
+walletButton.addEventListener("click", () => {
+  if (walletState.connected) {
+    disconnectWallet();
+  } else {
+    connectWallet();
+  }
 });
 document.querySelector("#refresh-button").addEventListener("click", checkApi);
 

@@ -1,14 +1,66 @@
-# Frontend
+# CodeNomad Frontend
 
-User-facing surfaces for CodeNomad. This package consumes the generated
-bindings in `packages/bindings/*` — it never hardcodes contract addresses,
-quotes, or sample values as live data.
+User-facing web app for CodeNomad. This document covers the wallet connection
+flow, network verification, and the manual verification steps required before
+shipping to testnet or mainnet.
 
-## Network selection (#107)
+## Wallet connection
 
-The frontend exposes an explicit network selector with `local`, `testnet`, and
-future networks. There is no implicit default that silently falls back after an
-error — the selected network is always shown and must be chosen deliberately.
+The frontend connects to a supported Stellar wallet via
+[Stellar Wallets Kit](https://github.com/Creit-Tech/Stellar-Wallets-Kit)
+(which wraps Freighter, xBull, Albedo, and other supported wallets).
+
+On connect the app:
+
+1. Requests the selected public key from the wallet.
+2. Reads the wallet's active network (`PUBLIC`, `TESTNET`, `FUTURENET`, or
+   `LOCAL`).
+3. Compares the wallet network against the expected network configured for the
+   build (`NEXT_PUBLIC_STELLAR_NETWORK`, default `TESTNET`).
+
+### Displayed state
+
+When a wallet is connected and the network matches, the UI shows:
+
+- The connected **public key** (truncated, with the full key available on
+  hover/copy).
+- The **detected network** reported by the wallet.
+
+No sample or placeholder key is ever rendered as if it were live. If no wallet
+is connected, the UI shows the disconnected state.
+
+### Network mismatch
+
+If the wallet's network does not match the expected network, the connection is
+**rejected**:
+
+- The app surfaces a clear error (e.g. "Wallet is on PUBLIC but this app expects
+  TESTNET. Switch networks in your wallet and reconnect.").
+- The wallet is **not** treated as connected; no public key is shown as active.
+- There is **no silent fallback** to the wallet's network or to a default key.
+
+### Disconnect and errors
+
+Disconnecting (or any connection error) resets UI state so that no wallet is
+shown as connected. Errors are surfaced to the user rather than swallowed.
+
+## Automated tests
+
+The wallet flow has focused tests covering:
+
+- Successful connect: public key and network are surfaced.
+- Network mismatch: connection is rejected with a clear error and no connected
+  state.
+- Disconnect: state is reset and no wallet is shown as connected.
+- Wallet/API error: error is surfaced and state is not left in a connected
+  state.
+
+Run the frontend package tests and build in CI:
+
+```bash
+npm test
+npm run build
+```
 
 Open <http://localhost:4173>. The optional x402 status indicator checks
 `http://localhost:3000/health`; set `localStorage.oracledeskApiUrl` in the
