@@ -12,6 +12,10 @@ COPY --from=builder /build/node_modules ./node_modules
 COPY --from=builder /build/dist ./dist
 COPY --from=builder /build/package.json ./
 
+# Publish the OpenAPI contract alongside the server so operators and CI can
+# validate the documented x402 routes against the running build.
+COPY --from=builder /build/openapi/x402.openapi.yaml ./openapi/x402.openapi.yaml
+
 # Health check: verify metrics endpoint is alive
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
   CMD wget --no-verbose --tries=1 --spider http://localhost:9090/metrics || exit 1

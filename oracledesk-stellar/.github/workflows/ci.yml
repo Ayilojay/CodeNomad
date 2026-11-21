@@ -16,7 +16,14 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ steps.pinned.outputs.rust }}
           targets: wasm32v1-none
@@ -40,7 +47,7 @@ jobs:
           CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --workspace --locked
 
       - name: Build all contracts to wasm
         run: |
@@ -100,9 +107,12 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Read pinned Python version
+        id: pinned
+        run: echo "python=$(tr -d '[:space:]' < .python-version)" >> "$GITHUB_OUTPUT"
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ steps.pinned.outputs.python }}
       - run: python3 model/fpmm_model.py
       - run: python3 model/fpmm_bounds.py --quick
 
@@ -114,22 +124,28 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+          echo "node=$(tr -d '[:space:]' < .nvmrc)" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ steps.pinned.outputs.node }}
       - uses: actions/download-artifact@v4
         with:
           name: contract-wasm
           path: target/wasm32v1-none/release
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
       - uses: Swatinem/rust-cache@v2
       - name: Install Stellar CLI
-        run: |
-          curl -fsSL https://github.com/stellar/stellar-cli/releases/download/v27.1.0/stellar-cli-27.1.0-x86_64-unknown-linux-gnu.tar.gz -o /tmp/stellar.tar.gz
-          mkdir -p "$RUNNER_TEMP/stellar-bin"
-          tar -xzf /tmp/stellar.tar.gz -C "$RUNNER_TEMP/stellar-bin" stellar
-          echo "$RUNNER_TEMP/stellar-bin" >> "$GITHUB_PATH"
+        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
 
       - name: Generate bindings from the built wasm
         run: |
@@ -147,7 +163,7 @@ jobs:
       - name: Install and build bindings packages
         run: |
           for pkg in market-core resolver treasury reasoning-registry timelock router; do
-            (cd "packages/bindings/$pkg" && npm install && npm run build)
+            (cd "packages/bindings/$pkg" && npm ci && npm run build)
           done
 
       - name: Interface tool tests
@@ -163,45 +179,110 @@ jobs:
       - name: agents — install, typecheck, test
         run: |
           cd agents
-          npm install
+          npm ci
           npm run build
           npm test
 
-  runbook:
-    name: Ops runbook (incident & recovery)
+      - name: Fail if lockfiles or manifests drifted during install/build
+        run: |
+          git diff --exit-code -- \
+            Cargo.lock \
+            x402/package-lock.json \
+            agents/package-lock.json \
+            packages/bindings/market-core/package-lock.json \
+            packages/bindings/resolver/package-lock.json \
+            packages/bindings/treasury/package-lock.json \
+            packages/bindings/reasoning-registry/package-lock.json \
+            packages/bindings/timelock/package-lock.json \
+            packages/bindings/router/package-lock.json
+
+  release-bundle:
+    name: Release bundle (checksums, manifests, metadata)
+    runs-on: ubuntu-latest
+    needs: [rust, node]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read pinned toolchain versions
+        id: pinned
+        run: |
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "stellar_cli=$(tr -d '[:space:]' < stellar-cli.version)" >> "$GITHUB_OUTPUT"
+          echo "node=$(tr -d '[:space:]' < .nvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
+          targets: wasm32v1-none
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.pinned.outputs.node }}
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install stellar CLI
+        run: cargo install --locked stellar-cli --version ${{ steps.pinned.outputs.stellar_cli }}
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm
+          path: target/wasm32v1-none/release
+
+      - name: Generate bindings from the built wasm
+        run: |
+          chmod +x scripts/gen-bindings.sh
+          ./scripts/gen-bindings.sh
+
+      - name: Assemble verifiable release bundle
+        run: |
+          chmod +x scripts/build-release-bundle.sh
+          ./scripts/build-release-bundle.sh
+
+      - name: Verify the bundle against a clean rebuild
+        run: |
+          chmod +x scripts/verify-release-bundle.sh
+          ./scripts/verify-release-bundle.sh dist/release-bundle
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/release-bundle
+
+  security:
+    name: Security (deps, secrets, artifacts)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      # Issue #124: the incident/recovery runbook is an operational artifact.
-      # This gate keeps it present and complete so operators always have a
-      # verified procedure for containment, key rotation, pausing,
-      # reconciliation, state restore and resumption.
-      - name: Verify incident & recovery runbook is present and complete
+      - name: Read pinned toolchain versions
+        id: pinned
         run: |
-          set -euo pipefail
-          runbook="docs/runbooks/incident-recovery.md"
-          if [ ! -f "$runbook" ]; then
-            echo "::error file=$runbook::Incident & recovery runbook is missing (#124)"
-            exit 1
-          fi
-          required=(
-            "Containment"
-            "Key rotation"
-            "Pausing"
-            "Reconciliation"
-            "State restore"
-            "Resumption"
-            "Evidence preservation"
-          )
-          missing=0
-          for section in "${required[@]}"; do
-            if ! grep -qi "$section" "$runbook"; then
-              echo "::error file=$runbook::Runbook is missing required section: $section (#124)"
-              missing=1
-            fi
+          echo "rust=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+          echo "node=$(tr -d '[:space:]' < .nvmrc)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ steps.pinned.outputs.rust }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.pinned.outputs.node }}
+
+      # Dependency scanning. `cargo audit` reads the committed Cargo.lock and
+      # fails on any advisory not explicitly ignored in .cargo/audit.toml
+      # (each ignore there carries a rationale comment).
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit (Rust dependencies)
+        run: cargo audit --deny warnings
+
+      - name: npm audit (Node dependencies)
+        run: |
+          for dir in x402 agents packages/bindings/market-core packages/bindings/resolver \
+            packages/bindings/treasury packages/bindings/reasoning-registry \
+            packages/bindings/timelock packages/bindings/router; do
+            (cd "$dir" && npm audit --audit-level=high)
           done
-          if [ "$missing" -ne 0 ]; then
-            exit 1
-          fi
-          echo "Runbook present with all required sections."
