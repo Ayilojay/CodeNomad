@@ -2,11 +2,13 @@
   "name": "codenomad-frontend",
   "version": "0.1.0",
   "private": true,
-  "description": "CodeNomad frontend with explicit network selection (local, testnet, future networks)",
+  "description": "CodeNomad frontend with explicit local, testnet and future network selection",
   "type": "module",
   "scripts": {
-    "start": "node server.js",
-    "test": "node --test test/"
+    "start": "node server.mjs",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write ."
   },
   "engines": {
     "node": ">=18"

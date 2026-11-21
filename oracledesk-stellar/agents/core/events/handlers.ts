@@ -109,3 +109,148 @@ export function resync(deps: { reloadAll: () => Promise<void>; log?: (event: str
     await deps.reloadAll();
   };
 }
+
+/**
+ * Rebuildable read models (#97).
+ *
+ * Market lifecycle, trades and treasury activity views are derived purely from
+ * canonical events. Every derived record carries the `sourceEventId` of the
+ * event that produced it, so applying the same event twice is a no-op and a
+ * full rebuild (replaying every event from scratch) yields exactly the same
+ * records as incremental updates. Nothing here trusts an event in isolation to
+ * fabricate a success state: records are only emitted for events that carry the
+ * fields the view needs, and unknown kinds are ignored.
+ */
+export interface MarketLifecycleRecord {
+  marketId: bigint;
+  /** Latest lifecycle stage observed for the market. */
+  stage: "open" | "resolution_proposed" | "resolved" | "finalized";
+  outcome?: string;
+  /** Ledger close time of the event that set this stage. */
+  updatedAt: bigint;
+  sourceEventId: string;
+}
+
+export interface TradeRecord {
+  marketId: bigint;
+  trader: string;
+  side: string;
+  collateral: bigint;
+  /** Ledger close time of the trade. */
+  at: bigint;
+  sourceEventId: string;
+}
+
+export interface TreasuryActivityRecord {
+  marketId: bigint;
+  /** Activity kind, e.g. "trade", "resolution_proposed", "resolved". */
+  activity: string;
+  amount: bigint;
+  at: bigint;
+  sourceEventId: string;
+}
+
+export interface ReadModels {
+  lifecycle: Map<bigint, MarketLifecycleRecord>;
+  trades: TradeRecord[];
+  treasury: TreasuryActivityRecord[];
+}
+
+export function emptyReadModels(): ReadModels {
+  return { lifecycle: new Map(), trades: [], treasury: [] };
+}
+
+/** Stable identity for an event, used to dedupe incremental updates. */
+export function sourceEventId(e: OracleDeskEvent): string {
+  const anyE = e as unknown as { txHash?: string; eventIndex?: number; ledger?: number };
+  if (anyE.txHash !== undefined && anyE.eventIndex !== undefined) {
+    return `${anyE.txHash}:${anyE.eventIndex}`;
+  }
+  return `${e.kind}:${String(anyE.ledger ?? "")}:${JSON.stringify(e)}`;
+}
+
+const STAGE_RANK: Record<MarketLifecycleRecord["stage"], number> = {
+  open: 0,
+  resolution_proposed: 1,
+  resolved: 2,
+  finalized: 3,
+};
+
+/**
+ * Applies a single canonical event to the read models. Idempotent: re-applying
+ * an event whose `sourceEventId` is already recorded leaves the models
+ * unchanged. Returns true when the models changed.
+ */
+export function applyEvent(models: ReadModels, e: OracleDeskEvent): boolean {
+  const id = sourceEventId(e);
+  if (models.trades.some((t) => t.sourceEventId === id)) return false;
+  if (models.treasury.some((t) => t.sourceEventId === id)) return false;
+  if (models.lifecycle.get((e as { marketId?: bigint }).marketId ?? -1n)?.sourceEventId === id) return false;
+
+  switch (e.kind) {
+    case "MarketOpened": {
+      const m = e as Of<"MarketOpened">;
+      return setStage(models, m.marketId, "open", undefined, m.closedAt, id);
+    }
+    case "ResolutionProposed": {
+      const m = e as Of<"ResolutionProposed">;
+      const changed = setStage(models, m.marketId, "resolution_proposed", m.outcome, m.closedAt, id);
+      models.treasury.push({ marketId: m.marketId, activity: "resolution_proposed", amount: 0n, at: m.closedAt, sourceEventId: id });
+      return changed || true;
+    }
+    case "MarketResolved": {
+      const m = e as Of<"MarketResolved">;
+      const changed = setStage(models, m.marketId, "resolved", m.outcome, m.closedAt, id);
+      models.treasury.push({ marketId: m.marketId, activity: "resolved", amount: 0n, at: m.closedAt, sourceEventId: id });
+      return changed || true;
+    }
+    case "ResolutionFinalized": {
+      const m = e as Of<"ResolutionFinalized">;
+      return setStage(models, m.marketId, "finalized", undefined, m.closedAt, id);
+    }
+    case "PriceResolution": {
+      const m = e as Of<"PriceResolution">;
+      return setStage(models, m.marketId, "resolved", undefined, m.closedAt, id);
+    }
+    case "Trade": {
+      const m = e as Of<"Trade">;
+      models.trades.push({
+        marketId: m.marketId,
+        trader: m.trader,
+        side: m.side,
+        collateral: m.collateral,
+        at: m.closedAt,
+        sourceEventId: id,
+      });
+      models.treasury.push({ marketId: m.marketId, activity: "trade", amount: m.collateral, at: m.closedAt, sourceEventId: id });
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
+function setStage(
+  models: ReadModels,
+  marketId: bigint,
+  stage: MarketLifecycleRecord["stage"],
+  outcome: string | undefined,
+  updatedAt: bigint,
+  sourceEventId: string,
+): boolean {
+  const prev = models.lifecycle.get(marketId);
+  if (prev && STAGE_RANK[prev.stage] > STAGE_RANK[stage]) return false;
+  models.lifecycle.set(marketId, { marketId, stage, outcome, updatedAt, sourceEventId });
+  return true;
+}
+
+/**
+ * Full rebuild: replays every canonical event from scratch. Because
+ * `applyEvent` is idempotent and order-stable per stage, the result is
+ * identical to applying the same events incrementally.
+ */
+export function rebuildReadModels(events: Iterable<OracleDeskEvent>): ReadModels {
+  const models = emptyReadModels();
+  for (const e of events) applyEvent(models, e);
+  return models;
+}

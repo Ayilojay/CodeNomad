@@ -1,32 +1,31 @@
-# Bindings Release Pipeline Implementation Plan
+# Bindings Release Pipeline
 
-## Overview
-Implementation plan for adding a complete release pipeline for `@oracledesk/bindings-*` packages with semantic versioning, changelogs, npm publishing with provenance, and wasm hash tracking.
+This document describes how generated bindings and WASM artifacts are produced,
+verified, and released for the OracleDesk Stellar contracts.
 
-## Current State Analysis
+## Supported toolchains
 
-### Already Implemented ✅
-- `scripts/gen-bindings.sh` preserves versions, CHANGELOG.md, and package-lock.json across regeneration
-- Interface snapshots extracted to `interface.json` via `scripts/interface-manifest`
-- Packages already at v0.1.0 with scoped names (`@oracledesk/bindings-<name>`)
-- Six bindings packages: market-core, resolver, reasoning-registry, treasury, timelock, router
+The pipeline is validated against a matrix of toolchain versions. The
+**minimum** column is the oldest version we support; the **pinned** column is
+the version used for release artifacts and determinism checks.
 
-### Missing Components ❌
-- `package.json` metadata: `files`, `repository`, `license`, `publishConfig`, `keywords`, `oracledesk.wasmSha256`
-- Semantic versioning automation based on contract interface diffs
-- Changesets integration for version bumps and changelog generation
-- Root-level release workflow (`/.github/workflows/release-bindings.yml`)
-- Package validation scripts
-- Documentation for downstream consumers
-- CI job for testing packed tarballs
+| Tool          | Minimum supported | Pinned CI / release |
+| ------------- | ----------------- | ------------------- |
+| Rust          | 1.74.0            | 1.79.0              |
+| Node.js       | 18.18.0           | 20.11.0             |
+| Stellar CLI   | 21.0.0            | 21.1.0              |
 
-## Implementation Steps
+Any combination outside these ranges is **unsupported**. The CI matrix job
+(`bindings-toolchain-matrix`) runs the focused build/test suite for each
+supported combination and fails loudly on unsupported combinations — there is
+no silent fallback to a different toolchain.
 
-### 1. Package Metadata Enhancement
+## CI matrix
 
-**File:** `oracledesk-stellar/scripts/gen-bindings.sh` (modify)
+The `bindings-toolchain-matrix` workflow job runs the following combinations:
 
-Add metadata merge step after `stellar contract bindings typescript`:
+- **minimum**: Rust 1.74.0, Node 18.18.0, Stellar CLI 21.0.0
+- **pinned**: Rust 1.79.0, Node 20.11.0, Stellar CLI 21.1.0
 
 ```bash
 # After the bindings generation and before the jq .name/.version step:
@@ -244,470 +243,197 @@ ${changes.map(c => `- ${c}`).join('\n')}
   console.log(`Created changeset: ${filename}`);
 }
 
-// Main
-const [, , packageName] = process.argv;
-if (!packageName) {
-  console.error('Usage: tsx scripts/bindings-semver.ts <package-name>');
-  process.exit(1);
-}
+function main() {
+  const packageName = process.argv[2];
+  if (!packageName) {
+    console.error('Usage: tsx scripts/bindings-semver.ts <package-name>');
+    process.exit(1);
+  }
 
-const oldInterface = loadInterface(`packages/bindings/${packageName}/interface.json`);
-const newInterface = loadInterface(`packages/bindings/${packageName}/interface.json`); // TODO: Load from fresh wasm
+  const pkgDir = `packages/bindings/${packageName}`;
+  const newInterfacePath = `${pkgDir}/interface.json`;
+  const pkgJsonPath = `${pkgDir}/package.json`;
 
-const packageJson = JSON.parse(readFileSync(`packages/bindings/${packageName}/package.json`, 'utf-8'));
-const currentVersion = packageJson.version;
+  let currentVersion = '0.0.0';
+  try {
+    const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
+    currentVersion = pkg.version || currentVersion;
+  } catch {
+    console.warn(`No package.json found at ${pkgJsonPath}, assuming ${currentVersion}`);
+  }
 
-const { bump, changes } = classifyDiff(oldInterface, newInterface, currentVersion);
+  // Fetch the last published interface.json from npm for comparison
+  let oldInterfacePath: string | null = null;
+  try {
+    const tmpDir = execSync('mktemp -d').toString().trim();
+    execSync(
+      `npm pack @oracledesk/bindings-${packageName}@${currentVersion} --pack-destination ${tmpDir}`,
+      { stdio: 'pipe' }
+    );
+    const tarball = execSync(`ls ${tmpDir}/*.tgz`).toString().trim();
+    execSync(`tar -xzf ${tarball} -C ${tmpDir}`);
+    oldInterfacePath = `${tmpDir}/package/interface.json`;
+  } catch {
+    console.warn(`Could not fetch published interface for ${packageName}@${currentVersion}; treating as initial release`);
+  }
 
-if (bump && changes.length > 0) {
+  if (!oldInterfacePath) {
+    console.log(`No previous interface for ${packageName}; skipping semver diff`);
+    return;
+  }
+
+  const oldSpec = loadInterface(oldInterfacePath);
+  const newSpec = loadInterface(newInterfacePath);
+  const { bump, changes } = classifyDiff(oldSpec, newSpec, currentVersion);
+
+  if (!bump || changes.length === 0) {
+    console.log(`No interface changes for ${packageName}`);
+    return;
+  }
+
   writeChangeset(packageName, bump, changes);
-} else {
-  console.log(`No interface changes detected for ${packageName}`);
 }
+
+main();
 ```
 
-**Note:** The tool above is a skeleton. The actual implementation would need to:
-- Load the OLD interface from the last published npm package or committed snapshot
-- Load the NEW interface from the freshly extracted interface.json
-- Handle all edge cases mentioned in the issue
+### 3. Release Bundle: Checksums, Manifests, and Build Metadata
 
-### 3. Changesets Configuration
+**File:** `oracledesk-stellar/scripts/build-release-bundle.sh` (new)
 
-**File:** `oracledesk-stellar/.changeset/config.json` (new)
+Produces a verifiable release bundle per artifact (WASM + bindings tarball) containing:
+- `SHA256SUMS` — checksums for every artifact in the bundle
+- `interface.json` — exported surface manifest per bindings package
+- `build-metadata.json` — source revision (git commit), toolchain versions, build timestamp, and reproducibility inputs
 
-```json
+```bash
+#!/usr/bin/env bash
+# Builds a verifiable release bundle for WASM + bindings artifacts.
+#
+# Output layout (under dist/release-bundle/):
+#   artifacts/<name>.wasm
+#   artifacts/@oracledesk-bindings-<name>-<version>.tgz
+#   manifests/<name>.interface.json
+#   build-metadata.json
+#   SHA256SUMS
+#
+# Consumers verify with:
+#   sha256sum -c SHA256SUMS
+#   jq -r '.sourceCommit' build-metadata.json   # compare to expected git rev
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+OUT="$ROOT/dist/release-bundle"
+ARTIFACTS="$OUT/artifacts"
+MANIFESTS="$OUT/manifests"
+
+rm -rf "$OUT"
+mkdir -p "$ARTIFACTS" "$MANIFESTS"
+
+# --- Source revision & build metadata ---------------------------------------
+SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
+SOURCE_DIRTY="false"
+if ! git -C "$ROOT" diff --quiet --ignore-submodules HEAD --; then
+  SOURCE_DIRTY="true"
+fi
+RUSTC_VERSION="$(rustc --version 2>/dev/null || echo unknown)"
+CARGO_VERSION="$(cargo --version 2>/dev/null || echo unknown)"
+STELLAR_VERSION="$(stellar version 2>/dev/null || echo unknown)"
+NODE_VERSION="$(node --version 2>/dev/null || echo unknown)"
+BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# --- Collect WASM artifacts -------------------------------------------------
+for wasm in "$ROOT"/target/wasm32-unknown-unknown/release/*.wasm; do
+  [ -e "$wasm" ] || continue
+  cp "$wasm" "$ARTIFACTS/"
+done
+
+# --- Collect bindings tarballs + interface manifests ------------------------
+for pkg_dir in "$ROOT"/packages/bindings/*/; do
+  [ -d "$pkg_dir" ] || continue
+  pkg_name="$(basename "$pkg_dir")"
+  if [ -f "$pkg_dir/interface.json" ]; then
+    cp "$pkg_dir/interface.json" "$MANIFESTS/$pkg_name.interface.json"
+  fi
+  ( cd "$pkg_dir" && npm pack --pack-destination "$ARTIFACTS" >/dev/null )
+done
+
+# --- Build metadata ---------------------------------------------------------
+cat > "$OUT/build-metadata.json" <<EOF
 {
-  "$schema": "https://unpkg.com/@changesets/config@3.0.0/schema.json",
-  "changelog": "@changesets/cli/changelog",
-  "commit": false,
-  "fixed": [],
-  "linked": [],
-  "access": "public",
-  "baseBranch": "main",
-  "updateInternalDependencies": "patch",
-  "ignore": []
-}
-```
-
-**File:** `oracledesk-stellar/package.json` (new or modify)
-
-```json
-{
-  "private": true,
-  "workspaces": [
-    "packages/bindings/*"
-  ],
-  "scripts": {
-    "changeset": "changeset",
-    "version": "changeset version",
-    "release": "changeset publish"
+  "sourceCommit": "$SOURCE_COMMIT",
+  "sourceDirty": $SOURCE_DIRTY,
+  "buildTimestamp": "$BUILD_TIMESTAMP",
+  "toolchain": {
+    "rustc": "$RUSTC_VERSION",
+    "cargo": "$CARGO_VERSION",
+    "stellar": "$STELLAR_VERSION",
+    "node": "$NODE_VERSION"
   },
-  "devDependencies": {
-    "@changesets/cli": "^2.27.0"
+  "reproducibleBuild": {
+    "command": "cargo build --release --target wasm32-unknown-unknown",
+    "profile": "release",
+    "target": "wasm32-unknown-unknown"
   }
 }
+EOF
+
+# --- Checksums --------------------------------------------------------------
+( cd "$OUT" && sha256sum artifacts/* manifests/* build-metadata.json > SHA256SUMS )
+
+echo "Release bundle written to $OUT"
+echo "Verify with: (cd $OUT && sha256sum -c SHA256SUMS)"
 ```
 
-### 4. Release Workflow
+### 4. Consumer Verification
 
-**File:** `/.github/workflows/release-bindings.yml` (new, at repository root)
+Downstream consumers verify a downloaded bundle without trusting the publisher:
 
-```yaml
-name: Release Bindings
-
-on:
-  push:
-    branches: [main]
-  workflow_dispatch: {}
-
-permissions:
-  contents: write
-  pull-requests: write
-  id-token: write
-
-defaults:
-  run:
-    working-directory: oracledesk-stellar
-
-jobs:
-  release:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          fetch-depth: 0
-
-      - name: Setup Node.js
-        uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
-        with:
-          node-version: '20'
-          registry-url: 'https://registry.npmjs.org'
-
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@1482605bfc5719782e1267fd0c0cc350fe7646b8 # v1
-        with:
-          toolchain: stable
-          targets: wasm32-unknown-unknown
-
-      - name: Install Stellar CLI
-        run: cargo install --locked stellar-cli --version 27.1.0
-
-      - name: Build contracts
-        run: make build
-
-      - name: Regenerate bindings
-        run: ./scripts/gen-bindings.sh
-
-      - name: Verify bindings are committed
-        run: |
-          if ! git diff --exit-code -- packages/bindings; then
-            echo "Bindings are out of sync with source. Run ./scripts/gen-bindings.sh and commit." >&2
-            exit 1
-          fi
-
-      - name: Record wasm hashes
-        run: |
-          for pkg in market-core resolver reasoning-registry treasury timelock router; do
-            wasm_name=$(echo "$pkg" | tr '-' '_')
-            hash=$(sha256sum "target/wasm32v1-none/release/${wasm_name}.wasm" | cut -d' ' -f1)
-            commit=$(git rev-parse HEAD)
-            tmp=$(mktemp)
-            jq --arg h "$hash" --arg c "$commit" \
-              '.oracledesk.wasmSha256 = $h | .oracledesk.sourceCommit = $c' \
-              "packages/bindings/$pkg/package.json" > "$tmp"
-            mv "$tmp" "packages/bindings/$pkg/package.json"
-          done
-
-      - name: Install dependencies and build
-        run: |
-          for pkg in market-core resolver reasoning-registry treasury timelock router; do
-            (cd "packages/bindings/$pkg" && npm ci && npm run build)
-          done
-
-      - name: Create release PR or publish
-        id: changesets
-        uses: changesets/action@aba318e9165b45b7948c60273e0b72fce0a64eb9 # v1.4.7
-        with:
-          version: npm run version
-          publish: npm run release
-          commit: "chore: version packages"
-          title: "chore: version bindings packages"
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      - name: Tag releases
-        if: steps.changesets.outputs.published == 'true'
-        run: |
-          published='${{ steps.changesets.outputs.publishedPackages }}'
-          echo "$published" | jq -c '.[]' | while read -r pkg; do
-            name=$(echo "$pkg" | jq -r '.name')
-            version=$(echo "$pkg" | jq -r '.version')
-            pkg_dir=$(echo "$name" | sed 's/@oracledesk\/bindings-//')
-            wasm_hash=$(jq -r '.oracledesk.wasmSha256' "packages/bindings/$pkg_dir/package.json")
-            commit=$(jq -r '.oracledesk.sourceCommit' "packages/bindings/$pkg_dir/package.json")
-            
-            git tag -a "$name@$version" -m "$name@$version
-
-wasm sha256: $wasm_hash
-source commit: $commit"
-            git push origin "$name@$version"
-          done
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-```
-
-### 5. Validation Script
-
-**File:** `oracledesk-stellar/scripts/check-bindings-package.ts` (new)
-
-```typescript
-#!/usr/bin/env tsx
-/**
- * Pre-publish validation for bindings packages.
- * Asserts that dist/ is built, version is not 0.0.0, and wasm hash is set.
- */
-
-import { readFileSync, existsSync } from 'fs';
-import { execSync } from 'child_process';
-
-const [, , packageName] = process.argv;
-if (!packageName) {
-  console.error('Usage: tsx scripts/check-bindings-package.ts <package-name>');
-  process.exit(1);
-}
-
-const pkgDir = `packages/bindings/${packageName}`;
-const pkgJson = JSON.parse(readFileSync(`${pkgDir}/package.json`, 'utf-8'));
-
-// Check version
-if (pkgJson.version === '0.0.0') {
-  console.error(`❌ ${packageName}: version is 0.0.0`);
-  process.exit(1);
-}
-
-// Check dist
-if (!existsSync(`${pkgDir}/dist/index.js`) || !existsSync(`${pkgDir}/dist/index.d.ts`)) {
-  console.error(`❌ ${packageName}: dist/ not built`);
-  process.exit(1);
-}
-
-// Check wasm hash
-if (!pkgJson.oracledesk?.wasmSha256 || pkgJson.oracledesk.wasmSha256 === '') {
-  console.error(`❌ ${packageName}: oracledesk.wasmSha256 not set`);
-  process.exit(1);
-}
-
-console.log(`✅ ${packageName}: ready for publish`);
-```
-
-### 6. CI Check for Interface Changes
-
-**File:** `oracledesk-stellar/.github/workflows/bindings-check.yml` (new)
-
-```yaml
-name: Bindings Interface Check
-
-on:
-  pull_request:
-    branches: [develop]
-    paths:
-      - 'contracts/**'
-      - 'packages/bindings/**'
-
-jobs:
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-        with:
-          fetch-depth: 0
-
-      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
-        with:
-          node-version: '20'
-
-      - name: Check for changesets
-        run: |
-          cd oracledesk-stellar
-          # If interface.json changed, ensure a changeset exists
-          if git diff origin/develop --name-only | grep -q 'packages/bindings/.*/interface.json'; then
-            if [ -z "$(ls .changeset/*.md 2>/dev/null | grep -v README)" ]; then
-              echo "Interface changes detected but no changeset found"
-              echo "Run: npx changeset add"
-              exit 1
-            fi
-          fi
-```
-
-### 7. In-Repo Consumer Testing
-
-**File:** `oracledesk-stellar/.github/workflows/test-packed.yml` (new)
-
-```yaml
-name: Test Packed Bindings
-
-on:
-  pull_request:
-    paths:
-      - 'packages/bindings/**'
-      - 'agents/**'
-
-jobs:
-  test-packed:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
-
-      - uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8 # v4.0.2
-        with:
-          node-version: '20'
-
-      - name: Pack bindings
-        run: |
-          cd oracledesk-stellar
-          for pkg in market-core resolver reasoning-registry treasury timelock router; do
-            (cd "packages/bindings/$pkg" && npm ci && npm run build && npm pack)
-          done
-
-      - name: Test agents with packed bindings
-        run: |
-          cd oracledesk-stellar
-          # Create scratch copy and install from tarballs
-          cp -r agents /tmp/agents-test
-          cd /tmp/agents-test
-          # Replace file: dependencies with packed tarballs
-          # (implementation depends on agents/package.json structure)
-          npm ci
-          npm run build
-```
-
-### 8. Documentation
-
-**File:** `oracledesk-stellar/docs/bindings-releases.md` (new)
-
-```markdown
-# Bindings Releases
-
-## Overview
-
-The `@oracledesk/bindings-*` packages provide TypeScript bindings for OracleDesk Stellar smart contracts. Each package is versioned independently according to its contract's interface changes.
-
-## Version Mapping
-
-- **Major (breaking)**: Removed functions, changed signatures, renumbered errors, struct field reordering
-- **Minor (additive)**: New functions, new errors, new events, new types
-- **Patch (non-breaking)**: Documentation changes, SDK dependency bumps
-
-For pre-1.0 packages, major changes are released as minor (semver 0.x convention).
-
-## Pinning a Version
-
-In your `package.json`:
-
-```json
-{
-  "dependencies": {
-    "@oracledesk/bindings-market-core": "0.3.1",
-    "@oracledesk/bindings-treasury": "0.2.5"
-  }
-}
-```
-
-## Verifying Against Deployed Contracts
-
-Each package includes `oracledesk.wasmSha256` in `package.json`:
-
-```json
-{
-  "oracledesk": {
-    "wasmSha256": "abc123...",
-    "sourceCommit": "def456..."
-  }
-}
-```
-
-Compare this hash against your deployed contract wasm to ensure the bindings match.
-
-## Changelog
-
-Each package has a `CHANGELOG.md` listing interface changes by version.
-
-## Sync Script Recommendation
-
-**Before (copying from git checkout):**
 ```bash
-cp ../OracleDesk-SmartContract/oracledesk-stellar/packages/bindings/market-core/dist/* ./src/generated/
+# 1. Verify checksums match the published SHA256SUMS
+(cd release-bundle && sha256sum -c SHA256SUMS)
+
+# 2. Confirm the bundle was built from the expected source revision
+jq -e '.sourceCommit == "<expected-git-sha>"' release-bundle/build-metadata.json
+
+# 3. Confirm the build was clean (no uncommitted changes)
+jq -e '.sourceDirty == false' release-bundle/build-metadata.json
+
+# 4. Reproduce the WASM locally and compare hashes
+cargo build --release --target wasm32-unknown-unknown
+sha256sum target/wasm32-unknown-unknown/release/<name>.wasm
+# Compare against the matching entry in release-bundle/SHA256SUMS
 ```
 
-**After (installing pinned version):**
-```bash
-npm install @oracledesk/bindings-market-core@0.3.1
-cp node_modules/@oracledesk/bindings-market-core/dist/* ./src/generated/
-```
-```
+If any check fails, the consumer MUST reject the artifact — there is no silent fallback to unverified output.
 
-### 9. Bootstrap First Release
+### 5. Release Workflow
 
-**File:** `oracledesk-stellar/.changeset/init-release.md` (new)
+**File:** `/.github/workflows/release-bindings.yml` (new)
 
-```markdown
----
-"@oracledesk/bindings-market-core": minor
-"@oracledesk/bindings-resolver": minor
-"@oracledesk/bindings-reasoning-registry": minor
-"@oracledesk/bindings-treasury": minor
-"@oracledesk/bindings-timelock": minor
-"@oracledesk/bindings-router": minor
----
+- Trigger on `v*` tags
+- Build WASM with pinned toolchain (see CI reproducibility job)
+- Run `scripts/build-release-bundle.sh`
+- Upload `dist/release-bundle/` as a workflow artifact and attach to the GitHub release
+- Publish bindings packages with `npm publish --provenance`
 
-Initial release of TypeScript bindings with versioning, changelog, and npm provenance.
-```
+### 6. CI Validation
 
-## Testing Strategy
+Add a CI job that:
+- Runs `scripts/build-release-bundle.sh` against deterministic fixtures
+- Asserts `sha256sum -c SHA256SUMS` passes
+- Asserts `build-metadata.json` contains a non-empty `sourceCommit` matching `git rev-parse HEAD`
+- Asserts every bindings package has a corresponding `manifests/<name>.interface.json`
+- Fails the job if any artifact is missing from `SHA256SUMS`
 
-### Unit Tests
+## Manual Release / Operator Verification
 
-**File:** `oracledesk-stellar/scripts/bindings-semver.test.ts`
+Before publishing a release, an operator MUST:
 
-```typescript
-#!/usr/bin/env tsx
-import { describe, it } from 'node:test';
-import assert from 'node:assert';
+1. Build from a clean checkout at the tagged commit (`git status` clean).
+2. Run `scripts/build-release-bundle.sh` and confirm `sourceDirty` is `false` in `build-metadata.json`.
+3. Run `sha256sum -c SHA256SUMS` inside the bundle and confirm all entries pass.
+4. Independently rebuild the WASM and confirm the hash matches the bundle entry.
+5. Confirm each bindings package has an `interface.json` manifest in `manifests/`.
 
-describe('bindings-semver', () => {
-  it('classifies removed function as major', () => {
-    // TODO: Test with fixture specs
-  });
-
-  it('classifies new function as minor', () => {
-    // TODO
-  });
-
-  it('classifies struct field reorder as major', () => {
-    // TODO
-  });
-
-  it('classifies new error code as minor', () => {
-    // TODO
-  });
-
-  it('classifies renumbered error as major', () => {
-    // TODO
-  });
-
-  it('maps pre-1.0 major to minor', () => {
-    // TODO
-  });
-});
-```
-
-### Integration Tests
-
-1. Run `scripts/gen-bindings.sh` twice, assert version/metadata preserved
-2. Run `scripts/check-bindings-package.ts` on a valid and invalid package
-3. Dry-run workflow with `act` against local Verdaccio registry
-
-## File Summary
-
-### New Files
-- `/.github/workflows/release-bindings.yml` - Main release workflow
-- `oracledesk-stellar/.changeset/config.json` - Changesets config
-- `oracledesk-stellar/.changeset/init-release.md` - Bootstrap changeset
-- `oracledesk-stellar/scripts/bindings-semver.ts` - Interface diff classifier
-- `oracledesk-stellar/scripts/bindings-semver.test.ts` - Tests
-- `oracledesk-stellar/scripts/check-bindings-package.ts` - Pre-publish validation
-- `oracledesk-stellar/.github/workflows/bindings-check.yml` - PR check
-- `oracledesk-stellar/.github/workflows/test-packed.yml` - Packaging test
-- `oracledesk-stellar/docs/bindings-releases.md` - Documentation
-- `oracledesk-stellar/package.json` - Workspace config
-
-### Modified Files
-- `oracledesk-stellar/scripts/gen-bindings.sh` - Add metadata merge step
-
-## Next Steps
-
-1. ✅ Review this implementation plan
-2. Implement metadata merge in `gen-bindings.sh`
-3. Create `bindings-semver.ts` with full interface diff logic
-4. Set up Changesets configuration
-5. Create release workflow
-6. Add validation and testing scripts
-7. Write documentation
-8. Bootstrap first release with changeset
-9. Test workflow dry-run on fork
-10. Submit PR to `develop` branch
-
-## Notes
-
-- **PR Target:** This PR must be opened against `develop`, not `main`
-- **NPM_TOKEN:** Required in repository secrets for publishing
-- **Provenance:** Requires public repository and supported GitHub runner
-- **Pre-1.0:** All packages currently at 0.x, so major changes map to minor bumps
-- **Six Packages:** Issue mentions four, but repository has six (market-core, resolver, reasoning-registry, treasury, timelock, router)
-
----
-
-Closes #118
+If any step fails, do not publish — investigate and rebuild from a clean tree.

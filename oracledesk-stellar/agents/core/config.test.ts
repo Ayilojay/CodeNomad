@@ -99,8 +99,19 @@ test("an unset AGENT_MODE defaults to dry-run with documented defaults", async (
   assert.equal(cfg.trading.minTradeStroops, 1_000_000n);
   assert.equal(cfg.trading.fairUncertaintyBps, 500);
   assert.equal(cfg.maker.defaultSeedStroops, 1_500_000_000n);
+  assert.equal(cfg.events.startLedger, undefined);
+  assert.equal(cfg.events.maxBackfillPages, 10);
   assert.equal(cfg.agentSecret, undefined);
   assert.match(cfg.deploymentsFile, /deployments[\\/]testnet\.json$/);
+});
+
+test("event backfill configuration is strictly bounded", async () => {
+  const cfg = await load({ EVENTS_START_LEDGER: "42", EVENTS_BACKFILL_MAX_PAGES: "7" }).run();
+  assert.equal(cfg.events.startLedger, 42);
+  assert.equal(cfg.events.maxBackfillPages, 7);
+  const issues = await issuesOf(load({ EVENTS_START_LEDGER: "0", EVENTS_BACKFILL_MAX_PAGES: "1001" }).run());
+  assert.ok(issues.some((i) => i.startsWith("EVENTS_START_LEDGER:")));
+  assert.ok(issues.some((i) => i.startsWith("EVENTS_BACKFILL_MAX_PAGES:")));
 });
 
 test("unknown and empty agent modes are rejected", async () => {
