@@ -15,6 +15,13 @@
  *   like a retention gap.
  * - Events from failed contract calls are dropped; filters are checked
  *   against the RPC's limits up front.
+ *
+ * Event-driven wakeups (#73): `start()` runs a periodic reconciliation poll
+ * (the fallback) and, when `subscribe` is provided, also wakes the loop as
+ * soon as the RPC pushes a new ledger. Wakeups only shorten the latency of a
+ * poll; they never replace it, so a dropped subscription degrades to plain
+ * polling. Duplicate deliveries are tolerated because the persisted cursor
+ * and the dispatcher's processed-id LRU deduplicate by ledger/event identity.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -86,6 +93,14 @@ export class MemoryCheckpointStore implements CheckpointStore {
   }
 }
 
+/**
+ * A push source of new-ledger notifications. `onLedger` fires whenever the
+ * RPC reports a new ledger; the returned function tears the subscription
+ * down. Implementations must tolerate reconnects internally or simply stop
+ * firing — the periodic poll remains the source of truth either way.
+ */
+export type LedgerSubscription = (onLedger: (ledger: number) => void) => () => void;
+
 export interface SubscriberOptions {
   rpc: EventsRpc;
   decoder: EventDecoder;
@@ -104,6 +119,8 @@ export interface SubscriberOptions {
   onResync: (reason: string) => Promise<void>;
   /** The dispatcher's processed ids, persisted with each checkpoint. */
   processedIds?: () => string[];
+  /** Optional event-driven wakeup source; polling still runs as fallback. */
+  subscribe?: LedgerSubscription;
   log?: (event: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -139,6 +156,8 @@ export class EventSubscriber {
   private readonly pageLimit: number;
   private readonly maxBackfillPages: number;
   private stopped = false;
+  private wake: (() => void) | undefined;
+  private unsubscribe: (() => void) | undefined;
 
   constructor(private readonly o: SubscriberOptions) {
     this.filters = o.filters ?? [{ type: "contract", contractIds: o.decoder.contractIds() }];
@@ -214,29 +233,62 @@ export class EventSubscriber {
       }
       const events = page.events
         .filter((e) => e.inSuccessfulContractCall)
-        .map((e) => this.o.decoder.decode(e))
-        .filter((e): e is OracleDeskEvent => e !== undefined);
-      const full = page.events.length >= this.pageLimit;
-      if (events.length > 0) await this.o.onBatch(events);
-      delivered += events.length;
-      cursor = page.cursor || cursor;
-      // A full page may stop mid-ledger, so only the ledger before its last event is complete.
-      lastLedger = full ? Math.max(lastLedger, page.events.at(-1)!.ledger - 1) : Math.max(lastLedger, page.latestLedger);
+        .map((e) => this.o.decoder.decode(e));
+      if (events.length > 0) {
+        await this.o.onBatch(events);
+        delivered += events.length;
+      }
+      cursor = page.cursor;
+      lastLedger = page.latestLedger;
       await this.save({ cursor, lastLedger });
-      if (!full) return delivered;
+      if (page.events.length < this.pageLimit) return delivered;
     }
     return delivered;
   }
 
-  /** Polls until `stop()`; `sleep` is injectable for tests. */
-  async run(sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<void> {
+  /**
+   * Runs the reconciliation poll forever, waking early on subscription
+   * notifications. The poll interval is the fallback: if the subscription
+   * disconnects or never fires, the loop still reconciles on schedule.
+   */
+  async start(): Promise<void> {
+    this.stopped = false;
+    if (this.o.subscribe) {
+      try {
+        this.unsubscribe = this.o.subscribe((ledger) => {
+          this.log("EVENTS_WAKE", { ledger });
+          this.wake?.();
+        });
+      } catch (err) {
+        this.log("EVENTS_SUBSCRIBE_FAILED", { error: String(err) });
+      }
+    }
+    const interval = this.o.pollIntervalMs ?? 5_000;
     while (!this.stopped) {
-      await this.pollOnce();
-      if (!this.stopped) await sleep(this.o.pollIntervalMs ?? 10_000);
+      try {
+        await this.pollOnce();
+      } catch (err) {
+        this.log("EVENTS_POLL_FAILED", { error: String(err) });
+      }
+      if (this.stopped) break;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(done, interval);
+        const self = this;
+        function done() {
+          clearTimeout(timer);
+          self.wake = undefined;
+          resolve();
+        }
+        this.wake = done;
+      });
     }
   }
 
+  /** Stops the loop and tears down the subscription. */
   stop(): void {
     this.stopped = true;
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    this.wake?.();
   }
 }

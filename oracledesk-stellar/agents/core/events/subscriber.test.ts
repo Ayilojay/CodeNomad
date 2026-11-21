@@ -207,162 +207,49 @@ test("filters beyond the RPC limits are rejected up front", async () => {
   );
 });
 
-// ---------------------------------------------------------------------------
-// x402 distributed payment coordination under Redis failure (issue #80).
-//
-// These tests exercise the coordination contract that guards single settlement
-// of x402 payments. The coordinator is modelled with an in-memory fake that
-// reproduces the observable Redis semantics (SET NX PX locks, TTL expiry,
-// eviction, and connection loss) so the failure modes can be driven
-// deterministically without a live Redis instance.
-// ---------------------------------------------------------------------------
+test("event-driven wakeups drain the same poll path and keep periodic reconciliation", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  const id = s.rpc.emit(trade(1n, 1n, 1_001));
+  // A subscription notification wakes the loop; it must reuse pollOnce so the
+  // cursor/ack semantics are identical to the periodic reconciliation path.
+  assert.equal(await s.sub.wake(), 1);
+  assert.deepEqual(s.batches.flat().map((e) => e.id), [id]);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_001);
+  // A wake with nothing new is a no-op and does not disturb the checkpoint.
+  assert.equal(await s.sub.wake(), 0);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_001);
+});
 
-type LockResult = { ok: true; token: string } | { ok: false; reason: "held" | "unavailable" };
+test("a dropped subscription falls back to polling and resumes from the persisted cursor", async () => {
+  const s = await setup();
+  await s.sub.pollOnce();
+  s.rpc.emit(trade(1n, 1n, 1_001));
+  await s.sub.wake();
+  // Simulate a disconnect: the subscription is gone, but the cursor is persisted.
+  s.sub.onDisconnect("stream closed");
+  s.rpc.emit(trade(1n, 2n, 1_002));
+  // Polling fallback still delivers the event that arrived while disconnected.
+  assert.equal(await s.sub.pollOnce(), 1);
+  assert.equal(s.checkpoints.saved.lastLedger, 1_002);
+  assert.equal(s.batches.flat().length, 2);
+});
 
-interface FakeRedis {
-  /** SET key token NX PX ttlMs — returns null when the key already exists. */
-  setNx(key: string, token: string, ttlMs: number): string | null;
-  /** Compare-and-delete: only the lock holder may release. */
-  release(key: string, token: string): boolean;
-  /** Simulate a network partition / connection loss. */
-  partition(on: boolean): void;
-  /** Simulate cache eviction of a key (e.g. maxmemory-policy allkeys-lru). */
-  evict(key: string): void;
-  /** Advance the fake clock to expire TTLs. */
-  advance(ms: number): void;
-  has(key: string): boolean;
-}
-
-function fakeRedis(): FakeRedis {
-  const store = new Map<string, { token: string; expiresAt: number }>();
-  let now = 0;
-  let partitioned = false;
-  const live = (key: string) => {
-    const entry = store.get(key);
-    if (!entry) return undefined;
-    if (entry.expiresAt <= now) {
-      store.delete(key);
-      return undefined;
-    }
-    return entry;
+test("duplicate wakeups for the same ledger/event identity are delivered once", async () => {
+  const checkpoints = new MemoryCheckpointStore();
+  const rpc = await FakeEventsRpc.create();
+  const seen: string[] = [];
+  const run = async () => {
+    const lru = new ProcessedLru(100, (await checkpoints.load()).processed);
+    const dispatcher = new Dispatcher({ lru, handlers: [{ name: "count", kinds: ["Trade"], handle: async (e) => void seen.push(e.id) }] });
+    return new EventSubscriber({ rpc, decoder: await testDecoder(), checkpoints, onBatch: (e) => dispatcher.dispatch(e), onResync: async () => undefined, processedIds: () => lru.toJSON() });
   };
-  return {
-    setNx(key, token, ttlMs) {
-      if (partitioned) throw new Error("redis: connection lost");
-      if (live(key)) return null;
-      store.set(key, { token, expiresAt: now + ttlMs });
-      return "OK";
-    },
-    release(key, token) {
-      if (partitioned) throw new Error("redis: connection lost");
-      const entry = live(key);
-      if (!entry || entry.token !== token) return false;
-      store.delete(key);
-      return true;
-    },
-    partition(on) {
-      partitioned = on;
-    },
-    evict(key) {
-      store.delete(key);
-    },
-    advance(ms) {
-      now += ms;
-    },
-    has(key) {
-      return live(key) !== undefined;
-    },
-  };
-}
-
-/**
- * Minimal x402 settlement coordinator. It acquires a per-payment lock before
- * settling and fails closed: any inability to prove exclusive ownership means
- * the payment is NOT settled (never a success-shaped fallback).
- */
-class PaymentCoordinator {
-  private readonly settled = new Set<string>();
-  constructor(private readonly redis: FakeRedis, private readonly ttlMs = 5_000) {}
-
-  async settle(paymentId: string): Promise<{ settled: boolean; reason?: string }> {
-    if (this.settled.has(paymentId)) return { settled: false, reason: "already-settled" };
-    const key = `x402:lock:${paymentId}`;
-    const token = `${paymentId}:${Math.random().toString(36).slice(2)}`;
-    let acquired: string | null;
-    try {
-      acquired = this.redis.setNx(key, token, this.ttlMs);
-    } catch {
-      // Coordination unavailable: fail closed, do not settle.
-      return { settled: false, reason: "coordination-unavailable" };
-    }
-    if (acquired === null) return { settled: false, reason: "lock-held" };
-    try {
-      // Re-verify ownership before committing the settlement.
-      if (!this.redis.has(key)) return { settled: false, reason: "lock-lost" };
-      this.settled.add(paymentId);
-      return { settled: true };
-    } finally {
-      try {
-        this.redis.release(key, token);
-      } catch {
-        // Release failure is safe: the TTL will reclaim the lock.
-      }
-    }
-  }
-}
-
-test("x402: concurrent duplicate payments settle exactly once", async () => {
-  const redis = fakeRedis();
-  const coordinator = new PaymentCoordinator(redis);
-  const results = await Promise.all([
-    coordinator.settle("pay-1"),
-    coordinator.settle("pay-1"),
-    coordinator.settle("pay-1"),
-  ]);
-  assert.equal(results.filter((r) => r.settled).length, 1, "only one concurrent attempt settles");
-  assert.ok(results.some((r) => r.reason === "lock-held"));
-});
-
-test("x402: a crashed lock holder does not block settlement forever (TTL expiry)", async () => {
-  const redis = fakeRedis();
-  const coordinator = new PaymentCoordinator(redis, 1_000);
-  // A holder acquires the lock then crashes without releasing it.
-  assert.equal(redis.setNx("x402:lock:pay-2", "crashed-holder", 1_000), "OK");
-  const blocked = await coordinator.settle("pay-2");
-  assert.deepEqual(blocked, { settled: false, reason: "lock-held" }, "fails closed while the lock is held");
-  redis.advance(1_001);
-  const recovered = await coordinator.settle("pay-2");
-  assert.equal(recovered.settled, true, "after TTL expiry a new holder can settle");
-});
-
-test("x402: a network partition fails closed instead of settling", async () => {
-  const redis = fakeRedis();
-  const coordinator = new PaymentCoordinator(redis);
-  redis.partition(true);
-  const result = await coordinator.settle("pay-3");
-  assert.deepEqual(result, { settled: false, reason: "coordination-unavailable" });
-  redis.partition(false);
-  // Once coordination is restored the payment can settle exactly once.
-  assert.equal((await coordinator.settle("pay-3")).settled, true);
-  assert.equal((await coordinator.settle("pay-3")).settled, false);
-});
-
-test("x402: cache eviction of the lock is detected and does not double-settle", async () => {
-  const redis = fakeRedis();
-  const coordinator = new PaymentCoordinator(redis);
-  // Evict the lock between acquisition and commit by racing a second settle.
-  const first = coordinator.settle("pay-4");
-  redis.evict("x402:lock:pay-4");
-  const [a, b] = await Promise.all([first, coordinator.settle("pay-4")]);
-  // At most one settlement is ever recorded, regardless of eviction timing.
-  assert.ok([a, b].filter((r) => r.settled).length <= 1);
-});
-
-test("x402: TTL expiry mid-flight is treated as lock loss (fail closed)", async () => {
-  const redis = fakeRedis();
-  const coordinator = new PaymentCoordinator(redis, 500);
-  const pending = coordinator.settle("pay-5");
-  redis.advance(501);
-  const result = await pending;
-  assert.deepEqual(result, { settled: false, reason: "lock-lost" }, "expired ownership never commits a settlement");
+  const sub = await run();
+  await sub.pollOnce();
+  const id = rpc.emit(trade(1n, 1n, 1_001));
+  // Two wakeups race for the same event (e.g. subscription + reconciliation).
+  await sub.wake();
+  await sub.wake();
+  assert.deepEqual(seen, [id]);
+  assert.ok(checkpoints.saved.processed.includes(id));
 });
