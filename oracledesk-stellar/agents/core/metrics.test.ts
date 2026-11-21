@@ -4,6 +4,11 @@ import {
   createMetrics,
   type TaskOutcome,
 } from "./metrics";
+import {
+  runTournament,
+  type StrategyVariant,
+  type SeedRunResult,
+} from "./backtest";
 
 describe("agents runtime metrics", () => {
   let metrics: MetricsRegistry;
@@ -101,5 +106,100 @@ describe("agents runtime metrics", () => {
 
     expect(metrics.isDryRun()).toBe(true);
     expect(metrics.snapshot().dryRun).toBe(true);
+  });
+});
+
+// Deterministic multi-seed fixtures for tournament evaluation.
+const SEEDS = [1, 2, 3, 4, 5];
+
+function makeRun(seed: number, overrides: Partial<SeedRunResult> = {}): SeedRunResult {
+  return {
+    seed,
+    pnl: 100 + seed * 10,
+    maxDrawdown: 0.1 + seed * 0.01,
+    tailLoss: 0.05 + seed * 0.005,
+    turnover: 1000 + seed * 100,
+    calibration: 0.9 - seed * 0.01,
+    capitalUse: 0.5 + seed * 0.02,
+    ...overrides,
+  };
+}
+
+function makeVariant(
+  id: string,
+  runs: SeedRunResult[],
+): StrategyVariant {
+  return { id, runs };
+}
+
+describe("strategy tournament evaluation", () => {
+  it("compares variants across shared seeds with risk-adjusted scoring", () => {
+    const conservative = makeVariant(
+      "conservative",
+      SEEDS.map((s) => makeRun(s, { maxDrawdown: 0.05, tailLoss: 0.02, turnover: 500 })),
+    );
+    const aggressive = makeVariant(
+      "aggressive",
+      SEEDS.map((s) => makeRun(s, { maxDrawdown: 0.3, tailLoss: 0.25, turnover: 5000 })),
+    );
+
+    const report = runTournament([conservative, aggressive], { seeds: SEEDS });
+
+    expect(report.seeds).toEqual(SEEDS);
+    expect(report.variants).toHaveLength(2);
+
+    const cons = report.variants.find((v) => v.id === "conservative")!;
+    const aggr = report.variants.find((v) => v.id === "aggressive")!;
+
+    // Risk-adjusted score should favor the lower-drawdown variant.
+    expect(cons.score).toBeGreaterThan(aggr.score);
+    expect(report.ranking[0]).toBe("conservative");
+
+    // Each metric reports an uncertainty interval.
+    for (const metric of ["maxDrawdown", "tailLoss", "turnover", "calibration", "capitalUse"] as const) {
+      const interval = cons.intervals[metric];
+      expect(interval.low).toBeLessThanOrEqual(interval.high);
+      expect(interval.mean).toBeGreaterThanOrEqual(interval.low);
+      expect(interval.mean).toBeLessThanOrEqual(interval.high);
+    }
+  });
+
+  it("is deterministic across repeated runs", () => {
+    const a = makeVariant("a", SEEDS.map((s) => makeRun(s)));
+    const b = makeVariant("b", SEEDS.map((s) => makeRun(s, { pnl: 50 })));
+
+    const first = runTournament([a, b], { seeds: SEEDS });
+    const second = runTournament([a, b], { seeds: SEEDS });
+
+    expect(second).toEqual(first);
+  });
+
+  it("rejects unpaired comparisons when seed sets differ", () => {
+    const paired = makeVariant("paired", SEEDS.map((s) => makeRun(s)));
+    const unpaired = makeVariant(
+      "unpaired",
+      [1, 2, 3].map((s) => makeRun(s)),
+    );
+
+    expect(() => runTournament([paired, unpaired], { seeds: SEEDS })).toThrow(
+      /unpaired|seed/i,
+    );
+  });
+
+  it("rejects variants evaluated on seeds outside the shared set", () => {
+    const variant = makeVariant(
+      "mismatched",
+      [1, 2, 3, 4, 99].map((s) => makeRun(s)),
+    );
+
+    expect(() => runTournament([variant], { seeds: SEEDS })).toThrow(/seed/i);
+  });
+
+  it("handles a single variant without comparison errors", () => {
+    const only = makeVariant("only", SEEDS.map((s) => makeRun(s)));
+    const report = runTournament([only], { seeds: SEEDS });
+
+    expect(report.variants).toHaveLength(1);
+    expect(report.ranking).toEqual(["only"]);
   });
 });

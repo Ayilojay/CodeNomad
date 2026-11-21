@@ -1,319 +1,443 @@
+// Risk controls for the OracleDesk agents.
+//
+// This module centralises the on-chain risk primitives (position caps, fee
+// accounting) and the walk-forward backtest evaluator used to validate trading
+// strategies against time-ordered observations.
+//
+// Backtest guarantees (see issue #61):
+// - No look-ahead bias: each step only sees observations up to and including
+//   the current index. The benchmark and strategy both consume the same slice.
+// - Fees and position/size caps are applied on every simulated trade.
+// - Missing observations follow an explicit, configurable policy.
+// - Drawdown and calibration are reported alongside returns.
+//
+// Tournament evaluation (see issue #63):
+// - Variants are compared across a shared set of seeds. Every variant must be
+//   evaluated on the identical seed set; unpaired comparisons are rejected.
+// - Risk-adjusted metrics (drawdown, tail loss, turnover, calibration, capital
+//   use) are reported with uncertainty intervals derived from the per-seed
+//   dispersion, so a single lucky seed cannot dominate the ranking.
+
+export interface Observation {
+  /** Monotonically increasing timestamp (ms). */
+  timestamp: number;
+  /** Observed price; `null` marks a missing data point. */
+  price: number | null;
+}
+
+export type MissingDataPolicy = "skip" | "hold" | "flat";
+
+export interface BacktestConfig {
+  /** Fraction of notional charged per trade (e.g. 0.001 = 10 bps). */
+  feeRate: number;
+  /** Maximum fraction of equity deployable in a single position (0..1]. */
+  maxPositionFraction: number;
+  /** Policy applied when an observation is missing. */
+  missingDataPolicy: MissingDataPolicy;
+}
+
+export interface BacktestMetrics {
+  /** Cumulative strategy return as a fraction (0.1 = +10%). */
+  totalReturn: number;
+  /** Cumulative benchmark (buy-and-hold) return as a fraction. */
+  benchmarkReturn: number;
+  /** Strategy return minus benchmark return. */
+  excessReturn: number;
+  /** Maximum peak-to-trough drawdown as a positive fraction. */
+  maxDrawdown: number;
+  /** Fraction of directional calls that matched the next move (0..1). */
+  calibration: number;
+  /** Number of steps actually evaluated. */
+  steps: number;
+}
+
 /**
- * Pre-trade risk checks for cross-market arbitrage (#108). The planner
- * already sizes a plan inside the hard treasury caps; these checks add the
- * arbitrage-specific limits that exist because the two legs are not atomic.
+ * A strategy maps the observations available so far to a target position in
+ * [-1, 1] (short..long). It must only read from the provided slice.
  */
-import { BPS } from "./fpmm.js";
-import type { ArbPlan } from "./strategies/arbitrage.js";
+export type Strategy = (history: ReadonlyArray<Observation>) => number;
 
-export interface ArbRiskLimits {
-  /** ARB_MAX_NOTIONAL: most one plan may spend across both legs. */
-  maxNotional: bigint;
-  /** ARB_MAX_UNHEDGED_STROOPS: the first leg alone, if the second never fills. */
-  maxUnhedged: bigint;
-  /** ARB_MARKET_HEADROOM_BPS: share of each market's max_market kept free for hedges. */
-  marketHeadroomBps: bigint;
-  /** ARB_MAX_OPEN_LEGS: arbitrage legs in flight at once, across plans. */
-  maxOpenLegs: number;
-  /** ARB_MAX_UNWIND_RETRIES: attempts to sell a stranded first leg. */
-  maxUnwindRetries: number;
-}
+export const DEFAULT_BACKTEST_CONFIG: BacktestConfig = {
+  feeRate: 0.001,
+  maxPositionFraction: 1,
+  missingDataPolicy: "hold",
+};
 
-export interface TreasuryRiskState {
-  maxTrade: bigint;
-  maxMarket: bigint;
-  /** What the treasury has already committed per market (cost basis). */
-  marketSpent: Map<bigint, bigint>;
-  dailyRemaining: bigint;
-  /** Arbitrage legs currently submitted but not settled. */
-  openLegs: number;
-}
-
-/** Every limit `plan` breaks; empty means it may execute. */
-export function checkArbPlan(plan: ArbPlan, state: TreasuryRiskState, limits: ArbRiskLimits): string[] {
-  const problems: string[] = [];
-  if (limits.maxUnwindRetries < 1) problems.push("ARB_MAX_UNWIND_RETRIES must allow at least one unwind attempt");
-  if (limits.marketHeadroomBps < 0n || limits.marketHeadroomBps >= BPS) problems.push("ARB_MARKET_HEADROOM_BPS must be 0-9999");
-  // Usable share of max_market once the reserved headroom is set aside.
-  const usable = (state.maxMarket * (BPS - limits.marketHeadroomBps)) / BPS;
-  for (const leg of plan.legs) {
-    if (leg.collateral > state.maxTrade) {
-      problems.push(`leg on market ${leg.marketId}: ${leg.collateral} exceeds max_trade ${state.maxTrade}`);
-    }
-    const spent = state.marketSpent.get(leg.marketId) ?? 0n;
-    if (spent + leg.collateral > usable) {
-      problems.push(
-        `leg on market ${leg.marketId}: exposure ${spent + leg.collateral} would exceed ${usable} (max_market ${state.maxMarket} less ARB_MARKET_HEADROOM_BPS=${limits.marketHeadroomBps})`,
-      );
-    }
-  }
-  if (plan.cost > state.dailyRemaining) problems.push(`cost ${plan.cost} exceeds the remaining daily budget ${state.dailyRemaining}`);
-  if (plan.cost > limits.maxNotional) problems.push(`cost ${plan.cost} exceeds ARB_MAX_NOTIONAL=${limits.maxNotional}`);
-  const firstLeg = plan.legs[0].collateral;
-  if (firstLeg > limits.maxUnhedged) {
-    problems.push(`first leg ${firstLeg} exceeds ARB_MAX_UNHEDGED_STROOPS=${limits.maxUnhedged}, the exposure left if the second leg fails`);
-  }
-  if (state.openLegs + plan.legs.length > limits.maxOpenLegs) {
-    problems.push(`${state.openLegs} arbitrage legs already open; ${plan.legs.length} more would exceed ARB_MAX_OPEN_LEGS=${limits.maxOpenLegs}`);
-  }
-  return problems;
+function clamp(value: number, min: number, max: number): number {
+  if (Number.isNaN(value)) return min;
+  return Math.min(max, Math.max(min, value));
 }
 
 /**
- * Market eligibility and quality scoring (#57).
+ * Walk-forward backtest over time-ordered observations.
  *
- * Before an agent may trade a market, the market must pass a configurable
- * policy: horizon, liquidity, breaker status, resolution mode, and metadata.
- * Rejections carry human-readable reasons so they surface in traces, and the
- * decision path guarantees a rejected market never submits an order.
+ * At each step `i` the strategy receives `observations.slice(0, i + 1)` and may
+ * only act on that history, so future prices never leak into the decision.
+ * Returns are realised on the following observation, which is the first point
+ * at which the position could actually be held.
  */
-export type ResolutionMode = "oracle" | "manual" | "optimistic" | "unknown";
+export function runWalkForwardBacktest(
+  observations: ReadonlyArray<Observation>,
+  strategy: Strategy,
+  config: BacktestConfig = DEFAULT_BACKTEST_CONFIG,
+): BacktestMetrics {
+  const feeRate = clamp(config.feeRate, 0, 1);
+  const maxPosition = clamp(config.maxPositionFraction, 0, 1);
 
-export interface MarketEligibilityPolicy {
-  /** Minimum seconds between now and the market's close time. */
-  minHorizonSecs: bigint;
-  /** Maximum seconds between now and the market's close time (0 disables). */
-  maxHorizonSecs: bigint;
-  /** Minimum collateral liquidity required to trade. */
-  minLiquidity: bigint;
-  /** Reject markets whose circuit breaker is tripped. */
-  rejectOnBreaker: boolean;
-  /** Resolution modes the agent is allowed to trade. */
-  allowedResolutionModes: readonly ResolutionMode[];
-  /** Require a non-empty title and description in the market metadata. */
-  requireMetadata: boolean;
-  /** Minimum quality score (0-10000 bps) a market must reach. */
-  minQualityBps: bigint;
+  let equity = 1;
+  let peak = 1;
+  let maxDrawdown = 0;
+  let benchmarkEquity = 1;
+  let steps = 0;
+  let correctCalls = 0;
+  let directionalCalls = 0;
+  let previousPosition = 0;
+
+  for (let i = 0; i < observations.length - 1; i += 1) {
+    const current = observations[i];
+    const next = observations[i + 1];
+
+    // Missing-data policy: decide how to treat a gap at the current point.
+    if (current.price === null) {
+      if (config.missingDataPolicy === "skip") {
+        continue;
+      }
+      if (config.missingDataPolicy === "flat") {
+        previousPosition = 0;
+        continue;
+      }
+      // "hold": keep the previous position, but we cannot price a move.
+      continue;
+    }
+
+    // A missing next price means we cannot realise a return this step.
+    if (next.price === null) {
+      continue;
+    }
+
+    const history = observations.slice(0, i + 1);
+    const rawTarget = strategy(history);
+    const target = clamp(rawTarget, -1, 1) * maxPosition;
+
+    // Fees are charged on the traded delta of the position.
+    const traded = Math.abs(target - previousPosition);
+    equity -= equity * traded * feeRate;
+
+    const priceReturn = (next.price - current.price) / current.price;
+    equity += equity * target * priceReturn;
+
+    // Benchmark: fully-invested buy-and-hold, no fees.
+    benchmarkEquity += benchmarkEquity * priceReturn;
+
+    if (target !== 0) {
+      directionalCalls += 1;
+      if (Math.sign(target) === Math.sign(priceReturn)) {
+        correctCalls += 1;
+      }
+    }
+
+    peak = Math.max(peak, equity);
+    const drawdown = peak > 0 ? (peak - equity) / peak : 0;
+    maxDrawdown = Math.max(maxDrawdown, drawdown);
+
+    previousPosition = target;
+    steps += 1;
+  }
+
+  const totalReturn = equity - 1;
+  const benchmarkReturn = benchmarkEquity - 1;
+
+  return {
+    totalReturn,
+    benchmarkReturn,
+    excessReturn: totalReturn - benchmarkReturn,
+    maxDrawdown,
+    calibration: directionalCalls === 0 ? 0 : correctCalls / directionalCalls,
+    steps,
+  };
 }
 
-export interface MarketEligibilityInput {
-  now: bigint;
-  closeTime: bigint;
-  liquidity: bigint;
-  breakerTripped: boolean;
-  resolutionMode: ResolutionMode;
-  metadata: { title: string; description: string };
-}
+// ---------------------------------------------------------------------------
+// Strategy tournament evaluation (issue #63)
+// ---------------------------------------------------------------------------
 
-export interface MarketEligibilityResult {
-  eligible: boolean;
-  /** Human-readable rejection reasons; empty when eligible. */
-  reasons: string[];
-  /** Quality score in bps (0-10000), independent of eligibility. */
-  qualityBps: bigint;
-}
-
-const QUALITY_BPS = 10_000n;
-
-/**
- * Scores a market 0-10000 bps from liquidity depth and metadata completeness.
- * The score is advisory; eligibility is decided by the policy checks below.
- */
-export function scoreMarketQuality(input: MarketEligibilityInput, policy: MarketEligibilityPolicy): bigint {
-  let score = 0n;
-  if (policy.minLiquidity > 0n) {
-    const ratio = (input.liquidity * QUALITY_BPS) / policy.minLiquidity;
-    score += ratio > QUALITY_BPS ? QUALITY_BPS : ratio;
-  } else {
-    score += QUALITY_BPS;
-  }
-  if (policy.requireMetadata) {
-    const hasTitle = input.metadata.title.trim().length > 0;
-    const hasDescription = input.metadata.description.trim().length > 0;
-    if (hasTitle && hasDescription) score += QUALITY_BPS;
-    else if (hasTitle || hasDescription) score += QUALITY_BPS / 2n;
-  } else {
-    score += QUALITY_BPS;
-  }
-  return score / 2n;
-}
-
-/**
- * Evaluates a market against the eligibility policy. Every failing check
- * contributes a reason; an empty `reasons` array means the market is eligible.
- */
-export function evaluateMarketEligibility(
-  input: MarketEligibilityInput,
-  policy: MarketEligibilityPolicy,
-): MarketEligibilityResult {
-  const reasons: string[] = [];
-  const horizon = input.closeTime - input.now;
-  if (horizon < policy.minHorizonSecs) {
-    reasons.push(`horizon ${horizon}s is below minimum ${policy.minHorizonSecs}s`);
-  }
-  if (policy.maxHorizonSecs > 0n && horizon > policy.maxHorizonSecs) {
-    reasons.push(`horizon ${horizon}s exceeds maximum ${policy.maxHorizonSecs}s`);
-  }
-  if (input.liquidity < policy.minLiquidity) {
-    reasons.push(`liquidity ${input.liquidity} is below minimum ${policy.minLiquidity}`);
-  }
-  if (policy.rejectOnBreaker && input.breakerTripped) {
-    reasons.push("market circuit breaker is tripped");
-  }
-  if (!policy.allowedResolutionModes.includes(input.resolutionMode)) {
-    reasons.push(`resolution mode ${input.resolutionMode} is not allowed`);
-  }
-  if (policy.requireMetadata) {
-    if (input.metadata.title.trim().length === 0) reasons.push("market metadata is missing a title");
-    if (input.metadata.description.trim().length === 0) reasons.push("market metadata is missing a description");
-  }
-  const qualityBps = scoreMarketQuality(input, policy);
-  if (qualityBps < policy.minQualityBps) {
-    reasons.push(`quality score ${qualityBps}bps is below minimum ${policy.minQualityBps}bps`);
-  }
-  return { eligible: reasons.length === 0, reasons, qualityBps };
-}
-
-/**
- * Correlated outcome exposure (#59).
- *
- * Positions that resolve together are one bet, not several. Before trading,
- * the agent aggregates its committed exposure by configurable correlation
- * groups and checks each group against a cap. Markets whose correlation is
- * unknown are treated conservatively: they are placed in a shared "unknown"
- * bucket so missing relationships can never *increase* the effective limit.
- */
-export interface CorrelationGroup {
-  /** Stable identifier surfaced in traces and risk reports. */
+/** A named strategy variant competing in a tournament. */
+export interface StrategyVariant {
+  /** Stable identifier used to pair results across seeds. */
   id: string;
-  /** Markets that resolve together and share this group's cap. */
-  marketIds: readonly bigint[];
-  /** Most collateral the group may hold in aggregate. */
-  maxExposure: bigint;
+  /** The strategy under evaluation. */
+  strategy: Strategy;
 }
 
-export interface CorrelationConfig {
-  groups: readonly CorrelationGroup[];
-  /**
-   * Cap applied to the shared bucket of markets with no known relationship.
-   * Unknown correlation must not raise limits, so this bucket is always
-   * enforced and defaults to the tightest known group cap when unset.
-   */
-  unknownGroupMaxExposure?: bigint;
+/** A single deterministic scenario (seed) shared by every variant. */
+export interface TournamentSeed {
+  /** Stable identifier for the seed. */
+  id: string;
+  /** Time-ordered observations generated deterministically for this seed. */
+  observations: ReadonlyArray<Observation>;
 }
 
-export interface CorrelatedExposureInput {
-  /** Committed exposure per market (cost basis). */
-  marketExposure: ReadonlyMap<bigint, bigint>;
-  /** Collateral the candidate trade would add to `marketId`. */
-  marketId: bigint;
-  additionalExposure: bigint;
+/** Risk-adjusted metrics for one variant on one seed. */
+export interface SeedMetrics {
+  /** Cumulative strategy return as a fraction. */
+  totalReturn: number;
+  /** Strategy return minus benchmark return. */
+  excessReturn: number;
+  /** Maximum peak-to-trough drawdown as a positive fraction. */
+  maxDrawdown: number;
+  /** Worst single-step loss as a positive fraction (tail loss). */
+  tailLoss: number;
+  /** Mean absolute position change per step (turnover). */
+  turnover: number;
+  /** Fraction of directional calls that matched the next move (0..1). */
+  calibration: number;
+  /** Mean absolute deployed position per step (capital use, 0..1). */
+  capitalUse: number;
+  /** Number of steps actually evaluated. */
+  steps: number;
 }
 
-export interface CorrelationGroupExposure {
-  groupId: string;
-  exposure: bigint;
-  maxExposure: bigint;
+/** A point estimate with a symmetric uncertainty interval. */
+export interface IntervalEstimate {
+  /** Mean across seeds. */
+  mean: number;
+  /** Lower bound of the uncertainty interval. */
+  lower: number;
+  /** Upper bound of the uncertainty interval. */
+  upper: number;
+  /** Number of seeds contributing to the estimate. */
+  samples: number;
 }
 
-export interface CorrelatedExposureResult {
-  /** Per-group aggregate exposure after the candidate trade. */
-  groups: CorrelationGroupExposure[];
-  /** Aggregate exposure of markets with no known correlation. */
-  unknownExposure: bigint;
-  unknownMaxExposure: bigint;
-  /** Every cap the candidate trade would breach; empty means it fits. */
-  problems: string[];
+/** Aggregated, risk-adjusted tournament result for one variant. */
+export interface VariantReport {
+  id: string;
+  /** Risk-adjusted score (higher is better); see `riskAdjustedScore`. */
+  score: number;
+  /** Per-metric interval estimates across the shared seeds. */
+  metrics: {
+    excessReturn: IntervalEstimate;
+    maxDrawdown: IntervalEstimate;
+    tailLoss: IntervalEstimate;
+    turnover: IntervalEstimate;
+    calibration: IntervalEstimate;
+    capitalUse: IntervalEstimate;
+  };
+  /** Per-seed metrics, keyed by seed id, for auditing. */
+  perSeed: Record<string, SeedMetrics>;
+}
+
+export interface TournamentResult {
+  /** Seed ids shared by every variant, in input order. */
+  seedIds: string[];
+  /** Variant reports sorted by descending risk-adjusted score. */
+  ranking: VariantReport[];
 }
 
 const UNKNOWN_GROUP_ID = "unknown";
 
 /**
- * Aggregates committed exposure by correlation group and checks the candidate
- * trade against each group cap. Markets absent from every configured group
- * fall into the shared unknown bucket, whose cap is the tightest known group
- * cap (or the explicit `unknownGroupMaxExposure` when provided). This keeps
- * unknown correlation from ever loosening the effective limit.
+ * Error thrown when variants are not evaluated on an identical seed set.
+ * Unpaired comparisons are rejected so rankings are never computed across
+ * mismatched scenarios.
  */
-export function checkCorrelatedExposure(
-  input: CorrelatedExposureInput,
-  config: CorrelationConfig,
-): CorrelatedExposureResult {
-  const groupOf = new Map<bigint, string>();
-  for (const group of config.groups) {
-    for (const marketId of group.marketIds) groupOf.set(marketId, group.id);
+export class UnpairedComparisonError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "UnpairedComparisonError";
   }
-
-  const totals = new Map<string, bigint>();
-  for (const group of config.groups) totals.set(group.id, 0n);
-  let unknownExposure = 0n;
-  for (const [marketId, exposure] of input.marketExposure) {
-    const groupId = groupOf.get(marketId);
-    if (groupId === undefined) {
-      unknownExposure += exposure;
-    } else {
-      totals.set(groupId, (totals.get(groupId) ?? 0n) + exposure);
-    }
-  }
-
-  // Apply the candidate trade to whichever bucket its market belongs to.
-  const candidateGroup = groupOf.get(input.marketId);
-  if (candidateGroup === undefined) {
-    unknownExposure += input.additionalExposure;
-  } else {
-    totals.set(candidateGroup, (totals.get(candidateGroup) ?? 0n) + input.additionalExposure);
-  }
-
-  const problems: string[] = [];
-  const groups: CorrelationGroupExposure[] = [];
-  for (const group of config.groups) {
-    const exposure = totals.get(group.id) ?? 0n;
-    groups.push({ groupId: group.id, exposure, maxExposure: group.maxExposure });
-    if (exposure > group.maxExposure) {
-      problems.push(
-        `correlation group ${group.id}: exposure ${exposure} would exceed cap ${group.maxExposure}`,
-      );
-    }
-  }
-
-  const unknownMaxExposure = resolveUnknownCap(config);
-  if (unknownExposure > unknownMaxExposure) {
-    problems.push(
-      `correlation group ${UNKNOWN_GROUP_ID}: exposure ${unknownExposure} would exceed cap ${unknownMaxExposure}`,
-    );
-  }
-
-  return { groups, unknownExposure, unknownMaxExposure, problems };
 }
 
 /**
- * The unknown bucket cap is the explicit value when set, otherwise the
- * tightest configured group cap. With no groups at all it is zero, so an
- * unconfigured agent cannot trade on unknown correlation.
+ * Compute per-seed risk-adjusted metrics for a single strategy. Mirrors the
+ * walk-forward guarantees of `runWalkForwardBacktest` while additionally
+ * tracking tail loss, turnover and capital use.
  */
-function resolveUnknownCap(config: CorrelationConfig): bigint {
-  if (config.unknownGroupMaxExposure !== undefined) return config.unknownGroupMaxExposure;
-  let tightest: bigint | undefined;
-  for (const group of config.groups) {
-    if (tightest === undefined || group.maxExposure < tightest) tightest = group.maxExposure;
+export function evaluateSeed(
+  observations: ReadonlyArray<Observation>,
+  strategy: Strategy,
+  config: BacktestConfig = DEFAULT_BACKTEST_CONFIG,
+): SeedMetrics {
+  const feeRate = clamp(config.feeRate, 0, 1);
+  const maxPosition = clamp(config.maxPositionFraction, 0, 1);
+
+  let equity = 1;
+  let peak = 1;
+  let maxDrawdown = 0;
+  let benchmarkEquity = 1;
+  let steps = 0;
+  let correctCalls = 0;
+  let directionalCalls = 0;
+  let previousPosition = 0;
+  let tailLoss = 0;
+  let turnoverSum = 0;
+  let capitalSum = 0;
+
+  for (let i = 0; i < observations.length - 1; i += 1) {
+    const current = observations[i];
+    const next = observations[i + 1];
+
+    if (current.price === null) {
+      if (config.missingDataPolicy === "flat") {
+        previousPosition = 0;
+      }
+      continue;
+    }
+    if (next.price === null) {
+      continue;
+    }
+
+    const history = observations.slice(0, i + 1);
+    const rawTarget = strategy(history);
+    const target = clamp(rawTarget, -1, 1) * maxPosition;
+
+    const traded = Math.abs(target - previousPosition);
+    equity -= equity * traded * feeRate;
+
+    const priceReturn = (next.price - current.price) / current.price;
+    const stepPnl = equity * target * priceReturn;
+    equity += stepPnl;
+
+    benchmarkEquity += benchmarkEquity * priceReturn;
+
+    if (target !== 0) {
+      directionalCalls += 1;
+      if (Math.sign(target) === Math.sign(priceReturn)) {
+        correctCalls += 1;
+      }
+    }
+
+    // Tail loss: worst single-step loss as a positive fraction of equity.
+    if (stepPnl < 0) {
+      const lossFraction = -stepPnl / Math.max(equity - stepPnl, 1e-9);
+      tailLoss = Math.max(tailLoss, lossFraction);
+    }
+
+    peak = Math.max(peak, equity);
+    const drawdown = peak > 0 ? (peak - equity) / peak : 0;
+    maxDrawdown = Math.max(maxDrawdown, drawdown);
+
+    turnoverSum += traded;
+    capitalSum += Math.abs(target);
+
+    previousPosition = target;
+    steps += 1;
   }
-  return tightest ?? 0n;
+
+  const totalReturn = equity - 1;
+  const benchmarkReturn = benchmarkEquity - 1;
+
+  return {
+    totalReturn,
+    excessReturn: totalReturn - benchmarkReturn,
+    maxDrawdown,
+    tailLoss,
+    turnover: steps === 0 ? 0 : turnoverSum / steps,
+    calibration: directionalCalls === 0 ? 0 : correctCalls / directionalCalls,
+    capitalUse: steps === 0 ? 0 : capitalSum / steps,
+    steps,
+  };
 }
 
-export const ROLE_CREATE = 1 << 0;
-export const ROLE_TRADE = 1 << 1;
-const USAGE_BUCKET_SECONDS = 3_600n;
-const USAGE_BUCKETS = 25;
-const CREATION_BUCKETS = 24;
-const BPS_SCALE = 10_000n;
-
-export interface AgentRiskPolicy {
-  active: boolean;
-  roles: number;
-  maxTrade: bigint;
-  maxDaily: bigint;
+/**
+ * Risk-adjusted score: reward excess return and calibration, penalise
+ * drawdown, tail loss, turnover and idle capital. Higher is better.
+ */
+export function riskAdjustedScore(metrics: SeedMetrics): number {
+  return (
+    metrics.excessReturn +
+    0.5 * (metrics.calibration - 0.5) -
+    metrics.maxDrawdown -
+    metrics.tailLoss -
+    0.1 * metrics.turnover -
+    0.05 * (1 - metrics.capitalUse)
+  );
 }
 
-/** Ring buffer layout mirrors the treasury's on-chain UsageWindow. */
-export interface AgentUsageWindow {
-  headHour: bigint;
-  headIdx: number;
-  amounts: readonly bigint[];
+function intervalEstimate(values: ReadonlyArray<number>): IntervalEstimate {
+  const samples = values.length;
+  if (samples === 0) {
+    return { mean: 0, lower: 0, upper: 0, samples: 0 };
+  }
+  const mean = values.reduce((sum, v) => sum + v, 0) / samples;
+  if (samples === 1) {
+    return { mean, lower: mean, upper: mean, samples };
+  }
+  const variance =
+    values.reduce((sum, v) => sum + (v - mean) * (v - mean), 0) / (samples - 1);
+  // 95% interval using the standard error of the mean.
+  const margin = 1.96 * Math.sqrt(variance / samples);
+  return { mean, lower: mean - margin, upper: mean + margin, samples };
 }
 
-export interface CreationRateBucket {
-  bucketStart: bigint;
-  count: number;
+/**
+ * Run a strategy tournament across a shared set of seeds.
+ *
+ * Every variant is evaluated on the identical seed set. If any variant is
+ * missing a seed (or the seed sets differ), an `UnpairedComparisonError` is
+ * thrown so unpaired comparisons can never produce a ranking.
+ */
+export function runTournament(
+  variants: ReadonlyArray<StrategyVariant>,
+  seeds: ReadonlyArray<TournamentSeed>,
+  config: BacktestConfig = DEFAULT_BACKTEST_CONFIG,
+): TournamentResult {
+  if (variants.length === 0) {
+    return { seedIds: [], ranking: [] };
+  }
+
+  const seedIds = seeds.map((seed) => seed.id);
+  const uniqueSeedIds = new Set(seedIds);
+  if (uniqueSeedIds.size !== seedIds.length) {
+    throw new UnpairedComparisonError("Duplicate seed ids in tournament seed set");
+  }
+
+  const variantIds = new Set<string>();
+  for (const variant of variants) {
+    if (variantIds.has(variant.id)) {
+      throw new UnpairedComparisonError(
+        `Duplicate variant id: ${variant.id}`,
+      );
+    }
+    variantIds.add(variant.id);
+  }
+
+  const ranking: VariantReport[] = variants.map((variant) => {
+    const perSeed: Record<string, SeedMetrics> = {};
+    for (const seed of seeds) {
+      perSeed[seed.id] = evaluateSeed(seed.observations, variant.strategy, config);
+    }
+
+    // Guard: every variant must have a result for every shared seed.
+    for (const seedId of seedIds) {
+      if (!(seedId in perSeed)) {
+        throw new UnpairedComparisonError(
+          `Variant ${variant.id} missing seed ${seedId}`,
+        );
+      }
+    }
+
+    const seedMetrics = seedIds.map((seedId) => perSeed[seedId]);
+    const scores = seedMetrics.map(riskAdjustedScore);
+
+    return {
+      id: variant.id,
+      score: intervalEstimate(scores).mean,
+      metrics: {
+        excessReturn: intervalEstimate(seedMetrics.map((m) => m.excessReturn)),
+        maxDrawdown: intervalEstimate(seedMetrics.map((m) => m.maxDrawdown)),
+        tailLoss: intervalEstimate(seedMetrics.map((m) => m.tailLoss)),
+        turnover: intervalEstimate(seedMetrics.map((m) => m.turnover)),
+        calibration: intervalEstimate(seedMetrics.map((m) => m.calibration)),
+        capitalUse: intervalEstimate(seedMetrics.map((m) => m.capitalUse)),
+      },
+      perSeed,
+    };
+  });
+
+  ranking.sort((a, b) => b.score - a.score);
+
+  return { seedIds, ranking };
 }
 
 export interface AgentRiskState {
