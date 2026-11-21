@@ -157,6 +157,8 @@ export const EnvSchema = z.object({
   EVENTS_TRADE_THRESHOLD: stroopsField(500_000_000n),
   EVENTS_POLL_INTERVAL_MS: intField(10_000, 100, 3_600_000),
   EVENTS_PAGE_LIMIT: intField(100, 1, 10_000),
+  EVENTS_START_LEDGER: intField(undefined, 1, 4_294_967_295),
+  EVENTS_BACKFILL_MAX_PAGES: intField(10, 1, 1_000),
   EVENTS_CONCURRENCY: intField(4, 1, 64),
   EVENTS_MAX_ATTEMPTS: intField(5, 1, 100),
   EVENTS_DISPUTE_WINDOW_SECS: intField(600, 0, 30 * 86_400),
@@ -288,6 +290,10 @@ export interface EventsConfig {
   tradeThresholdStroops: bigint;
   pollIntervalMs: number;
   pageLimit: number;
+  /** Inclusive first ledger when no checkpoint exists. */
+  startLedger?: number;
+  /** Upper bound on RPC pages fetched during one poll. */
+  maxBackfillPages: number;
   concurrency: number;
   maxAttempts: number;
   /** Dispute window assumed for alerts, seconds. */
@@ -391,6 +397,8 @@ function tunablesFrom(e: ParsedEnv, env: NodeJS.ProcessEnv): Tunables {
       tradeThresholdStroops: e.EVENTS_TRADE_THRESHOLD,
       pollIntervalMs: e.EVENTS_POLL_INTERVAL_MS!,
       pageLimit: e.EVENTS_PAGE_LIMIT!,
+      startLedger: e.EVENTS_START_LEDGER,
+      maxBackfillPages: e.EVENTS_BACKFILL_MAX_PAGES!,
       concurrency: e.EVENTS_CONCURRENCY!,
       maxAttempts: e.EVENTS_MAX_ATTEMPTS!,
       disputeWindowSecs: e.EVENTS_DISPUTE_WINDOW_SECS!,
