@@ -41,6 +41,36 @@ async function buildRepository(): Promise<BuiltRepository> {
   );
 }
 
+// Transport hardening defaults. All values are operator-overridable via env.
+// - X402_MAX_BODY_BYTES: max accepted request body size (default 1 MiB).
+// - X402_REQUEST_TIMEOUT_MS: whole-request timeout (default 30s).
+// - X402_HEADERS_TIMEOUT_MS: time to receive request headers (default 15s).
+// - X402_IDLE_TIMEOUT_MS: keep-alive idle timeout (default 60s).
+// - X402_TRUST_PROXY: opt-in trusted-proxy policy. Unset/"false" means
+//   forwarded headers (X-Forwarded-For) are ignored and the socket peer
+//   address is used. Set to "true" to trust the immediate proxy, or a
+//   comma-separated list of trusted proxy IPs/CIDRs.
+const MAX_BODY_BYTES = Number(process.env.X402_MAX_BODY_BYTES ?? 1024 * 1024);
+const REQUEST_TIMEOUT_MS = Number(
+  process.env.X402_REQUEST_TIMEOUT_MS ?? 30000,
+);
+const HEADERS_TIMEOUT_MS = Number(
+  process.env.X402_HEADERS_TIMEOUT_MS ?? 15000,
+);
+const IDLE_TIMEOUT_MS = Number(process.env.X402_IDLE_TIMEOUT_MS ?? 60000);
+const TRUST_PROXY = process.env.X402_TRUST_PROXY;
+
+function parseTrustProxy(
+  value: string | undefined,
+): boolean | string[] {
+  if (!value || value === "false" || value === "0") return false;
+  if (value === "true" || value === "1") return true;
+  return value
+    .split(",")
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
 async function main() {
   const mode = process.env.X402_LEDGER ?? "sqlite";
   if (!["memory", "sqlite"].includes(mode))
@@ -100,6 +130,68 @@ async function main() {
     ],
   });
 
+  // Trusted-proxy policy: opt-in and safe by default. When disabled, Express
+  // ignores X-Forwarded-For and uses the socket peer address for req.ip.
+  app.set("trust proxy", parseTrustProxy(TRUST_PROXY));
+
+  // Secure response headers applied to every response.
+  app.use((_req, res, next) => {
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader("X-Frame-Options", "DENY");
+    res.setHeader("Referrer-Policy", "no-referrer");
+    res.setHeader(
+      "Content-Security-Policy",
+      "default-src 'none'; frame-ancestors 'none'",
+    );
+    if (process.env.X402_ENABLE_HSTS === "1") {
+      res.setHeader(
+        "Strict-Transport-Security",
+        "max-age=31536000; includeSubDomains",
+      );
+    }
+    next();
+  });
+
+  // Reject unsupported methods before any payment processing runs.
+  const ALLOWED_METHODS = new Set(["GET", "HEAD", "POST", "OPTIONS"]);
+  app.use((req, res, next) => {
+    if (!ALLOWED_METHODS.has(req.method)) {
+      res.setHeader("Allow", [...ALLOWED_METHODS].join(", "));
+      res.status(405).json({ error: "method_not_allowed" });
+      return;
+    }
+    next();
+  });
+
+  // Enforce an explicit maximum request body size before payment processing.
+  app.use((req, res, next) => {
+    const declared = Number(req.headers["content-length"] ?? 0);
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      res.setHeader("Connection", "close");
+      res.status(413).json({
+        error: "payload_too_large",
+        maxBytes: MAX_BODY_BYTES,
+      });
+      return;
+    }
+    let received = 0;
+    let rejected = false;
+    req.on("data", (chunk: Buffer) => {
+      if (rejected) return;
+      received += chunk.length;
+      if (received > MAX_BODY_BYTES) {
+        rejected = true;
+        res.setHeader("Connection", "close");
+        res.status(413).json({
+          error: "payload_too_large",
+          maxBytes: MAX_BODY_BYTES,
+        });
+        req.destroy();
+      }
+    });
+    next();
+  });
+
   try {
     await app.locals.ready;
   } catch (error) {
@@ -111,6 +203,9 @@ async function main() {
   const server = app.listen(port, () => {
     console.log(`OracleDesk x402 trace API listening on port ${port}`);
   });
+  server.requestTimeout = REQUEST_TIMEOUT_MS;
+  server.headersTimeout = HEADERS_TIMEOUT_MS;
+  server.keepAliveTimeout = IDLE_TIMEOUT_MS;
   for (const signal of ["SIGINT", "SIGTERM"] as const)
     process.once(signal, () => {
       server.close(() => {
