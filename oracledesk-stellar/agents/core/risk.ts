@@ -130,3 +130,20 @@ export function computeEvidenceHash(payload: unknown): string {
   const serialized = typeof payload === "string" ? payload : JSON.stringify(payload);
   return createHash("sha256").update(serialized).digest("hex");
 }
+
+export interface AgentRiskState {
+  now: bigint;
+  global: {
+    maxTrade: bigint;
+    maxMarket: bigint;
+    maxDaily: bigint;
+    maxNetExposure: bigint;
+  };
+  agent: AgentRiskPolicy;
+  usage: {
+    global: AgentUsageWindow;
+    agent: AgentUsageWindow;
+  };
+  /** Treasury's current token balance before a possible yield withdrawa
+
+/* … truncated 7739 chars — edit only what you need near the top … */
