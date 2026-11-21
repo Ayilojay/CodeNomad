@@ -74,112 +74,42 @@ export function existingQuestionHashes(snapshot: Snapshot): Set<string> {
 }
 
 /**
- * Metadata-only trace descriptor returned by cursor-based discovery.
- *
- * Deliberately excludes trace bytes: content stays behind the verified
- * payment flow. Only stable, non-sensitive descriptors are exposed here.
+ * Canonical trace intent: the minimal, deterministic description of a trace
+ * publication. Two intents that describe the same decision must serialize to
+ * the same string regardless of key ordering or process restart.
  */
-export interface TraceMetadata {
-  traceId: string;
-  createdAt: number;
-  size: number;
-  contentHash: string;
-}
-
-/** A page of trace metadata plus an opaque cursor for the next page. */
-export interface TraceMetadataPage {
-  traces: TraceMetadata[];
-  /** Opaque cursor for the next page, or null when this is the last page. */
-  nextCursor: string | null;
-}
-
-/** Default and maximum page sizes for trace metadata discovery. */
-export const TRACE_DISCOVERY_DEFAULT_LIMIT = 50;
-export const TRACE_DISCOVERY_MAX_LIMIT = 200;
-
-/**
- * Encode an opaque cursor from a stable sort key (createdAt + traceId).
- * The cursor is base64url-encoded JSON so callers cannot forge ordering
- * semantics by hand-crafting a plain offset.
- */
-function encodeTraceCursor(createdAt: number, traceId: string): string {
-  return Buffer.from(JSON.stringify({ c: createdAt, t: traceId }), "utf8").toString(
-    "base64url",
-  );
+export interface TraceIntent {
+  network: string;
+  contractId: string;
+  marketId: string;
+  decision: string;
+  /** Stable identifier of the reasoning payload (e.g. content hash). */
+  payloadHash: string;
 }
 
 /**
- * Decode an opaque cursor. Throws on malformed input so callers cannot fall
- * back to a success-shaped first page when a cursor is invalid.
+ * Derive a deterministic idempotency key from the canonical trace intent.
+ * The key is stable across agent restarts so a producer that crashed after
+ * publication but before local acknowledgement can reconcile the previous
+ * result instead of publishing a duplicate decision.
  */
-function decodeTraceCursor(cursor: string): { createdAt: number; traceId: string } {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(Buffer.from(cursor, "base64url").toString("utf8"));
-  } catch {
-    throw new Error("invalid trace cursor: not decodable");
+export function traceIdempotencyKey(intent: TraceIntent): string {
+  const canonical = JSON.stringify([
+    intent.network,
+    intent.contractId,
+    intent.marketId,
+    intent.decision,
+    intent.payloadHash,
+  ]);
+  // FNV-1a 64-bit over the canonical intent; deterministic and dependency-free.
+  let hash = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < canonical.length; i++) {
+    hash ^= BigInt(canonical.charCodeAt(i));
+    hash = (hash * prime) & mask;
   }
-  if (
-    typeof parsed !== "object" ||
-    parsed === null ||
-    typeof (parsed as { c?: unknown }).c !== "number" ||
-    typeof (parsed as { t?: unknown }).t !== "string"
-  ) {
-    throw new Error("invalid trace cursor: malformed payload");
-  }
-  return { createdAt: (parsed as { c: number }).c, traceId: (parsed as { t: string }).t };
-}
-
-/**
- * Cursor-based, metadata-only trace discovery.
- *
- * Returns at most `limit` trace descriptors ordered by (createdAt, traceId)
- * ascending, starting strictly after `cursor` when provided. Trace bytes are
- * never returned; retrieval of content remains gated by the verified payment
- * flow. Invalid cursors and out-of-range limits throw rather than silently
- * degrading to an unbounded or first-page result.
- */
-export function discoverTraceMetadata(
-  traces: Iterable<TraceMetadata>,
-  options: { cursor?: string | null; limit?: number } = {},
-): TraceMetadataPage {
-  const limit = options.limit ?? TRACE_DISCOVERY_DEFAULT_LIMIT;
-  if (!Number.isInteger(limit) || limit < 1 || limit > TRACE_DISCOVERY_MAX_LIMIT) {
-    throw new Error(
-      `invalid trace discovery limit: must be an integer in [1, ${TRACE_DISCOVERY_MAX_LIMIT}]`,
-    );
-  }
-
-  const after = options.cursor ? decodeTraceCursor(options.cursor) : null;
-
-  const sorted = Array.from(traces).sort((a, b) => {
-    if (a.createdAt !== b.createdAt) return a.createdAt - b.createdAt;
-    return a.traceId < b.traceId ? -1 : a.traceId > b.traceId ? 1 : 0;
-  });
-
-  const start = after
-    ? sorted.findIndex(
-        (t) =>
-          t.createdAt > after.createdAt ||
-          (t.createdAt === after.createdAt && t.traceId > after.traceId),
-      )
-    : 0;
-
-  const from = start === -1 ? sorted.length : start;
-  const page = sorted.slice(from, from + limit);
-  const hasMore = from + limit < sorted.length;
-  const last = page[page.length - 1];
-  const nextCursor = hasMore && last ? encodeTraceCursor(last.createdAt, last.traceId) : null;
-
-  return {
-    traces: page.map((t) => ({
-      traceId: t.traceId,
-      createdAt: t.createdAt,
-      size: t.size,
-      contentHash: t.contentHash,
-    })),
-    nextCursor,
-  };
+  return `trace:${hash.toString(16).padStart(16, "0")}`;
 }
 
 /**

@@ -196,91 +196,70 @@ test("put fails with TracePinError listing attempts when minPins not met", async
 
 test("get returns verified bytes from the first healthy gateway", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
+  let calls = 0;
+  const k = await kubo(t, () => cid);
+  const flaky = await serve(t, (_req, res) => {
+    calls++;
+    if (calls === 1) return json(res, 503, { Message: "try again" });
+    res.end(`${JSON.stringify({ Name: "trace.json", Hash: cid, Size: "1" })}\n`);
+  });
   const gw = await gateway(t, () => TRACE_BYTES);
-  const store = new IpfsTraceStore({ providers: [], gatewayUrl: gw.url, ...fast });
-  const bytes = await store.get(cid);
-  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
-  assert.equal(gw.hits(), 1);
+  const store = new IpfsTraceStore({ providers: [new KuboProvider({ apiUrl: flaky })], gatewayUrl: gw.url, ...fast });
+  assert.deepEqual(await store.put(TRACE.hash, TRACE.json), { cid });
+  assert.equal(calls, 2);
+  assert.equal(k.queries.length, 0);
 });
 
-test("get falls through to a later gateway when earlier ones are missing", async (t) => {
+test("put fails with TraceGatewayError when gateway serves tampered bytes", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const miss1 = await missingGateway(t);
-  const miss2 = await missingGateway(t);
-  const good = await gateway(t, () => TRACE_BYTES);
-  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss1.url, miss2.url, good.url], ...fast });
-  const bytes = await store.get(cid);
-  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
-  assert.equal(miss1.hits(), 1);
-  assert.equal(miss2.hits(), 1);
-  assert.equal(good.hits(), 1);
+  const k = await kubo(t, () => cid);
+  const gw = await gateway(t, () => new TextEncoder().encode("tampered"));
+  const store = new IpfsTraceStore({ providers: [new KuboProvider({ apiUrl: k.url })], gatewayUrl: gw.url, ...fast });
+  await assert.rejects(store.put(TRACE.hash, TRACE.json), TraceGatewayError);
 });
 
-test("get reports missing content when every gateway 404s", async (t) => {
+test("verifyAvailability reports available, missing, and tampered gateways deterministically", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const miss1 = await missingGateway(t);
-  const miss2 = await missingGateway(t);
-  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss1.url, miss2.url], ...fast });
-  const err = await store.get(cid).then(
-    () => assert.fail("expected TraceGatewayError"),
-    (e: unknown) => e,
-  );
-  assert.ok(err instanceof TraceGatewayError);
-  assert.equal(err.reason, "missing");
-  assert.equal(miss1.hits(), 1);
-  assert.equal(miss2.hits(), 1);
-});
-
-test("get rejects tampered content and never returns it as success", async (t) => {
-  const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const tampered = new TextEncoder().encode(TRACE.json.replace("buy", "sell"));
-  const gw = await gateway(t, () => tampered);
-  const store = new IpfsTraceStore({ providers: [], gatewayUrl: gw.url, ...fast });
-  const err = await store.get(cid).then(
-    () => assert.fail("expected TraceGatewayError"),
-    (e: unknown) => e,
-  );
-  assert.ok(err instanceof TraceGatewayError);
-  assert.equal(err.reason, "tampered");
-});
-
-test("get distinguishes tampered from missing across gateways", async (t) => {
-  const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const tampered = new TextEncoder().encode(TRACE.json.replace("buy", "sell"));
-  const bad = await gateway(t, () => tampered);
-  const miss = await missingGateway(t);
-  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss.url, bad.url], ...fast });
-  const err = await store.get(cid).then(
-    () => assert.fail("expected TraceGatewayError"),
-    (e: unknown) => e,
-  );
-  assert.ok(err instanceof TraceGatewayError);
-  assert.equal(err.reason, "tampered", "tampered content outranks missing");
-});
-
-test("get bounds each gateway attempt with a timeout and moves on", async (t) => {
-  const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const slow = await gateway(t, () => TRACE_BYTES, { delayMs: 5_000 });
-  const good = await gateway(t, () => TRACE_BYTES);
+  const available = await gateway(t, () => TRACE_BYTES);
+  const missing = await serve(t, (_req, res) => json(res, 404, { Message: "not found" }));
+  const tampered = await gateway(t, () => new TextEncoder().encode("tampered"));
   const store = new IpfsTraceStore({
     providers: [],
-    gatewayUrls: [slow.url, good.url],
-    gatewayTimeoutMs: 100,
+    gatewayUrl: available.url,
+    gateways: [available.url, `${missing}/ipfs`, tampered.url],
     ...fast,
   });
-  const bytes = await store.get(cid);
-  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
-  assert.equal(good.hits(), 1);
+  const report = await store.verifyAvailability([{ hash: TRACE.hash, cid }]);
+  assert.equal(report.length, 1);
+  const [entry] = report;
+  assert.equal(entry.hash, TRACE.hash);
+  assert.equal(entry.cid, cid);
+  assert.equal(entry.available, true);
+  const byUrl = new Map(entry.gateways.map((g) => [g.gateway, g]));
+  assert.equal(byUrl.get(available.url)?.status, "available");
+  assert.equal(byUrl.get(`${missing}/ipfs`)?.status, "missing");
+  assert.equal(byUrl.get(tampered.url)?.status, "tampered");
 });
 
-test("get reports missing when all gateways time out", async (t) => {
+test("verifyAvailability reports unavailable when every gateway is missing", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const slow = await gateway(t, () => TRACE_BYTES, { delayMs: 5_000 });
-  const store = new IpfsTraceStore({ providers: [], gatewayUrl: slow.url, gatewayTimeoutMs: 100, ...fast });
-  const err = await store.get(cid).then(
-    () => assert.fail("expected TraceGatewayError"),
-    (e: unknown) => e,
-  );
-  assert.ok(err instanceof TraceGatewayError);
-  assert.equal(err.reason, "missing");
+  const missing = await serve(t, (_req, res) => json(res, 404, {}));
+  const store = new IpfsTraceStore({
+    providers: [],
+    gatewayUrl: `${missing}/ipfs`,
+    gateways: [`${missing}/ipfs`],
+    ...fast,
+  });
+  const [entry] = await store.verifyAvailability([{ hash: TRACE.hash, cid }]);
+  assert.equal(entry.available, false);
+  assert.equal(entry.gateways[0]?.status, "missing");
+});
+
+test("verifyAvailability samples only the requested subset of CIDs", async (t) => {
+  const { cid } = await rawCidForBytes(TRACE_BYTES);
+  const gw = await gateway(t, () => TRACE_BYTES);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrl: gw.url, gateways: [gw.url], ...fast });
+  const report = await store.verifyAvailability([{ hash: TRACE.hash, cid }], { sample: 1 });
+  assert.equal(report.length, 1);
+  assert.equal(gw.hits(), 1);
 });

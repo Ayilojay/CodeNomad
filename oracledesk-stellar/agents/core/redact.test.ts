@@ -34,3 +34,28 @@ test("handles cyclic values", () => {
   assert.equal(result.password, REDACTED);
   assert.equal(result.self, result);
 });
+
+// Confidentiality boundary: serialized traces must never carry secrets or
+// private keys. These tests pin the public-data contract documented for
+// operators (on-chain data, CIDs, x402 responses, and logs are public).
+test("serialized traces never contain Stellar secret seeds or private keys", () => {
+  const secretSeed = `S${"B".repeat(55)}`;
+  const trace = {
+    agent: "trader",
+    privateKey: secretSeed,
+    signer: { secretKey: secretSeed, publicKey: `G${"C".repeat(55)}` },
+    x402: { response: { authorization: "Bearer live-token" } },
+    note: `signed with ${secretSeed}`,
+  };
+  const serialized = JSON.stringify(redact(trace));
+  assert.ok(!serialized.includes(secretSeed), "secret seed leaked into trace");
+  assert.ok(!serialized.includes("live-token"), "bearer token leaked into trace");
+  assert.ok(serialized.includes(`G${"C".repeat(55)}`), "public key should remain");
+});
+
+test("redaction is idempotent so re-serialized traces stay clean", () => {
+  const once = redact({ apiKey: "k", nested: { password: "p" } });
+  const twice = redact(once);
+  assert.deepEqual(twice, once);
+  assert.equal(JSON.stringify(twice).includes("\"k\""), false);
+});
