@@ -164,6 +164,132 @@ export function evaluateMarketEligibility(
   return { eligible: reasons.length === 0, reasons, qualityBps };
 }
 
+/**
+ * Correlated outcome exposure (#59).
+ *
+ * Positions that resolve together are one bet, not several. Before trading,
+ * the agent aggregates its committed exposure by configurable correlation
+ * groups and checks each group against a cap. Markets whose correlation is
+ * unknown are treated conservatively: they are placed in a shared "unknown"
+ * bucket so missing relationships can never *increase* the effective limit.
+ */
+export interface CorrelationGroup {
+  /** Stable identifier surfaced in traces and risk reports. */
+  id: string;
+  /** Markets that resolve together and share this group's cap. */
+  marketIds: readonly bigint[];
+  /** Most collateral the group may hold in aggregate. */
+  maxExposure: bigint;
+}
+
+export interface CorrelationConfig {
+  groups: readonly CorrelationGroup[];
+  /**
+   * Cap applied to the shared bucket of markets with no known relationship.
+   * Unknown correlation must not raise limits, so this bucket is always
+   * enforced and defaults to the tightest known group cap when unset.
+   */
+  unknownGroupMaxExposure?: bigint;
+}
+
+export interface CorrelatedExposureInput {
+  /** Committed exposure per market (cost basis). */
+  marketExposure: ReadonlyMap<bigint, bigint>;
+  /** Collateral the candidate trade would add to `marketId`. */
+  marketId: bigint;
+  additionalExposure: bigint;
+}
+
+export interface CorrelationGroupExposure {
+  groupId: string;
+  exposure: bigint;
+  maxExposure: bigint;
+}
+
+export interface CorrelatedExposureResult {
+  /** Per-group aggregate exposure after the candidate trade. */
+  groups: CorrelationGroupExposure[];
+  /** Aggregate exposure of markets with no known correlation. */
+  unknownExposure: bigint;
+  unknownMaxExposure: bigint;
+  /** Every cap the candidate trade would breach; empty means it fits. */
+  problems: string[];
+}
+
+const UNKNOWN_GROUP_ID = "unknown";
+
+/**
+ * Aggregates committed exposure by correlation group and checks the candidate
+ * trade against each group cap. Markets absent from every configured group
+ * fall into the shared unknown bucket, whose cap is the tightest known group
+ * cap (or the explicit `unknownGroupMaxExposure` when provided). This keeps
+ * unknown correlation from ever loosening the effective limit.
+ */
+export function checkCorrelatedExposure(
+  input: CorrelatedExposureInput,
+  config: CorrelationConfig,
+): CorrelatedExposureResult {
+  const groupOf = new Map<bigint, string>();
+  for (const group of config.groups) {
+    for (const marketId of group.marketIds) groupOf.set(marketId, group.id);
+  }
+
+  const totals = new Map<string, bigint>();
+  for (const group of config.groups) totals.set(group.id, 0n);
+  let unknownExposure = 0n;
+  for (const [marketId, exposure] of input.marketExposure) {
+    const groupId = groupOf.get(marketId);
+    if (groupId === undefined) {
+      unknownExposure += exposure;
+    } else {
+      totals.set(groupId, (totals.get(groupId) ?? 0n) + exposure);
+    }
+  }
+
+  // Apply the candidate trade to whichever bucket its market belongs to.
+  const candidateGroup = groupOf.get(input.marketId);
+  if (candidateGroup === undefined) {
+    unknownExposure += input.additionalExposure;
+  } else {
+    totals.set(candidateGroup, (totals.get(candidateGroup) ?? 0n) + input.additionalExposure);
+  }
+
+  const problems: string[] = [];
+  const groups: CorrelationGroupExposure[] = [];
+  for (const group of config.groups) {
+    const exposure = totals.get(group.id) ?? 0n;
+    groups.push({ groupId: group.id, exposure, maxExposure: group.maxExposure });
+    if (exposure > group.maxExposure) {
+      problems.push(
+        `correlation group ${group.id}: exposure ${exposure} would exceed cap ${group.maxExposure}`,
+      );
+    }
+  }
+
+  const unknownMaxExposure = resolveUnknownCap(config);
+  if (unknownExposure > unknownMaxExposure) {
+    problems.push(
+      `correlation group ${UNKNOWN_GROUP_ID}: exposure ${unknownExposure} would exceed cap ${unknownMaxExposure}`,
+    );
+  }
+
+  return { groups, unknownExposure, unknownMaxExposure, problems };
+}
+
+/**
+ * The unknown bucket cap is the explicit value when set, otherwise the
+ * tightest configured group cap. With no groups at all it is zero, so an
+ * unconfigured agent cannot trade on unknown correlation.
+ */
+function resolveUnknownCap(config: CorrelationConfig): bigint {
+  if (config.unknownGroupMaxExposure !== undefined) return config.unknownGroupMaxExposure;
+  let tightest: bigint | undefined;
+  for (const group of config.groups) {
+    if (tightest === undefined || group.maxExposure < tightest) tightest = group.maxExposure;
+  }
+  return tightest ?? 0n;
+}
+
 export const ROLE_CREATE = 1 << 0;
 export const ROLE_TRADE = 1 << 1;
 const USAGE_BUCKET_SECONDS = 3_600n;
@@ -203,190 +329,6 @@ export interface AgentRiskState {
     global: AgentUsageWindow;
     agent: AgentUsageWindow;
   };
-  /** Treasury's current token balance before a possible yield withdrawal. */
-  idleCapital: bigint;
-  queueReservedCapital: bigint;
-  /** Current cost-basis exposure across all markets. */
-  netExposure: bigint;
-  /** Lifetime/cap exposure for the target market. Missing markets use zero. */
-  marketExposure: bigint;
-  /** In/out counters for the target market used to calculate its net increase. */
-  marketNetPosition: { collateralIn: bigint; collateralOut: bigint };
-  /** Whether a yield venue is enabled and the amount that can safely be recalled. */
-  yieldLiquidity: { enabled: boolean; available: bigint | null };
-  price: {
-    maxBuyPriceBps: bigint;
-    minSellPriceBps: bigint;
-    maxImpactBps: bigint;
-    maxSlippageBps: bigint;
-  };
-}
+  /** Treasury's current token balance before a possible yield withdrawa
 
-export interface AgentBuyRiskAction {
-  kind: "buy";
-  amount: bigint;
-  priceBeforeBps: bigint;
-  priceAfterBps: bigint;
-  quotedShares: bigint;
-  minSharesOut: bigint;
-}
-
-export interface AgentCreateRiskAction {
-  kind: "create";
-  seedAmount: bigint;
-  closeTime: bigint;
-  category: "Crypto" | "Macro" | "Geopolitics" | "Sports" | "Culture" | "Other";
-  initialYesBps: bigint;
-  creationPolicy: {
-    maxSeed: bigint;
-    maxMarketsPerWindow: number;
-    creationWindowSecs: bigint;
-    minCloseHorizon: bigint;
-    maxCloseHorizon: bigint;
-    allowedCategories: number;
-  };
-  creationBuckets: readonly CreationRateBucket[];
-}
-
-export type AgentRiskAction = AgentBuyRiskAction | AgentCreateRiskAction;
-export interface AgentRiskEvaluation {
-  /** Checks which would reject the invocation, in contract execution order. */
-  violations: string[];
-  /** Checks dependent on external runtime outcomes or unavailable inputs. */
-  unverifiable: string[];
-}
-
-const CATEGORY_BITS: Record<AgentCreateRiskAction["category"], number> = {
-  Crypto: 1 << 0,
-  Macro: 1 << 1,
-  Geopolitics: 1 << 2,
-  Sports: 1 << 3,
-  Culture: 1 << 4,
-  Other: 1 << 5,
-};
-
-function windowState(window: AgentUsageWindow, now: bigint): { total: bigint; headAmount: bigint } | undefined {
-  if (
-    window.amounts.length !== USAGE_BUCKETS ||
-    !Number.isInteger(window.headIdx) ||
-    window.headIdx < 0 ||
-    window.headIdx >= USAGE_BUCKETS
-  ) return undefined;
-  const currentHour = now / USAGE_BUCKET_SECONDS;
-  const steps = currentHour > window.headHour
-    ? Number((currentHour - window.headHour) > BigInt(USAGE_BUCKETS)
-      ? BigInt(USAGE_BUCKETS)
-      : currentHour - window.headHour)
-    : 0;
-  const headIdx = (window.headIdx + steps) % USAGE_BUCKETS;
-  let total = 0n;
-  for (let slot = 0; slot < USAGE_BUCKETS; slot += 1) {
-    const amount = window.amounts[slot];
-    if (amount === undefined || amount < 0n) return undefined;
-    const age = (window.headIdx - slot + USAGE_BUCKETS) % USAGE_BUCKETS;
-    if (age + steps < USAGE_BUCKETS) total += amount;
-  }
-  return { total, headAmount: window.amounts[headIdx] ?? 0n };
-}
-
-function marketNetIncrease(position: AgentRiskState["marketNetPosition"], amount: bigint): bigint {
-  const current = position.collateralIn > position.collateralOut
-    ? position.collateralIn - position.collateralOut
-    : 0n;
-  const nextIn = position.collateralIn + amount;
-  const next = nextIn > position.collateralOut ? nextIn - position.collateralOut : 0n;
-  return next - current;
-}
-
-function creationWindowTotal(
-  buckets: readonly CreationRateBucket[],
-  now: bigint,
-  windowSecs: bigint,
-): number {
-  return buckets.reduce(
-    (sum, bucket) => bucket.bucketStart + windowSecs > now ? sum + bucket.count : sum,
-    0,
-  );
-}
-
-/**
- * Mirrors the treasury's create/buy gates. For buys and creates, capacity,
- * daily usage, and net exposure are evaluated after the nested market-core
- * action, matching Soroban's transaction rollback semantics.
- */
-export function evaluateAgentRisk(action: AgentRiskAction, state: AgentRiskState): AgentRiskEvaluation {
-  const violations: string[] = [];
-  const unverifiable: string[] = [];
-  const role = action.kind === "buy" ? ROLE_TRADE : ROLE_CREATE;
-  const amount = action.kind === "buy" ? action.amount : action.seedAmount;
-  if (!state.agent.active || (state.agent.roles & role) === 0) {
-    violations.push(`agent is inactive or missing the ${action.kind === "buy" ? "trade" : "create"} role`);
-  }
-  if (amount <= 0n) violations.push("amount must be positive");
-  if (amount > state.agent.maxTrade) {
-    violations.push(`amount ${amount} exceeds agent max_trade ${state.agent.maxTrade}`);
-  }
-  if (amount > state.global.maxTrade) {
-    violations.push(`amount ${amount} exceeds global max_trade ${state.global.maxTrade}`);
-  }
-  const agentUsage = windowState(state.usage.agent, state.now);
-  const globalUsage = windowState(state.usage.global, state.now);
-  if (!agentUsage || !globalUsage) {
-    unverifiable.push("usage window is malformed");
-  } else {
-    if (agentUsage.total + amount > state.agent.maxDaily) {
-      violations.push(`amount ${amount} would exceed agent max_daily ${state.agent.maxDaily} (used ${agentUsage.total})`);
-    }
-    if (globalUsage.total + amount > state.global.maxDaily) {
-      violations.push(`amount ${amount} would exceed global max_daily ${state.global.maxDaily} (used ${globalUsage.total})`);
-    }
-  }
-  const netIncrease = marketNetIncrease(state.marketNetPosition, amount);
-  if (state.marketExposure + netIncrease > state.global.maxMarket) {
-    violations.push(`market exposure ${state.marketExposure + netIncrease} would exceed max_market ${state.global.maxMarket}`);
-  }
-  if (state.netExposure + netIncrease > state.global.maxNetExposure) {
-    violations.push(`net exposure ${state.netExposure + netIncrease} would exceed max_net_exposure ${state.global.maxNetExposure}`);
-  }
-  const available = state.idleCapital + (state.yieldLiquidity.enabled ? (state.yieldLiquidity.available ?? 0n) : 0n);
-  if (amount > available - state.queueReservedCapital) {
-    violations.push(`amount ${amount} exceeds available capital ${available - state.queueReservedCapital}`);
-  }
-  if (action.kind === "buy") {
-    if (action.priceBeforeBps > state.price.maxBuyPriceBps) {
-      violations.push(`price ${action.priceBeforeBps}bps exceeds max_buy_price ${state.price.maxBuyPriceBps}bps`);
-    }
-    const impact = action.priceAfterBps > action.priceBeforeBps ? action.priceAfterBps - action.priceBeforeBps : 0n;
-    if (impact > state.price.maxImpactBps) {
-      violations.push(`price impact ${impact}bps exceeds max_impact ${state.price.maxImpactBps}bps`);
-    }
-    if (action.minSharesOut < action.quotedShares) {
-      const slippage = action.quotedShares > 0n
-        ? ((action.quotedShares - action.minSharesOut) * BPS_SCALE) / action.quotedShares
-        : 0n;
-      if (slippage > state.price.maxSlippageBps) {
-        violations.push(`slippage ${slippage}bps exceeds max_slippage ${state.price.maxSlippageBps}bps`);
-      }
-    }
-  } else {
-    const policy = action.creationPolicy;
-    if (action.seedAmount > policy.maxSeed) {
-      violations.push(`seed ${action.seedAmount} exceeds max_seed ${policy.maxSeed}`);
-    }
-    const horizon = action.closeTime - state.now;
-    if (horizon < policy.minCloseHorizon) {
-      violations.push(`close horizon ${horizon}s is below minimum ${policy.minCloseHorizon}s`);
-    }
-    if (horizon > policy.maxCloseHorizon) {
-      violations.push(`close horizon ${horizon}s exceeds maximum ${policy.maxCloseHorizon}s`);
-    }
-    if ((policy.allowedCategories & CATEGORY_BITS[action.category]) === 0) {
-      violations.push(`category ${action.category} is not allowed`);
-    }
-    const created = creationWindowTotal(action.creationBuckets, state.now, policy.creationWindowSecs);
-    if (created + 1 > policy.maxMarketsPerWindow) {
-      violations.push(`${created} markets already created in window; limit is ${policy.maxMarketsPerWindow}`);
-    }
-  }
-  return { violations, unverifiable };
-}
+/* … truncated 7739 chars — edit only what you need near the top … */
