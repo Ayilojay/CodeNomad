@@ -184,3 +184,181 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 
   return lines.join("\n") + "\n";
 }
+
+/**
+ * Walk-forward backtest evaluation for trading strategies (issue #61).
+ *
+ * Design constraints:
+ * - No look-ahead bias: at each step the strategy only sees observations up to
+ *   and including the current index; future data is never passed to it.
+ * - Fees and position/size caps are modeled on every rebalance.
+ * - Missing data is handled by an explicit, documented policy.
+ * - A benchmark (buy-and-hold) is evaluated alongside the strategy.
+ * - Reports returns, drawdown and calibration alongside the benchmark.
+ * - Pure evaluation only: this module has no control-flow authority and never
+ *   bypasses the safe dry-run default or on-chain risk controls.
+ */
+
+export type MissingDataPolicy = "skip" | "hold" | "flat";
+
+export interface BacktestObservation {
+  /** Monotonic timestamp; observations must be supplied in ascending order. */
+  timestamp: number;
+  /** Reference price for the step; `null` marks a missing observation. */
+  price: number | null;
+}
+
+export interface BacktestConfig {
+  /** Proportional trading fee applied to the traded notional (e.g. 0.001). */
+  feeRate: number;
+  /** Maximum absolute position size as a fraction of equity (e.g. 1.0). */
+  maxPositionFraction: number;
+  /** Policy applied when an observation is missing. */
+  missingDataPolicy: MissingDataPolicy;
+}
+
+export interface BacktestStep {
+  timestamp: number;
+  /** Target position fraction chosen by the strategy (post-cap). */
+  position: number;
+  /** Strategy equity after fees for this step. */
+  equity: number;
+  /** Benchmark (buy-and-hold) equity for this step. */
+  benchmarkEquity: number;
+  /** True when the observation was missing and the policy was applied. */
+  missing: boolean;
+}
+
+export interface BacktestResult {
+  steps: BacktestStep[];
+  /** Total strategy return over the window (fractional). */
+  strategyReturn: number;
+  /** Total benchmark return over the window (fractional). */
+  benchmarkReturn: number;
+  /** Maximum peak-to-trough drawdown of the strategy (fractional, >= 0). */
+  maxDrawdown: number;
+  /** Brier score of the strategy's directional predictions (lower is better). */
+  calibration: number;
+  /** Number of steps where the missing-data policy was applied. */
+  missingSteps: number;
+}
+
+/**
+ * Strategy callback: receives only the observations available up to and
+ * including `index` (no look-ahead) and returns a target position fraction.
+ */
+export type BacktestStrategy = (
+  history: readonly BacktestObservation[],
+  index: number,
+) => number;
+
+function clampPosition(position: number, maxFraction: number): number {
+  if (!Number.isFinite(position)) {
+    return 0;
+  }
+  const cap = Math.max(0, maxFraction);
+  return Math.max(-cap, Math.min(cap, position));
+}
+
+/**
+ * Run a walk-forward backtest over time-ordered observations.
+ *
+ * Each step evaluates the strategy using only `observations[0..i]`, applies
+ * fees on the traded notional, clamps the position to the configured cap, and
+ * applies the missing-data policy when the current price is `null`.
+ */
+export function runWalkForwardBacktest(
+  observations: readonly BacktestObservation[],
+  strategy: BacktestStrategy,
+  config: BacktestConfig,
+): BacktestResult {
+  const steps: BacktestStep[] = [];
+  const feeRate = Number.isFinite(config.feeRate) && config.feeRate > 0 ? config.feeRate : 0;
+  const maxFraction =
+    Number.isFinite(config.maxPositionFraction) && config.maxPositionFraction > 0
+      ? config.maxPositionFraction
+      : 0;
+  const policy = config.missingDataPolicy;
+
+  let strategyEquity = 1;
+  let benchmarkEquity = 1;
+  let prevPosition = 0;
+  let prevPrice: number | null = null;
+  let peak = 1;
+  let maxDrawdown = 0;
+  let missingSteps = 0;
+  let brierSum = 0;
+  let brierCount = 0;
+
+  for (let i = 0; i < observations.length; i += 1) {
+    const obs = observations[i];
+    const missing = obs.price === null || !Number.isFinite(obs.price as number);
+
+    let targetPosition: number;
+    if (missing) {
+      missingSteps += 1;
+      if (policy === "flat") {
+        targetPosition = 0;
+      } else if (policy === "hold") {
+        targetPosition = prevPosition;
+      } else {
+        // "skip": leave the position unchanged and do not trade this step.
+        targetPosition = prevPosition;
+      }
+    } else {
+      // No look-ahead: only history up to and including the current index.
+      const history = observations.slice(0, i + 1);
+      targetPosition = clampPosition(strategy(history, i), maxFraction);
+    }
+
+    const price = missing ? prevPrice : (obs.price as number);
+
+    if (!missing && prevPrice !== null && price !== null) {
+      const priceReturn = prevPrice === 0 ? 0 : price / prevPrice - 1;
+      // Strategy earns the return on the position held into this step.
+      strategyEquity *= 1 + prevPosition * priceReturn;
+      // Benchmark is buy-and-hold from the first available price.
+      benchmarkEquity *= 1 + priceReturn;
+
+      // Calibration: did the strategy's directional call match the move?
+      if (prevPosition !== 0) {
+        const predictedUp = prevPosition > 0 ? 1 : 0;
+        const actualUp = priceReturn > 0 ? 1 : 0;
+        brierSum += (predictedUp - actualUp) ** 2;
+        brierCount += 1;
+      }
+    }
+
+    // Apply fees on the traded notional when the position changes.
+    if (!missing && targetPosition !== prevPosition) {
+      const tradedNotional = Math.abs(targetPosition - prevPosition) * strategyEquity;
+      strategyEquity -= tradedNotional * feeRate;
+    }
+
+    prevPosition = targetPosition;
+    if (!missing) {
+      prevPrice = price;
+    }
+
+    peak = Math.max(peak, strategyEquity);
+    const drawdown = peak === 0 ? 0 : (peak - strategyEquity) / peak;
+    maxDrawdown = Math.max(maxDrawdown, drawdown);
+
+    steps.push({
+      timestamp: obs.timestamp,
+      position: targetPosition,
+      equity: strategyEquity,
+      benchmarkEquity,
+      missing,
+    });
+  }
+
+  return {
+    steps,
+    strategyReturn: strategyEquity - 1,
+    benchmarkReturn: benchmarkEquity - 1,
+    maxDrawdown,
+    calibration: brierCount === 0 ? 0 : brierSum / brierCount,
+    missingSteps,
+  };
+}
