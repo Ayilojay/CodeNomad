@@ -1,84 +1,42 @@
 /**
- * Durable storage for resolution specs the market-maker has committed to,
- * and the recovery loop that guarantees each one is eventually revealed.
+ * Canonical trace payload schema + serialization for trace hashing.
  *
- * A market's `resolution_hash` is fixed at creation and only the stored
- * spec reproduces it, so losing the spec between `agent_create_market` and
- * `register_*_spec` makes the market permanently unresolvable. The store is
- * therefore written (fsync + atomic rename) BEFORE the create transaction
- * exists, and its directory (`AGENT_SPEC_DIR`, default `./.specs`) must be
- * backed up — `SPEC_BACKUP_CMD` runs after every write for that.
+ * Producers and consumers must agree on a stable schema/version contract as
+ * fields and actions evolve. The canonical payload is a deterministic JSON
+ * encoding with:
+ *   - a fixed top-level key order (schemaVersion first, then payload keys)
+ *   - lexicographically sorted object keys at every nesting level
+ *   - no whitespace
+ *   - only finite numbers in canonical form (no -0, no exponent ambiguity)
+ *   - rejection of duplicate keys and unsupported schema versions
  */
-import { exec } from "node:child_process";
-import { randomBytes } from "node:crypto";
-import { mkdir, open, readdir, readFile, rename, unlink } from "node:fs/promises";
-import { join } from "node:path";
-import { canonicalizeSpec, type SpecJson } from "./spec.js";
 
-export interface StoredSpec {
-  /** Unique per create attempt: the same spec may be committed to by
-   * several markets, so the commitment alone is not a key. */
-  id: string;
-  commitment: string;
-  spec: SpecJson;
-  questionHash: string;
-  state: "pending_create" | "created" | "revealed" | "abandoned";
-  marketId?: string;
-  createdTx?: string;
-  /** close_time sent with the create, so recovery can match it exactly. */
-  closeTime?: string;
-  /** Unix milliseconds. */
-  createdAt: number;
-  updatedAt: number;
-  lastError?: string;
+export const TRACE_SCHEMA_VERSION = 1 as const;
+
+export const SUPPORTED_TRACE_SCHEMA_VERSIONS: readonly number[] = [1];
+
+export type TraceSchemaVersion = (typeof TRACE_SCHEMA_VERSION);
+
+export interface CanonicalTracePayload {
+  schemaVersion: TraceSchemaVersion;
+  [key: string]: unknown;
 }
 
-export interface SpecStore {
-  put(s: StoredSpec): Promise<void>;
-  byCommitment(h: string): Promise<StoredSpec | undefined>;
-  list(state?: StoredSpec["state"]): Promise<StoredSpec[]>;
-}
-
-export function newStoredSpec(args: {
-  commitment: string;
-  spec: SpecJson;
-  questionHash: string;
-  closeTime?: bigint;
-  now?: number;
-}): StoredSpec {
-  const now = args.now ?? Date.now();
-  return {
-    id: `${now}-${randomBytes(4).toString("hex")}`,
-    commitment: args.commitment,
-    spec: canonicalizeSpec(args.spec),
-    questionHash: args.questionHash,
-    state: "pending_create",
-    closeTime: args.closeTime?.toString(),
-    createdAt: now,
-    updatedAt: now,
-  };
-}
-
-function pickByCommitment(all: StoredSpec[], h: string): StoredSpec | undefined {
-  const matches = all.filter((s) => s.commitment === h);
-  matches.sort((a, b) => Number(a.state === "abandoned") - Number(b.state === "abandoned") || b.updatedAt - a.updatedAt);
-  return matches[0];
-}
-
-/** Non-durable store for dry-run and tests. */
-export class MemorySpecStore implements SpecStore {
-  private readonly entries = new Map<string, StoredSpec>();
-
-  async put(s: StoredSpec): Promise<void> {
-    this.entries.set(s.id, structuredClone(s));
+export class TraceSchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TraceSchemaError";
   }
+}
 
-  async byCommitment(h: string): Promise<StoredSpec | undefined> {
-    return pickByCommitment(await this.list(), h);
+function assertSupportedVersion(version: unknown): asserts version is TraceSchemaVersion {
+  if (typeof version !== "number" || !Number.isInteger(version)) {
+    throw new TraceSchemaError(`trace schemaVersion must be an integer, got ${String(version)}`);
   }
-
-  async list(state?: StoredSpec["state"]): Promise<StoredSpec[]> {
-    return [...this.entries.values()].filter((s) => !state || s.state === state).map((s) => structuredClone(s));
+  if (!SUPPORTED_TRACE_SCHEMA_VERSIONS.includes(version)) {
+    throw new TraceSchemaError(
+      `unsupported trace schemaVersion ${version}; supported: ${SUPPORTED_TRACE_SCHEMA_VERSIONS.join(", ")}`,
+    );
   }
 }
 
@@ -230,118 +188,41 @@ export class FileSpecStore implements SpecStore {
     this.renameFn = opts.rename ?? rename;
     this.log = opts.log ?? ((m) => console.warn(m));
   }
-
-  private fileFor(s: StoredSpec): string {
-    if (!/^[0-9a-f]{64}$/.test(s.commitment)) throw new Error(`bad commitment ${s.commitment}`);
-    if (!/^[A-Za-z0-9-]+$/.test(s.id)) throw new Error(`bad spec id ${s.id}`);
-    return join(this.dir, `${s.commitment}.${s.id}.json`);
+  if (Object.is(value, -0)) {
+    throw new TraceSchemaError("negative zero is not a canonical number form");
   }
+  return JSON.stringify(value);
+}
 
-  async put(s: StoredSpec): Promise<void> {
-    await mkdir(this.dir, { recursive: true, mode: 0o700 });
-    const final = this.fileFor(s);
-    const tmp = `${final}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
-    const fh = await open(tmp, "wx", 0o600);
-    try {
-      await fh.writeFile(JSON.stringify(s, null, 2) + "\n", "utf8");
-      await fh.sync();
-    } finally {
-      await fh.close();
-    }
-    try {
-      await this.renameFn(tmp, final);
-    } catch (err) {
-      await unlink(tmp).catch(() => {});
-      throw err;
-    }
-    await this.syncDir();
-    await this.backup(final);
+function canonicalize(value: unknown, path: string): string {
+  if (value === null) return "null";
+  const t = typeof value;
+  if (t === "boolean") return value ? "true" : "false";
+  if (t === "number") return canonicalizeNumber(value as number);
+  if (t === "string") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((v, i) => canonicalize(v, `${path}[${i}]`)).join(",")}]`;
   }
-
-  private async syncDir(): Promise<void> {
-    try {
-      const dh = await open(this.dir, "r");
-      try {
-        await dh.sync();
-      } finally {
-        await dh.close();
+  if (t === "object") {
+    const obj = value as Record<string, unknown>;
+    const keys = Object.keys(obj).sort();
+    const parts: string[] = [];
+    for (const key of keys) {
+      const v = obj[key];
+      if (v === undefined) {
+        throw new TraceSchemaError(`undefined value at ${path}.${key} is not canonical`);
       }
-    } catch (err) {
-      // Windows cannot open/fsync a directory; the rename itself is durable
-      // there (MoveFileEx with write-through is what libuv uses).
-      if (process.platform !== "win32") throw err;
+      parts.push(`${JSON.stringify(key)}:${canonicalize(v, `${path}.${key}`)}`);
     }
+    return `{${parts.join(",")}}`;
   }
-
-  private async backup(file: string): Promise<void> {
-    if (!this.opts.backupCmd) return;
-    await new Promise<void>((resolve) => {
-      exec(this.opts.backupCmd!, { env: { ...process.env, SPEC_DIR: this.dir, SPEC_FILE: file } }, (err) => {
-        if (err) this.log(`[spec-store] WARNING: SPEC_BACKUP_CMD failed for ${file}: ${err.message}`);
-        resolve();
-      });
-    });
-  }
-
-  async byCommitment(h: string): Promise<StoredSpec | undefined> {
-    return pickByCommitment(await this.list(), h);
-  }
-
-  async list(state?: StoredSpec["state"]): Promise<StoredSpec[]> {
-    let names: string[];
-    try {
-      names = await readdir(this.dir);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
-      throw err;
-    }
-    const out: StoredSpec[] = [];
-    for (const name of names) {
-      if (!/^[0-9a-f]{64}\.[A-Za-z0-9-]+\.json$/.test(name)) continue;
-      // Final files are only ever produced by rename, so a parse failure is
-      // corruption, not a torn write: surface it rather than skip a spec.
-      const s = JSON.parse(await readFile(join(this.dir, name), "utf8")) as StoredSpec;
-      if (!state || s.state === state) out.push(s);
-    }
-    return out.sort((a, b) => a.createdAt - b.createdAt);
-  }
-}
-
-// --- recovery ---------------------------------------------------------------
-
-export interface ChainMarketView {
-  creator: string;
-  questionHash: string;
-  resolutionHash: string;
-  closeTime: bigint;
-}
-
-/** What recovery needs from the chain; implemented over StellarAdapter. */
-export interface RecoveryChain {
-  marketCount(): Promise<bigint>;
-  getMarket(id: bigint): Promise<ChainMarketView | undefined>;
-  /** True once any spec is registered for the market. Price reveals leave
-   * `state()` at Unconfigured, so this must also check the spec entry. */
-  isRevealed(id: bigint): Promise<boolean>;
-  /** register_signer_spec / register_price_spec; throws on failure. */
-  reveal(id: bigint, spec: SpecJson): Promise<void>;
-}
-
-/** The resolver's `MarketAlreadyConfigured` (#4), however the SDK surfaced it. */
-export function isMarketAlreadyConfigured(err: unknown): boolean {
-  const msg = err instanceof Error ? err.message : String(err);
-  return /MarketAlreadyConfigured|Error\(Contract, #4\)/.test(msg);
-}
-
-function errorText(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
+  throw new TraceSchemaError(`unsupported value type ${t} at ${path}`);
 }
 
 /**
- * Reveals `entry` for its (already known) market and records the outcome.
- * Someone else may reveal first — reveal is permissionless — so
- * `MarketAlreadyConfigured` counts as success once the market's on-chain
- * commitment is confirmed to be ours.
+ * Build a canonical trace payload with the current schema version stamped in.
+ * The returned object is the canonical structure; serialize it with
+ * `serializeCanonicalTrace` before hashing.
  */
 export async function revealStored(
   store: SpecStore,

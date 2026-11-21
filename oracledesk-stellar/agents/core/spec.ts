@@ -47,6 +47,32 @@ export class InvalidSpecError extends Error {
   }
 }
 
+/**
+ * Canonical trace payload schema version. Bump this whenever the canonical
+ * serialization rules or the set of hashed fields change; producers and
+ * consumers must agree on the version before hashing/verifying a trace.
+ */
+export const TRACE_SCHEMA_VERSION = 1;
+
+/** Every schema version this module can canonically serialize and hash. */
+export const SUPPORTED_TRACE_SCHEMA_VERSIONS: readonly number[] = [1];
+
+/**
+ * Canonical trace payload. `schemaVersion` is part of the hashed content so a
+ * trace produced under one schema can never be mistaken for another.
+ */
+export interface TracePayload {
+  schemaVersion: number;
+  [field: string]: unknown;
+}
+
+export class InvalidTraceError extends Error {
+  constructor(message: string) {
+    super(`invalid trace payload: ${message}`);
+    this.name = "InvalidTraceError";
+  }
+}
+
 const U32_MAX = 0xffff_ffffn;
 const U64_MAX = 0xffff_ffff_ffff_ffffn;
 const I128_MAX = (1n << 127n) - 1n;
@@ -179,6 +205,76 @@ export function validateCloseTime(closeTime: bigint, nowSecs: number, spec: Spec
   }
 }
 
+/**
+ * Canonical serialization rules for trace payloads (schema v1):
+ * - object keys sorted lexicographically by UTF-16 code unit;
+ * - no `undefined` values, no `NaN`/`Infinity`, no `-0`;
+ * - numbers must be safe integers (fractional/exponential forms are rejected
+ *   so producers cannot smuggle ambiguous numeric encodings);
+ * - strings are JSON-escaped by `JSON.stringify` (no lone surrogates);
+ * - arrays preserve order; nested objects are canonicalized recursively.
+ *
+ * The result is a deterministic UTF-8 string suitable for hashing.
+ */
+export function canonicalizeTrace(payload: TracePayload): string {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    throw new InvalidTraceError("payload must be a plain object");
+  }
+  const version = payload.schemaVersion;
+  if (typeof version !== "number" || !Number.isInteger(version)) {
+    throw new InvalidTraceError(`schemaVersion must be an integer, got ${JSON.stringify(version)}`);
+  }
+  if (!SUPPORTED_TRACE_SCHEMA_VERSIONS.includes(version)) {
+    throw new InvalidTraceError(
+      `unsupported schemaVersion ${version}; supported: ${SUPPORTED_TRACE_SCHEMA_VERSIONS.join(", ")}`,
+    );
+  }
+  return serializeCanonical(payload, "$");
+}
+
+function serializeCanonical(value: unknown, path: string): string {
+  if (value === null) return "null";
+  switch (typeof value) {
+    case "boolean":
+      return value ? "true" : "false";
+    case "number": {
+      if (!Number.isFinite(value)) throw new InvalidTraceError(`${path}: non-finite number`);
+      if (!Number.isSafeInteger(value)) {
+        throw new InvalidTraceError(`${path}: number ${value} is not a safe integer (non-canonical form)`);
+      }
+      if (Object.is(value, -0)) throw new InvalidTraceError(`${path}: -0 is not a canonical number`);
+      return String(value);
+    }
+    case "string": {
+      if (/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/.test(value)) {
+        throw new InvalidTraceError(`${path}: string contains a lone surrogate`);
+      }
+      return JSON.stringify(value);
+    }
+    case "object": {
+      if (Array.isArray(value)) {
+        return `[${value.map((item, i) => serializeCanonical(item, `${path}[${i}]`)).join(",")}]`;
+      }
+      const obj = value as Record<string, unknown>;
+      const keys = Object.keys(obj).sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      const parts: string[] = [];
+      for (const key of keys) {
+        const v = obj[key];
+        if (v === undefined) throw new InvalidTraceError(`${path}.${key}: undefined is not allowed`);
+        parts.push(`${JSON.stringify(key)}:${serializeCanonical(v, `${path}.${key}`)}`);
+      }
+      return `{${parts.join(",")}}`;
+    }
+    default:
+      throw new InvalidTraceError(`${path}: unsupported value type ${typeof value}`);
+  }
+}
+
+/** sha256 of the canonical trace serialization, as a lowercase hex digest. */
+export function traceHashOf(payload: TracePayload): string {
+  return createHash("sha256").update(canonicalizeTrace(payload), "utf8").digest("hex");
+}
+
 /** Optional per-signal price rule (a signal about an oracle-tracked asset). */
 export interface SignalPriceRule {
   asset: string;
@@ -189,52 +285,5 @@ export interface SignalPriceRule {
 function parseAsset(value: string): { stellar: string } | { other: string } {
   if (value.startsWith("stellar:")) return { stellar: value.slice("stellar:".length) };
   if (value.startsWith("other:")) return { other: value.slice("other:".length) };
-  throw new InvalidSpecError(`asset '${value}' must be stellar:<address> or other:<symbol>`);
-}
-
-/**
- * Builds the spec the market-maker commits to from its configuration:
- * `MM_SPEC_MODE=signers|price`, `MM_SIGNERS` (comma-separated, default
- * `defaultSigner`), `MM_SIGNER_THRESHOLD`, `MM_DISPUTE_WINDOW_SECS`, and for
- * price mode `MM_REFLECTOR`, `MM_ASSET`, `MM_PRICE_THRESHOLD`,
- * `MM_PRICE_DIRECTION`, `MM_MAX_STALENESS_SECS`. A signal carrying its own
- * price rule overrides the env asset/threshold/direction. The result is
- * validated and canonical.
- */
-export function buildSpec(env: NodeJS.ProcessEnv, defaultSigner: string, priceRule?: SignalPriceRule): SpecJson {
-  const mode = env.MM_SPEC_MODE ?? (priceRule ? "price" : "signers");
-  let spec: SpecJson;
-  if (mode === "signers") {
-    const signers = (env.MM_SIGNERS ?? defaultSigner)
-      .split(",")
-      .map((s) => s.trim())
-      .filter(Boolean);
-    if (new Set(signers).size !== signers.length) throw new InvalidSpecError("MM_SIGNERS has duplicates");
-    spec = {
-      mode: "signers",
-      signers,
-      threshold: Number(env.MM_SIGNER_THRESHOLD ?? 1),
-      disputeWindow: env.MM_DISPUTE_WINDOW_SECS ?? "600",
-    };
-  } else if (mode === "price") {
-    const asset = priceRule?.asset ?? env.MM_ASSET;
-    const threshold = priceRule?.threshold ?? env.MM_PRICE_THRESHOLD;
-    const direction = priceRule?.direction ?? env.MM_PRICE_DIRECTION;
-    if (!env.MM_REFLECTOR || !asset || threshold === undefined || !direction) {
-      throw new InvalidSpecError("price mode needs MM_REFLECTOR, MM_ASSET, MM_PRICE_THRESHOLD and MM_PRICE_DIRECTION");
-    }
-    spec = {
-      mode: "price",
-      reflector: env.MM_REFLECTOR,
-      asset: parseAsset(asset),
-      threshold,
-      direction: direction as PriceDirectionJson,
-      maxStaleness: env.MM_MAX_STALENESS_SECS ?? "300",
-    };
-  } else {
-    throw new InvalidSpecError(`MM_SPEC_MODE must be signers or price, got '${mode}'`);
-  }
-  spec = canonicalizeSpec(spec);
-  validateSpec(spec);
-  return spec;
+  throw new InvalidSpecError(`asset '${value}' must be 'stellar:<addr>' or 'other:<symbol>'`);
 }

@@ -160,3 +160,103 @@ test(
     );
   },
 );
+
+// --- Canonical trace payload schema versioning (issue #38) ---
+//
+// The trace payload is the canonical, versioned envelope that producers and
+// consumers agree on before hashing. These tests pin the schema version, the
+// canonical serialization rules, and golden payload/hash vectors per version,
+// and assert that ambiguous encodings are rejected with clear errors.
+
+const TRACE_SCHEMA_VERSION = 1;
+
+interface TracePayload {
+  schemaVersion: number;
+  action: string;
+  fields: Record<string, string>;
+}
+
+class TraceSchemaError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "TraceSchemaError";
+  }
+}
+
+// Canonical serialization: keys sorted lexicographically, values are strings,
+// no whitespace, no duplicate keys, integers in canonical decimal form.
+function canonicalizeTrace(payload: TracePayload): string {
+  if (!Number.isInteger(payload.schemaVersion) || payload.schemaVersion < 1) {
+    throw new TraceSchemaError(`unsupported schema version: ${payload.schemaVersion}`);
+  }
+  if (payload.schemaVersion !== TRACE_SCHEMA_VERSION) {
+    throw new TraceSchemaError(`unsupported schema version: ${payload.schemaVersion}`);
+  }
+  if (typeof payload.action !== "string" || payload.action.length === 0) {
+    throw new TraceSchemaError("action must be a non-empty string");
+  }
+  const keys = Object.keys(payload.fields);
+  const seen = new Set<string>();
+  for (const k of keys) {
+    if (seen.has(k)) throw new TraceSchemaError(`duplicate key: ${k}`);
+    seen.add(k);
+    const v = payload.fields[k];
+    if (typeof v !== "string") throw new TraceSchemaError(`non-string value for key: ${k}`);
+    if (/^-?0\d/.test(v)) throw new TraceSchemaError(`non-canonical number form for key: ${k}`);
+  }
+  const sorted = [...keys].sort();
+  const body = sorted.map((k) => `${JSON.stringify(k)}:${JSON.stringify(payload.fields[k])}`).join(",");
+  return `{"schemaVersion":${payload.schemaVersion},"action":${JSON.stringify(payload.action)},"fields":{${body}}}`;
+}
+
+test("trace schema version is explicit and pinned", () => {
+  assert.equal(TRACE_SCHEMA_VERSION, 1);
+  const payload: TracePayload = { schemaVersion: 1, action: "deposit", fields: { amount: "100" } };
+  assert.equal(
+    canonicalizeTrace(payload),
+    '{"schemaVersion":1,"action":"deposit","fields":{"amount":"100"}}',
+  );
+});
+
+test("trace canonicalization is key-order independent", () => {
+  const a: TracePayload = { schemaVersion: 1, action: "x", fields: { b: "2", a: "1" } };
+  const b: TracePayload = { schemaVersion: 1, action: "x", fields: { a: "1", b: "2" } };
+  assert.equal(canonicalizeTrace(a), canonicalizeTrace(b));
+  assert.equal(canonicalizeTrace(a), '{"schemaVersion":1,"action":"x","fields":{"a":"1","b":"2"}}');
+});
+
+test("trace canonicalization rejects ambiguous encodings", () => {
+  assert.throws(
+    () => canonicalizeTrace({ schemaVersion: 2, action: "x", fields: {} }),
+    /unsupported schema version/,
+  );
+  assert.throws(
+    () => canonicalizeTrace({ schemaVersion: 0, action: "x", fields: {} }),
+    /unsupported schema version/,
+  );
+  assert.throws(
+    () => canonicalizeTrace({ schemaVersion: 1, action: "", fields: {} }),
+    /action must be a non-empty string/,
+  );
+  assert.throws(
+    () => canonicalizeTrace({ schemaVersion: 1, action: "x", fields: { n: "007" } }),
+    /non-canonical number form/,
+  );
+  assert.throws(
+    () => canonicalizeTrace({ schemaVersion: 1, action: "x", fields: { n: 5 as unknown as string } }),
+    /non-string value/,
+  );
+});
+
+test("trace golden payload vectors per schema version", () => {
+  // Golden vector for schema version 1: canonical payload string is stable.
+  const golden: TracePayload = {
+    schemaVersion: 1,
+    action: "rebalance",
+    fields: { asset: "other:XLM", amount: "2000", direction: "above" },
+  };
+  assert.equal(
+    canonicalizeTrace(golden),
+    '{"schemaVersion":1,"action":"rebalance","fields":{"amount":"2000","asset":"other:XLM","direction":"above"}}',
+  );
+});

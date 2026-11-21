@@ -133,3 +133,8 @@ prerequisite and is not required for CI.
 The API is versioned via the `x402Version` field in challenges. Additive schema
 changes (new optional fields) are non-breaking; removing or renaming fields is a
 breaking change and requires a version bump.
+
+## Handsoff notes
+
+<!-- handsoff-issue-37 -->
+- #37: [treasury] Validate creation policy against adversarial market metadata
