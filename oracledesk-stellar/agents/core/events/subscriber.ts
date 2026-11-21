@@ -16,27 +16,12 @@
  * - Events from failed contract calls are dropped; filters are checked
  *   against the RPC's limits up front.
  *
- * ## Finality and duplicate-event semantics (#96)
- *
- * - **Stable event keys.** Events are identified by the Soroban event id
- *   (`<ledger>-<txIndex>-<opIndex>-<eventIndex>`), which is stable across
- *   replays and re-fetches of the same ledger. The contract id and topic
- *   structure are fixed by the decoder's filters; the id is the dedup key.
- * - **Idempotent dedup.** Before a batch is handed to `onBatch`, events whose
- *   id is already in the checkpoint's `processed` list are dropped. The list
- *   is bounded (LRU, oldest first) and persisted with each checkpoint, so a
- *   crash-and-redeliver or a duplicate RPC page never double-processes.
- * - **Finality.** A ledger is considered final once its events have been
- *   acknowledged and the checkpoint advanced past it. `lastLedger` is only
- *   advanced after `onBatch` resolves, so unacknowledged ledgers are replayed.
- * - **Gaps.** If RPC retention has moved past `lastLedger`, the missed events
- *   cannot be fetched; `onResync` is called for a full state reload and the
- *   subscriber restarts at the tip. This is logged as `EVENTS_RETENTION_GAP`.
- * - **Corrected RPC responses.** If a re-fetch returns a ledger whose events
- *   differ from what was already processed (e.g. a corrected response), the
- *   dedup list prevents re-processing already-acknowledged ids; new ids in
- *   the corrected response are processed normally. Operators should watch for
- *   `EVENTS_DUPLICATE_DROPPED` and `EVENTS_RETENTION_GAP` log events.
+ * Event-driven wakeups (#73): `start()` runs a periodic reconciliation poll
+ * (the fallback) and, when `subscribe` is provided, also wakes the loop as
+ * soon as the RPC pushes a new ledger. Wakeups only shorten the latency of a
+ * poll; they never replace it, so a dropped subscription degrades to plain
+ * polling. Duplicate deliveries are tolerated because the persisted cursor
+ * and the dispatcher's processed-id LRU deduplicate by ledger/event identity.
  */
 import { createHash } from "node:crypto";
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
@@ -111,6 +96,14 @@ export class MemoryCheckpointStore implements CheckpointStore {
   }
 }
 
+/**
+ * A push source of new-ledger notifications. `onLedger` fires whenever the
+ * RPC reports a new ledger; the returned function tears the subscription
+ * down. Implementations must tolerate reconnects internally or simply stop
+ * firing — the periodic poll remains the source of truth either way.
+ */
+export type LedgerSubscription = (onLedger: (ledger: number) => void) => () => void;
+
 export interface SubscriberOptions {
   rpc: EventsRpc;
   decoder: EventDecoder;
@@ -129,6 +122,8 @@ export interface SubscriberOptions {
   onResync: (reason: string) => Promise<void>;
   /** The dispatcher's processed ids, persisted with each checkpoint. */
   processedIds?: () => string[];
+  /** Optional event-driven wakeup source; polling still runs as fallback. */
+  subscribe?: LedgerSubscription;
   log?: (event: string, fields?: Record<string, unknown>) => void;
 }
 
@@ -204,6 +199,8 @@ export class EventSubscriber {
   private readonly pageLimit: number;
   private readonly maxBackfillPages: number;
   private stopped = false;
+  private wake: (() => void) | undefined;
+  private unsubscribe: (() => void) | undefined;
 
   constructor(private readonly o: SubscriberOptions) {
     this.filters = o.filters ?? [{ type: "contract", contractIds: o.decoder.contractIds() }];
@@ -280,30 +277,61 @@ export class EventSubscriber {
       const decoded = page.events
         .filter((e) => e.inSuccessfulContractCall)
         .map((e) => this.o.decoder.decode(e));
-      const { kept, dropped } = dedupeEvents(decoded, processed);
-      if (dropped > 0) this.log("EVENTS_DUPLICATE_DROPPED", { count: dropped });
-      if (kept.length > 0) {
-        await this.o.onBatch(kept);
-        delivered += kept.length;
-        for (const ev of kept) processed.add(ev.id);
+      if (events.length > 0) {
+        await this.o.onBatch(events);
+        delivered += events.length;
       }
       cursor = page.cursor;
       lastLedger = page.latestLedger;
       await this.save({ cursor, lastLedger });
-      if (page.events.length < this.pageLimit) break;
+      if (page.events.length < this.pageLimit) return delivered;
     }
     return delivered;
   }
 
-  /** Polls until `stop()`; `sleep` is injectable for tests. */
-  async run(sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<void> {
+  /**
+   * Runs the reconciliation poll forever, waking early on subscription
+   * notifications. The poll interval is the fallback: if the subscription
+   * disconnects or never fires, the loop still reconciles on schedule.
+   */
+  async start(): Promise<void> {
+    this.stopped = false;
+    if (this.o.subscribe) {
+      try {
+        this.unsubscribe = this.o.subscribe((ledger) => {
+          this.log("EVENTS_WAKE", { ledger });
+          this.wake?.();
+        });
+      } catch (err) {
+        this.log("EVENTS_SUBSCRIBE_FAILED", { error: String(err) });
+      }
+    }
+    const interval = this.o.pollIntervalMs ?? 5_000;
     while (!this.stopped) {
-      await this.pollOnce();
-      if (!this.stopped) await sleep(this.o.pollIntervalMs ?? 10_000);
+      try {
+        await this.pollOnce();
+      } catch (err) {
+        this.log("EVENTS_POLL_FAILED", { error: String(err) });
+      }
+      if (this.stopped) break;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(done, interval);
+        const self = this;
+        function done() {
+          clearTimeout(timer);
+          self.wake = undefined;
+          resolve();
+        }
+        this.wake = done;
+      });
     }
   }
 
+  /** Stops the loop and tears down the subscription. */
   stop(): void {
     this.stopped = true;
+    this.unsubscribe?.();
+    this.unsubscribe = undefined;
+    this.wake?.();
   }
 }

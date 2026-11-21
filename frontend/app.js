@@ -1,9 +1,28 @@
-const deployment = {
-  market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
-  reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+// Validated deployment manifests keyed by network. Contract/RPC configuration is
+// loaded from here instead of being hardcoded, so each network resolves its own
+// addresses and endpoints. Unknown networks have no manifest and are blocked.
+const DEPLOYMENT_MANIFESTS = {
+  local: {
+    network: "local",
+    explorer: "https://stellar.expert/explorer/testnet/contract/",
+    rpcUrl: "http://localhost:8000/soroban/rpc",
+    contracts: {
+      market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+    }
+  },
+  testnet: {
+    network: "testnet",
+    explorer: "https://stellar.expert/explorer/testnet/contract/",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    contracts: {
+      market_core: "CC4MMHWZ6ZRYAOQRR42KIIWNEZNFM4CWQ5Y4NNWTWNRUYH2O7E3SRK2O",
+      reasoning_registry: "CAFEED35XICK4OXIEXQDS6KTTBUA2LDNW3EXEUGTNMN54DY5ANETCH6M"
+    }
+  }
 };
 
-const explorer = "https://stellar.expert/explorer/testnet/contract/";
+const NETWORK_STORAGE_KEY = "oracledeskNetwork";
 const apiBase = localStorage.getItem("oracledeskApiUrl") || "http://localhost:3000";
 const expectedNetwork = "TESTNET";
 const clock = document.querySelector("#clock");
