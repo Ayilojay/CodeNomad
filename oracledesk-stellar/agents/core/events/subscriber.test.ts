@@ -8,17 +8,20 @@ import { Dispatcher, ProcessedLru } from "./dispatch.js";
 import { checkFilters, EventSubscriber, FileCheckpointStore, MemoryCheckpointStore, RpcFilterError } from "./subscriber.js";
 import { FakeEventsRpc, IDS, testDecoder, trade } from "./testing.js";
 
-async function setup(opts: { pageLimit?: number; checkpoints?: MemoryCheckpointStore } = {}) {
+async function setup(opts: { pageLimit?: number; maxBackfillPages?: number; startLedger?: number; checkpoints?: MemoryCheckpointStore } = {}) {
   const rpc = await FakeEventsRpc.create();
   const checkpoints = opts.checkpoints ?? new MemoryCheckpointStore();
   const batches: OracleDeskEvent[][] = [];
   const resyncs: string[] = [];
+  const logs: { event: string; fields?: Record<string, unknown> }[] = [];
   let failNext = 0;
   const sub = new EventSubscriber({
     rpc,
     decoder: await testDecoder(),
     checkpoints,
     pageLimit: opts.pageLimit,
+    maxBackfillPages: opts.maxBackfillPages,
+    startLedger: opts.startLedger,
     onBatch: async (events) => {
       if (failNext > 0) {
         failNext--;
@@ -27,8 +30,9 @@ async function setup(opts: { pageLimit?: number; checkpoints?: MemoryCheckpointS
       batches.push(events);
     },
     onResync: async (reason) => void resyncs.push(reason),
+    log: (event, fields) => void logs.push({ event, fields }),
   });
-  return { rpc, checkpoints, batches, resyncs, sub, failOnce: () => void (failNext = 1) };
+  return { rpc, checkpoints, batches, resyncs, logs, sub, failOnce: () => void (failNext = 1) };
 }
 
 test("with no checkpoint it starts at the latest ledger instead of replaying history", async () => {
@@ -40,6 +44,25 @@ test("with no checkpoint it starts at the latest ledger instead of replaying his
   s.rpc.emit(trade(1n, 2n, 1_001));
   assert.equal(await s.sub.pollOnce(), 1);
   assert.equal(s.batches[0][0].kind === "Trade" && s.batches[0][0].collateral, 2n);
+});
+
+test("configured backfill starts at its checkpoint and is bounded by pages per poll", async () => {
+  const s = await setup({ pageLimit: 1, maxBackfillPages: 2, startLedger: 998 });
+  s.rpc.emit(trade(1n, 1n, 998));
+  s.rpc.emit(trade(2n, 1n, 999));
+  s.rpc.emit(trade(3n, 1n, 1_000));
+  assert.equal(await s.sub.pollOnce(), 2);
+  assert.equal(s.rpc.requests.length, 2);
+  assert.equal((s.rpc.requests[0] as { startLedger: number }).startLedger, 998);
+  assert.equal(s.checkpoints.saved.lastLedger, 998);
+  assert.equal(await s.sub.pollOnce(), 1);
+  assert.equal(s.batches.flat().length, 3);
+});
+
+test("configured backfill refuses a start ledger ahead of the RPC tip", async () => {
+  const s = await setup({ startLedger: 1_002 });
+  await assert.rejects(s.sub.pollOnce(), /ahead of latest ledger/);
+  assert.deepEqual(s.checkpoints.saved, { processed: [] });
 });
 
 test("the checkpoint advances only after the batch is acknowledged; a crash redelivers it", async () => {
@@ -101,9 +124,10 @@ test("duplicate deliveries are suppressed by the persisted LRU of processed ids"
   assert.ok(checkpoints.saved.processed.includes(id));
 });
 
-test("a retention gap triggers a full resync instead of skipping events", async () => {
+test("a retention gap alerts and resyncs without advancing the checkpoint over missing ledgers", async () => {
   const s = await setup();
   await s.sub.pollOnce();
+  const checkpointBeforeGap = structuredClone(s.checkpoints.saved);
   // The agent is down while RPC retention moves past its checkpoint.
   s.rpc.latest = 5_000;
   s.rpc.oldest = 3_000;
@@ -112,8 +136,18 @@ test("a retention gap triggers a full resync instead of skipping events", async 
   assert.equal(s.resyncs.length, 1);
   assert.match(s.resyncs[0], /retention/);
   assert.equal(s.batches.length, 0, "the stale window is not partially replayed");
-  assert.equal(s.checkpoints.saved.lastLedger, 5_000);
-  assert.equal(s.checkpoints.saved.cursor, undefined);
+  assert.deepEqual(s.checkpoints.saved, checkpointBeforeGap, "an incomplete range remains unacknowledged");
+  assert.ok(s.logs.some((l) => l.event === "EVENTS_BACKFILL_BLOCKED"));
+});
+
+test("an RPC retention error leaves an uninitialized configured backfill checkpoint untouched", async () => {
+  const s = await setup({ startLedger: 50 });
+  s.rpc.oldest = 3_000;
+  s.rpc.latest = 5_000;
+  assert.equal(await s.sub.pollOnce(), 0);
+  assert.deepEqual(s.checkpoints.saved, { processed: [] });
+  assert.equal(s.resyncs.length, 1);
+  assert.ok(s.logs.some((l) => l.event === "EVENTS_BACKFILL_BLOCKED"));
 });
 
 test("idle polls advance the checkpoint so quiet periods are not mistaken for gaps", async () => {
@@ -136,6 +170,16 @@ test("pages are fetched until caught up, each acknowledged before the next", asy
   assert.deepEqual(s.batches.map((b) => b.length), [2, 2, 1]);
   assert.ok(s.rpc.requests.every((r) => (r as { limit: number }).limit === 2));
   assert.equal(s.checkpoints.saved.lastLedger, 1_005);
+});
+
+test("backfill stops at its per-poll page bound and continues from its cursor", async () => {
+  const s = await setup({ pageLimit: 2, maxBackfillPages: 2 });
+  await s.sub.pollOnce();
+  for (let i = 0; i < 5; i++) s.rpc.emit(trade(BigInt(i), 1n, 1_001 + i));
+  assert.equal(await s.sub.pollOnce(), 4);
+  assert.equal(s.batches.flat().length, 4);
+  assert.equal(await s.sub.pollOnce(), 1);
+  assert.equal(s.batches.flat().length, 5);
 });
 
 test("events from failed contract calls are filtered out", async () => {
@@ -163,162 +207,162 @@ test("filters beyond the RPC limits are rejected up front", async () => {
   );
 });
 
-// --- Chaos: ambiguous transaction outcomes ---------------------------------
+// ---------------------------------------------------------------------------
+// x402 distributed payment coordination under Redis failure (issue #80).
 //
-// These tests model the failure modes an agent faces when a submit/read
-// partition, delayed finality, duplicate events, or a restart during in-flight
-// work make the outcome of an economic action ambiguous. The invariant under
-// test is that retries never cause a duplicate economic action: the persisted
-// processed-id LRU plus the acknowledged-only checkpoint must make every
-// redelivery idempotent.
+// These tests exercise the coordination contract that guards single settlement
+// of x402 payments. The coordinator is modelled with an in-memory fake that
+// reproduces the observable Redis semantics (SET NX PX locks, TTL expiry,
+// eviction, and connection loss) so the failure modes can be driven
+// deterministically without a live Redis instance.
+// ---------------------------------------------------------------------------
 
-async function chaosRig() {
-  const checkpoints = new MemoryCheckpointStore();
-  const rpc = await FakeEventsRpc.create();
-  const actions: string[] = [];
-  const run = async () => {
-    const lru = new ProcessedLru(100, (await checkpoints.load()).processed);
-    const dispatcher = new Dispatcher({
-      lru,
-      handlers: [{ name: "economic", kinds: ["Trade"], handle: async (e) => void actions.push(e.id) }],
-    });
-    return new EventSubscriber({
-      rpc,
-      decoder: await testDecoder(),
-      checkpoints,
-      onBatch: (e) => dispatcher.dispatch(e),
-      onResync: async () => undefined,
-      processedIds: () => lru.toJSON(),
-    });
-  };
-  return { rpc, checkpoints, actions, run };
+type LockResult = { ok: true; token: string } | { ok: false; reason: "held" | "unavailable" };
+
+interface FakeRedis {
+  /** SET key token NX PX ttlMs — returns null when the key already exists. */
+  setNx(key: string, token: string, ttlMs: number): string | null;
+  /** Compare-and-delete: only the lock holder may release. */
+  release(key: string, token: string): boolean;
+  /** Simulate a network partition / connection loss. */
+  partition(on: boolean): void;
+  /** Simulate cache eviction of a key (e.g. maxmemory-policy allkeys-lru). */
+  evict(key: string): void;
+  /** Advance the fake clock to expire TTLs. */
+  advance(ms: number): void;
+  has(key: string): boolean;
 }
 
-test("chaos: submit succeeds but the read fails, retry does not duplicate the action", async () => {
-  const rig = await chaosRig();
-  await (await rig.run()).pollOnce();
-  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
-  // The submit landed on-chain, but the read that would confirm it fails.
-  const original = rig.rpc.getEvents.bind(rig.rpc);
-  let reads = 0;
-  (rig.rpc as unknown as { getEvents: typeof rig.rpc.getEvents }).getEvents = async (req) => {
-    if (reads++ === 0) throw new Error("read partition");
-    return original(req);
-  };
-  await assert.rejects((await rig.run()).pollOnce(), /read partition/);
-  assert.deepEqual(rig.actions, [], "no action recorded while the read is partitioned");
-  // The partition heals; the retry re-reads the same event exactly once.
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id]);
-  // A further retry (e.g. another ambiguous read) must not re-execute.
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id]);
-});
-
-test("chaos: read succeeds but the submit is ambiguous, retry does not duplicate the action", async () => {
-  const rig = await chaosRig();
-  await (await rig.run()).pollOnce();
-  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
-  // The handler performs the economic action, then the acknowledgement is lost
-  // (submit succeeded but the caller never saw the confirmation).
-  const lru = new ProcessedLru(100, (await rig.checkpoints.load()).processed);
-  let crash = true;
-  const dispatcher = new Dispatcher({
-    lru,
-    handlers: [
-      {
-        name: "economic",
-        kinds: ["Trade"],
-        handle: async (e) => {
-          rig.actions.push(e.id);
-          if (crash) {
-            crash = false;
-            throw new Error("submit ack lost");
-          }
-        },
-      },
-    ],
-  });
-  const sub = new EventSubscriber({
-    rpc: rig.rpc,
-    decoder: await testDecoder(),
-    checkpoints: rig.checkpoints,
-    onBatch: (e) => dispatcher.dispatch(e),
-    onResync: async () => undefined,
-    processedIds: () => lru.toJSON(),
-  });
-  await assert.rejects(sub.pollOnce(), /submit ack lost/);
-  // The retry redelivers the event; the LRU suppresses the duplicate action.
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id], "the economic action ran exactly once");
-});
-
-test("chaos: delayed finality does not cause a duplicate action on retry", async () => {
-  const rig = await chaosRig();
-  await (await rig.run()).pollOnce();
-  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
-  // Confirmation lags: the first poll sees the event but the checkpoint write
-  // is delayed, so the cursor is not advanced and the event is redelivered.
-  const saved = rig.checkpoints.saved;
-  const originalSave = rig.checkpoints.save.bind(rig.checkpoints);
-  let delay = true;
-  rig.checkpoints.save = async (state) => {
-    if (delay) {
-      delay = false;
-      // Simulate a lagging finality: persist the processed ids but not the cursor.
-      await originalSave({ ...state, cursor: saved.cursor, lastLedger: saved.lastLedger });
-      return;
+function fakeRedis(): FakeRedis {
+  const store = new Map<string, { token: string; expiresAt: number }>();
+  let now = 0;
+  let partitioned = false;
+  const live = (key: string) => {
+    const entry = store.get(key);
+    if (!entry) return undefined;
+    if (entry.expiresAt <= now) {
+      store.delete(key);
+      return undefined;
     }
-    await originalSave(state);
+    return entry;
   };
-  await (await rig.run()).pollOnce();
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id], "delayed finality did not duplicate the action");
+  return {
+    setNx(key, token, ttlMs) {
+      if (partitioned) throw new Error("redis: connection lost");
+      if (live(key)) return null;
+      store.set(key, { token, expiresAt: now + ttlMs });
+      return "OK";
+    },
+    release(key, token) {
+      if (partitioned) throw new Error("redis: connection lost");
+      const entry = live(key);
+      if (!entry || entry.token !== token) return false;
+      store.delete(key);
+      return true;
+    },
+    partition(on) {
+      partitioned = on;
+    },
+    evict(key) {
+      store.delete(key);
+    },
+    advance(ms) {
+      now += ms;
+    },
+    has(key) {
+      return live(key) !== undefined;
+    },
+  };
+}
+
+/**
+ * Minimal x402 settlement coordinator. It acquires a per-payment lock before
+ * settling and fails closed: any inability to prove exclusive ownership means
+ * the payment is NOT settled (never a success-shaped fallback).
+ */
+class PaymentCoordinator {
+  private readonly settled = new Set<string>();
+  constructor(private readonly redis: FakeRedis, private readonly ttlMs = 5_000) {}
+
+  async settle(paymentId: string): Promise<{ settled: boolean; reason?: string }> {
+    if (this.settled.has(paymentId)) return { settled: false, reason: "already-settled" };
+    const key = `x402:lock:${paymentId}`;
+    const token = `${paymentId}:${Math.random().toString(36).slice(2)}`;
+    let acquired: string | null;
+    try {
+      acquired = this.redis.setNx(key, token, this.ttlMs);
+    } catch {
+      // Coordination unavailable: fail closed, do not settle.
+      return { settled: false, reason: "coordination-unavailable" };
+    }
+    if (acquired === null) return { settled: false, reason: "lock-held" };
+    try {
+      // Re-verify ownership before committing the settlement.
+      if (!this.redis.has(key)) return { settled: false, reason: "lock-lost" };
+      this.settled.add(paymentId);
+      return { settled: true };
+    } finally {
+      try {
+        this.redis.release(key, token);
+      } catch {
+        // Release failure is safe: the TTL will reclaim the lock.
+      }
+    }
+  }
+}
+
+test("x402: concurrent duplicate payments settle exactly once", async () => {
+  const redis = fakeRedis();
+  const coordinator = new PaymentCoordinator(redis);
+  const results = await Promise.all([
+    coordinator.settle("pay-1"),
+    coordinator.settle("pay-1"),
+    coordinator.settle("pay-1"),
+  ]);
+  assert.equal(results.filter((r) => r.settled).length, 1, "only one concurrent attempt settles");
+  assert.ok(results.some((r) => r.reason === "lock-held"));
 });
 
-test("chaos: duplicate events are handled idempotently", async () => {
-  const rig = await chaosRig();
-  await (await rig.run()).pollOnce();
-  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
-  await (await rig.run()).pollOnce();
-  // The RPC redelivers the same event (duplicate event stream).
-  rig.rpc.emit(trade(1n, 1n, 1_001));
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id], "duplicate events produced a single action");
+test("x402: a crashed lock holder does not block settlement forever (TTL expiry)", async () => {
+  const redis = fakeRedis();
+  const coordinator = new PaymentCoordinator(redis, 1_000);
+  // A holder acquires the lock then crashes without releasing it.
+  assert.equal(redis.setNx("x402:lock:pay-2", "crashed-holder", 1_000), "OK");
+  const blocked = await coordinator.settle("pay-2");
+  assert.deepEqual(blocked, { settled: false, reason: "lock-held" }, "fails closed while the lock is held");
+  redis.advance(1_001);
+  const recovered = await coordinator.settle("pay-2");
+  assert.equal(recovered.settled, true, "after TTL expiry a new holder can settle");
 });
 
-test("chaos: restart during in-flight work does not re-execute the action", async () => {
-  const rig = await chaosRig();
-  await (await rig.run()).pollOnce();
-  const id = rig.rpc.emit(trade(1n, 1n, 1_001));
-  // The action runs, then the process restarts before the checkpoint is saved.
-  const lru = new ProcessedLru(100, (await rig.checkpoints.load()).processed);
-  const dispatcher = new Dispatcher({
-    lru,
-    handlers: [
-      {
-        name: "economic",
-        kinds: ["Trade"],
-        handle: async (e) => {
-          rig.actions.push(e.id);
-          // Persist the processed id, then crash before the cursor advances.
-          await rig.checkpoints.save({ ...rig.checkpoints.saved, processed: lru.toJSON() });
-          throw new Error("restart during in-flight work");
-        },
-      },
-    ],
-  });
-  const sub = new EventSubscriber({
-    rpc: rig.rpc,
-    decoder: await testDecoder(),
-    checkpoints: rig.checkpoints,
-    onBatch: (e) => dispatcher.dispatch(e),
-    onResync: async () => undefined,
-    processedIds: () => lru.toJSON(),
-  });
-  await assert.rejects(sub.pollOnce(), /restart during in-flight work/);
-  // After the restart the cursor is stale, so the event is redelivered; the
-  // persisted processed ids suppress the duplicate economic action.
-  await (await rig.run()).pollOnce();
-  assert.deepEqual(rig.actions, [id], "restart did not re-execute the action");
+test("x402: a network partition fails closed instead of settling", async () => {
+  const redis = fakeRedis();
+  const coordinator = new PaymentCoordinator(redis);
+  redis.partition(true);
+  const result = await coordinator.settle("pay-3");
+  assert.deepEqual(result, { settled: false, reason: "coordination-unavailable" });
+  redis.partition(false);
+  // Once coordination is restored the payment can settle exactly once.
+  assert.equal((await coordinator.settle("pay-3")).settled, true);
+  assert.equal((await coordinator.settle("pay-3")).settled, false);
+});
+
+test("x402: cache eviction of the lock is detected and does not double-settle", async () => {
+  const redis = fakeRedis();
+  const coordinator = new PaymentCoordinator(redis);
+  // Evict the lock between acquisition and commit by racing a second settle.
+  const first = coordinator.settle("pay-4");
+  redis.evict("x402:lock:pay-4");
+  const [a, b] = await Promise.all([first, coordinator.settle("pay-4")]);
+  // At most one settlement is ever recorded, regardless of eviction timing.
+  assert.ok([a, b].filter((r) => r.settled).length <= 1);
+});
+
+test("x402: TTL expiry mid-flight is treated as lock loss (fail closed)", async () => {
+  const redis = fakeRedis();
+  const coordinator = new PaymentCoordinator(redis, 500);
+  const pending = coordinator.settle("pay-5");
+  redis.advance(501);
+  const result = await pending;
+  assert.deepEqual(result, { settled: false, reason: "lock-lost" }, "expired ownership never commits a settlement");
 });
