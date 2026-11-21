@@ -10,6 +10,19 @@
  * is permanent. `put` resolves only once enough providers confirmed the pin
  * AND a gateway served bytes hashing to `trace_hash`. See
  * docs/architecture.md, "IPFS trace storage".
+ *
+ * ## Confidentiality / public-data boundary
+ *
+ * Everything this module produces is PUBLIC and permanent:
+ * - the pinned bytes (anyone with the CID can fetch them from any gateway),
+ * - the CID and its `trace_hash` (published on-chain in reasoning-registry),
+ * - the gateway probe evidence returned by {@link TraceAvailabilityChecker}.
+ *
+ * Therefore trace content MUST NOT contain secrets (private keys, seed
+ * phrases, API tokens, x402 payment signatures). Callers are responsible for
+ * redacting before serialization; {@link assertNoSecrets} is a last-line
+ * guard that refuses to pin bytes matching well-known secret shapes so a
+ * leaked key can never become a permanent, content-addressed artifact.
  */
 import { createHash } from "node:crypto";
 import { CID } from "multiformats/cid";
@@ -19,6 +32,37 @@ import type { TraceStore } from "./trace.js";
 
 /** One IPFS block: kubo's `chunker=size-1048576` keeps the root a raw leaf. */
 export const MAX_TRACE_BYTES = 1024 * 1024;
+
+/**
+ * Patterns that must never appear in serialized trace bytes. These are
+ * deliberately conservative: a false positive only blocks a pin (recoverable),
+ * while a false negative would publish a secret permanently (unrecoverable).
+ */
+const SECRET_PATTERNS: Array<{ name: string; re: RegExp }> = [
+  // Stellar secret seeds (S... 56 base32 chars).
+  { name: "stellar-secret-seed", re: /\bS[A-Z2-7]{55}\b/ },
+  // PEM-encoded private keys.
+  { name: "pem-private-key", re: /-----BEGIN (?:[A-Z]+ )?PRIVATE KEY-----/ },
+  // Common bearer / API token shapes.
+  { name: "bearer-token", re: /\bBearer\s+[A-Za-z0-9._~+/-]{16,}=*/ },
+  { name: "api-key", re: /\b(?:api[_-]?key|secret[_-]?key|private[_-]?key)\b\s*[:=]\s*["']?[A-Za-z0-9._~+/-]{16,}/i },
+];
+
+/**
+ * Throws {@link TraceStoreIntegrityError} when `bytes` contain a recognizable
+ * secret. This is a guard, not a redactor: callers must redact before
+ * serialization; this only prevents an accidental leak from being pinned.
+ */
+export function assertNoSecrets(bytes: Uint8Array): void {
+  const text = Buffer.from(bytes).toString("utf8");
+  for (const { name, re } of SECRET_PATTERNS) {
+    if (re.test(text)) {
+      throw new TraceStoreIntegrityError(
+        `refusing to pin trace: detected ${name} in serialized content; redact secrets before publishing`,
+      );
+    }
+  }
+}
 
 export class TraceStoreIntegrityError extends Error {
   constructor(message: string) {
@@ -224,123 +268,105 @@ export class TraceAvailabilityChecker {
 
 export interface PinResult {
   cid: string;
-  /** false when a pinning service only accepted (queued) the request. */
-  confirmed: boolean;
+  traceHash: string;
+  providers: string[];
 }
 
-export interface PinProvider {
-  name: string;
-  pin(bytes: Uint8Array, expectedCid: string, signal: AbortSignal): Promise<PinResult>;
-}
-
-function assertSameCid(provider: string, got: string, expected: string): void {
-  if (!sameCid(got, expected)) {
-    throw new TraceStoreIntegrityError(`${provider} returned CID ${got}, expected ${expected}`);
-  }
-}
-
-async function failForStatus(provider: string, res: Response): Promise<never> {
-  const body = (await res.text().catch(() => "")).slice(0, 200);
-  throw new Error(`${provider}: HTTP ${res.status}${body ? ` ${body}` : ""}`);
-}
-
-/** kubo HTTP RPC `/api/v0/add` as a single raw-leaf block. */
-export class KuboProvider implements PinProvider {
-  readonly name: string;
-
-  constructor(private readonly o: { apiUrl: string; authHeader?: string; name?: string }) {
-    this.name = o.name ?? "kubo";
-  }
-
-  async pin(bytes: Uint8Array, expectedCid: string, signal: AbortSignal): Promise<PinResult> {
-    const url = new URL("api/v0/add", this.o.apiUrl.endsWith("/") ? this.o.apiUrl : `${this.o.apiUrl}/`);
-    // Mandatory: default `add` flags produce a dag-pb/UnixFS CID whose
-    // digest is not sha256(bytes). The CID check below catches drift.
-    for (const [k, v] of Object.entries({
-      "cid-version": "1",
-      "raw-leaves": "true",
-      hash: "sha2-256",
-      pin: "true",
-      chunker: "size-1048576",
-    })) {
-      url.searchParams.set(k, v);
-    }
-    const form = new FormData();
-    form.append("file", new Blob([bytes]), "trace.json");
-    const headers: Record<string, string> = {};
-    if (this.o.authHeader) headers.Authorization = this.o.authHeader;
-    const res = await fetch(url, { method: "POST", body: form, headers, signal });
-    if (!res.ok) await failForStatus(this.name, res);
-    const lines = (await res.text()).split("\n").filter((l) => l.trim() !== "");
-    const last = lines.length ? (JSON.parse(lines[lines.length - 1]!) as { Hash?: string }) : {};
-    if (!last.Hash) throw new Error(`${this.name}: add response has no Hash`);
-    assertSameCid(this.name, last.Hash, expectedCid);
-    return { cid: expectedCid, confirmed: true };
-  }
-}
-
-type PinStatus = "queued" | "pinning" | "pinned" | "failed";
-
-/**
- * IPFS Pinning Service API (`POST /pins`, `GET /pins/{requestid}`). Pins by
- * CID, so the content must already be reachable — typically through the
- * kubo node, whose multiaddrs can be passed as `origins`.
- */
-export class PinningServiceProvider implements PinProvider {
-  readonly name: string;
-  private readonly pollMs: number;
-
-  constructor(
-    private readonly o: {
-      endpoint: string;
-      token: string;
-      origins?: string[];
-      acceptQueued?: boolean;
-      pollIntervalMs?: number;
-      name?: string;
-    },
-  ) {
-    this.name = o.name ?? "pinning-service";
-    this.pollMs = o.pollIntervalMs ?? 2_000;
-  }
-
-  private url(path: string): string {
-    return `${this.o.endpoint.replace(/\/+$/, "")}${path}`;
-  }
-
-  private headers(): Record<string, string> {
-    return { Authorization: `Bearer ${this.o.token}`, "Content-Type": "application/json" };
-  }
-
-  async pin(_bytes: Uint8Array, expectedCid: string, signal: AbortSignal): Promise<PinResult> {
-    const body: Record<string, unknown> = { cid: expectedCid, name: `oracledesk-trace-${expectedCid}` };
-    if (this.o.origins?.length) body.origins = this.o.origins;
-    const res = await fetch(this.url("/pins"), {
-      method: "POST",
-      headers: this.headers(),
-      body: JSON.stringify(body),
-      signal,
-    });
-    if (!res.ok) await failForStatus(this.name, res);
-    let status = (await res.json()) as { requestid: string; status: PinStatus; pin?: { cid?: string } };
-    if (!status.requestid) throw new Error(`${this.name}: response has no requestid`);
-    if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
-
-    while (status.status === "queued" || status.status === "pinning") {
-      await new Promise((r) => setTimeout(r, this.pollMs));
-      const poll = await fetch(this.url(`/pins/${status.requestid}`), { headers: this.headers(), signal });
-      if (!poll.ok) await failForStatus(this.name, poll);
-      status = (await poll.json()) as { requestid: string; status: PinStatus; pin?: { cid?: string } };
-    }
-    if (status.status === "failed") throw new Error(`${this.name}: pin failed`);
-    if (status.status !== "pinned") {
-      if (!this.o.acceptQueued) throw new Error(`${this.name}: pin not confirmed (${status.status})`);
-      return { cid: expectedCid, confirmed: false };
-    }
-    return { cid: expectedCid, confirmed: true };
-  }
+export interface TraceStoreOptions {
+  /** Pinning provider base URLs, e.g. `https://api.pinata.cloud/pinning/pinFileToIPFS`. */
+  providers: string[];
+  /** Minimum providers that must confirm the pin before `put` resolves. */
+  minConfirmations?: number;
+  /** Gateway base URLs used to verify the pinned bytes are retrievable. */
+  gateways: string[];
+  /** Per-request timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Injectable fetch for deterministic tests. */
+  fetchImpl?: typeof fetch;
 }
 
 function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * Pins trace bytes to IPFS and returns the self-computed CID. Refuses to pin
+ * bytes that exceed {@link MAX_TRACE_BYTES} or that contain recognizable
+ * secrets (see {@link assertNoSecrets}); both are permanent, unrecoverable
+ * outcomes once published.
+ */
+export class IpfsTraceStore implements TraceStore {
+  private readonly providers: string[];
+  private readonly minConfirmations: number;
+  private readonly gateways: string[];
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(o: TraceStoreOptions) {
+    if (!o.providers.length) throw new TracePinError("at least one pinning provider is required", []);
+    if (!o.gateways.length) throw new TraceGatewayError("at least one gateway is required");
+    this.providers = o.providers;
+    this.minConfirmations = o.minConfirmations ?? 1;
+    this.gateways = o.gateways;
+    this.timeoutMs = o.timeoutMs ?? 30_000;
+    this.fetchImpl = o.fetchImpl ?? fetch;
+  }
+
+  async put(bytes: Uint8Array): Promise<PinResult> {
+    if (bytes.byteLength > MAX_TRACE_BYTES) {
+      throw new TraceStoreIntegrityError(
+        `trace is ${bytes.byteLength} bytes, exceeds MAX_TRACE_BYTES (${MAX_TRACE_BYTES})`,
+      );
+    }
+    assertNoSecrets(bytes);
+    const { cid, digestHex } = await rawCidForBytes(bytes);
+    const attempts: PinAttempt[] = [];
+    const confirmed: string[] = [];
+    for (const provider of this.providers) {
+      const attempt = await this.pin(provider, bytes, cid, attempts.length + 1);
+      attempts.push(attempt);
+      if (attempt.ok) confirmed.push(provider);
+    }
+    if (confirmed.length < this.minConfirmations) {
+      throw new TracePinError(
+        `only ${confirmed.length}/${this.minConfirmations} providers confirmed pin for ${cid}`,
+        attempts,
+      );
+    }
+    const checker = new TraceAvailabilityChecker({
+      gateways: this.gateways,
+      timeoutMs: this.timeoutMs,
+      fetchImpl: this.fetchImpl,
+    });
+    const evidence = await checker.check({ cid, traceHash: digestHex });
+    if (!evidence.available) {
+      throw new TraceGatewayError(`pinned ${cid} but no gateway served matching bytes`);
+    }
+    return { cid, traceHash: digestHex, providers: confirmed };
+  }
+
+  private async pin(provider: string, bytes: Uint8Array, cid: string, attempt: number): Promise<PinAttempt> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(provider, {
+        method: "POST",
+        body: bytes,
+        signal: controller.signal,
+      });
+      if (!res.ok) {
+        return { provider, attempt, ok: false, error: `HTTP ${res.status}` };
+      }
+      const body = (await res.json().catch(() => ({}))) as { cid?: string; Hash?: string };
+      const reported = body.cid ?? body.Hash;
+      if (reported && !sameCid(reported, cid)) {
+        return { provider, attempt, ok: false, error: `provider reported CID ${reported}, expected ${cid}` };
+      }
+      return { provider, attempt, ok: true };
+    } catch (err) {
+      return { provider, attempt, ok: false, error: errorText(err) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
