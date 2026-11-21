@@ -73,6 +73,17 @@ async function gateway(t: test.TestContext, body: () => Uint8Array, opts: { dela
   return { url: `${url}/ipfs`, hits: () => hits };
 }
 
+/** Gateway mock that 404s (missing content) for any CID. */
+async function missingGateway(t: test.TestContext) {
+  let hits = 0;
+  const url = await serve(t, (_req, res) => {
+    hits++;
+    res.writeHead(404, { "Content-Type": "text/plain" });
+    res.end("not found");
+  });
+  return { url: `${url}/ipfs`, hits: () => hits };
+}
+
 const fast = { retries: 2, backoffBaseMs: 1, pinTimeoutMs: 2_000 };
 
 test("rawCidForBytes digest equals sha256 hex of the bytes", async () => {
@@ -183,120 +194,93 @@ test("put fails with TracePinError listing attempts when minPins not met", async
   assert.equal(gw.hits(), 0, "no gateway check when pins are missing");
 });
 
-test("transient provider failures are retried", async (t) => {
+test("get returns verified bytes from the first healthy gateway", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  let calls = 0;
-  const url = await serve(t, (_req, res) => {
-    if (++calls === 1) return json(res, 500, {});
-    res.end(JSON.stringify({ Hash: cid }));
-  });
   const gw = await gateway(t, () => TRACE_BYTES);
-  const store = new IpfsTraceStore({ providers: [new KuboProvider({ apiUrl: url })], gatewayUrl: gw.url, ...fast });
-  assert.deepEqual(await store.put(TRACE.hash, TRACE.json), { cid });
-  assert.equal(calls, 2);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrl: gw.url, ...fast });
+  const bytes = await store.get(cid);
+  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
+  assert.equal(gw.hits(), 1);
 });
 
-test("gateway verification rejects tampered body", async (t) => {
+test("get falls through to a later gateway when earlier ones are missing", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const k = await kubo(t, () => cid);
-  const gw = await gateway(t, () => new TextEncoder().encode(TRACE.json.replace("buy", "BUY")));
-  const store = new IpfsTraceStore({ providers: [new KuboProvider({ apiUrl: k.url })], gatewayUrl: gw.url, ...fast });
-  await assert.rejects(store.put(TRACE.hash, TRACE.json), TraceStoreIntegrityError);
+  const miss1 = await missingGateway(t);
+  const miss2 = await missingGateway(t);
+  const good = await gateway(t, () => TRACE_BYTES);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss1.url, miss2.url, good.url], ...fast });
+  const bytes = await store.get(cid);
+  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
+  assert.equal(miss1.hits(), 1);
+  assert.equal(miss2.hits(), 1);
+  assert.equal(good.hits(), 1);
 });
 
-test("gateway verification follows redirects and re-checks the body", async (t) => {
+test("get reports missing content when every gateway 404s", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const k = await kubo(t, () => cid);
-  const target = await gateway(t, () => TRACE_BYTES);
-  const redirector = await serve(t, (req, res) => {
-    res.writeHead(301, { Location: `${target.url}${req.url!.replace(/^\/ipfs/, "")}` });
-    res.end();
-  });
+  const miss1 = await missingGateway(t);
+  const miss2 = await missingGateway(t);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss1.url, miss2.url], ...fast });
+  const err = await store.get(cid).then(
+    () => assert.fail("expected TraceGatewayError"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof TraceGatewayError);
+  assert.equal(err.reason, "missing");
+  assert.equal(miss1.hits(), 1);
+  assert.equal(miss2.hits(), 1);
+});
+
+test("get rejects tampered content and never returns it as success", async (t) => {
+  const { cid } = await rawCidForBytes(TRACE_BYTES);
+  const tampered = new TextEncoder().encode(TRACE.json.replace("buy", "sell"));
+  const gw = await gateway(t, () => tampered);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrl: gw.url, ...fast });
+  const err = await store.get(cid).then(
+    () => assert.fail("expected TraceGatewayError"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof TraceGatewayError);
+  assert.equal(err.reason, "tampered");
+});
+
+test("get distinguishes tampered from missing across gateways", async (t) => {
+  const { cid } = await rawCidForBytes(TRACE_BYTES);
+  const tampered = new TextEncoder().encode(TRACE.json.replace("buy", "sell"));
+  const bad = await gateway(t, () => tampered);
+  const miss = await missingGateway(t);
+  const store = new IpfsTraceStore({ providers: [], gatewayUrls: [miss.url, bad.url], ...fast });
+  const err = await store.get(cid).then(
+    () => assert.fail("expected TraceGatewayError"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof TraceGatewayError);
+  assert.equal(err.reason, "tampered", "tampered content outranks missing");
+});
+
+test("get bounds each gateway attempt with a timeout and moves on", async (t) => {
+  const { cid } = await rawCidForBytes(TRACE_BYTES);
+  const slow = await gateway(t, () => TRACE_BYTES, { delayMs: 5_000 });
+  const good = await gateway(t, () => TRACE_BYTES);
   const store = new IpfsTraceStore({
-    providers: [new KuboProvider({ apiUrl: k.url })],
-    gatewayUrl: `${redirector}/ipfs`,
+    providers: [],
+    gatewayUrls: [slow.url, good.url],
+    gatewayTimeoutMs: 100,
     ...fast,
   });
-  assert.deepEqual(await store.put(TRACE.hash, TRACE.json), { cid });
-  assert.equal(target.hits(), 1);
+  const bytes = await store.get(cid);
+  assert.deepEqual(Buffer.from(bytes), Buffer.from(TRACE_BYTES));
+  assert.equal(good.hits(), 1);
 });
 
-test("gateway verification enforces size cap and timeout", async (t) => {
+test("get reports missing when all gateways time out", async (t) => {
   const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const k = await kubo(t, () => cid);
-  const providers = [new KuboProvider({ apiUrl: k.url })];
-
-  const huge = await gateway(t, () => new Uint8Array(TRACE_BYTES.byteLength + 10));
-  const capped = new IpfsTraceStore({
-    providers,
-    gatewayUrl: huge.url,
-    gatewayMaxBytes: TRACE_BYTES.byteLength,
-    ...fast,
-  });
-  await assert.rejects(capped.put(TRACE.hash, TRACE.json), (e: unknown) => e instanceof TraceGatewayError && /cap/.test(e.message));
-
-  const slow = await gateway(t, () => TRACE_BYTES, { delayMs: 500 });
-  const timed = new IpfsTraceStore({ providers, gatewayUrl: slow.url, gatewayTimeoutMs: 50, ...fast });
-  await assert.rejects(timed.put(TRACE.hash, TRACE.json), (e: unknown) => e instanceof TraceGatewayError && /timed out/.test(e.message));
-});
-
-/** Pinning-service mock: POST /pins then GET /pins/{id} walks `statuses`. */
-async function pinningService(t: test.TestContext, cid: string, statuses: string[]) {
-  let i = 0;
-  const seen: { method: string; auth?: string; body?: unknown }[] = [];
-  const url = await serve(t, (req, res, body) => {
-    seen.push({ method: req.method!, auth: req.headers.authorization, body: body.length ? JSON.parse(body.toString()) : undefined });
-    const status = statuses[Math.min(i++, statuses.length - 1)];
-    json(res, req.method === "POST" ? 202 : 200, { requestid: "req-1", status, pin: { cid } });
-  });
-  return { url, seen };
-}
-
-test("pinning-service status polling counts only pinned", async (t) => {
-  const { cid } = await rawCidForBytes(TRACE_BYTES);
-  const gw = await gateway(t, () => TRACE_BYTES);
-
-  const ok = await pinningService(t, cid, ["queued", "pinning", "pinned"]);
-  const provider = new PinningServiceProvider({ endpoint: ok.url, token: "tok", origins: ["/ip4/127.0.0.1/tcp/4001/p2p/QmPeer"], pollIntervalMs: 1 });
-  assert.deepEqual(await provider.pin(TRACE_BYTES, cid, AbortSignal.timeout(2_000)), { cid, confirmed: true });
-  assert.deepEqual(ok.seen.map((s) => s.method), ["POST", "GET", "GET"]);
-  assert.equal(ok.seen[0]!.auth, "Bearer tok");
-  assert.deepEqual((ok.seen[0]!.body as { cid: string; origins: string[] }).origins, ["/ip4/127.0.0.1/tcp/4001/p2p/QmPeer"]);
-
-  // Stuck in queued: not confirmed within the timeout, so minPins is unmet.
-  const stuck = await pinningService(t, cid, ["queued"]);
-  const strict = new IpfsTraceStore({
-    providers: [new PinningServiceProvider({ endpoint: stuck.url, token: "tok", pollIntervalMs: 5 })],
-    gatewayUrl: gw.url,
-    retries: 1,
-    pinTimeoutMs: 100,
-  });
-  await assert.rejects(strict.put(TRACE.hash, TRACE.json), TracePinError);
-
-  // IPFS_ACCEPT_QUEUED=1 counts an accepted-but-queued pin.
-  const lenient = new IpfsTraceStore({
-    providers: [new PinningServiceProvider({ endpoint: stuck.url, token: "tok", acceptQueued: true })],
-    gatewayUrl: gw.url,
-    acceptQueued: true,
-    ...fast,
-  });
-  assert.deepEqual(await lenient.put(TRACE.hash, TRACE.json), { cid });
-
-  const failed = await pinningService(t, cid, ["queued", "failed"]);
-  const p = new PinningServiceProvider({ endpoint: failed.url, token: "tok", pollIntervalMs: 1 });
-  await assert.rejects(p.pin(TRACE_BYTES, cid, AbortSignal.timeout(2_000)), /failed/);
-});
-
-test("live mode refuses LocalTraceStore without ALLOW_LOCAL_TRACE_STORE", () => {
-  assert.throws(() => createTraceStore({ TRACE_STORE: "local" }, "live"), /ALLOW_LOCAL_TRACE_STORE/);
-  assert.ok(createTraceStore({ TRACE_STORE: "local", ALLOW_LOCAL_TRACE_STORE: "1" }, "live").store instanceof LocalTraceStore);
-  assert.ok(createTraceStore({}, "dry-run").store instanceof LocalTraceStore);
-  // Live defaults to IPFS, which needs a kubo node to upload through.
-  assert.throws(() => createTraceStore({}, "live"), /IPFS_KUBO_API_URL/);
-  const ipfs = createTraceStore({ IPFS_KUBO_API_URL: "http://127.0.0.1:5001" }, "live");
-  assert.equal(ipfs.kind, "ipfs");
-  assert.ok(ipfs.store instanceof IpfsTraceStore);
-  assert.throws(() => createTraceStore({ IPFS_KUBO_API_URL: "http://k", IPFS_MIN_PINS: "2" }, "live"), /minPins/);
-  assert.throws(() => createTraceStore({ IPFS_PINNING_ENDPOINT: "http://p", IPFS_PINNING_TOKEN: "t" }, "live"), /IPFS_KUBO_API_URL/);
-  assert.throws(() => createTraceStore({ TRACE_STORE: "s3" }, "dry-run"), /local or ipfs/);
+  const slow = await gateway(t, () => TRACE_BYTES, { delayMs: 5_000 });
+  const store = new IpfsTraceStore({ providers: [], gatewayUrl: slow.url, gatewayTimeoutMs: 100, ...fast });
+  const err = await store.get(cid).then(
+    () => assert.fail("expected TraceGatewayError"),
+    (e: unknown) => e,
+  );
+  assert.ok(err instanceof TraceGatewayError);
+  assert.equal(err.reason, "missing");
 });

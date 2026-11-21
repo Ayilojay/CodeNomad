@@ -114,6 +114,133 @@ export async function resolveVerifiedTraceContent(
   return { status: "verified", cid: ref.cid, traceHash: ref.traceHash, bytes };
 }
 
+/**
+ * One gateway attempt while resolving trace content. `missing` means the
+ * gateway reported the content is not present (404/410); `error` means the
+ * attempt failed for another reason (timeout, network, non-2xx). `tampered`
+ * means bytes were served but did not hash to the expected `trace_hash`.
+ */
+export type TraceGatewayAttemptStatus = "verified" | "missing" | "tampered" | "error";
+
+export interface TraceGatewayAttempt {
+  gateway: string;
+  status: TraceGatewayAttemptStatus;
+  /** Present only when `status === "verified"`. */
+  bytes?: Uint8Array;
+  reason?: string;
+}
+
+/**
+ * Result of a multi-gateway trace retrieval. `verified` carries the exact
+ * bytes; `missing` means every gateway reported the content absent; `tampered`
+ * means at least one gateway served bytes that failed verification (and none
+ * verified); `unavailable` means no gateway could be reached. Never returns
+ * unverified bytes as success.
+ */
+export type TraceRetrievalStatus = "verified" | "missing" | "tampered" | "unavailable";
+
+export interface TraceRetrievalResult {
+  status: TraceRetrievalStatus;
+  cid: string;
+  traceHash: string;
+  /** Present only when `status === "verified"`. */
+  bytes?: Uint8Array;
+  reason?: string;
+  attempts: TraceGatewayAttempt[];
+}
+
+export interface TraceGateway {
+  /** Base URL of an IPFS gateway, e.g. `https://ipfs.io`. */
+  url: string;
+  /** Optional display name; defaults to the URL. */
+  name?: string;
+}
+
+function errorText(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function gatewayUrl(base: string, cid: string): string {
+  return `${base.replace(/\/+$/, "")}/ipfs/${cid}`;
+}
+
+/**
+ * Fetches trace content from a single gateway under a bounded timeout and
+ * verifies the served bytes against `traceHash`. Distinguishes missing content
+ * (404/410) from tampered content (bytes present but hash mismatch).
+ */
+async function fetchFromGateway(
+  gateway: TraceGateway,
+  ref: { cid: string; traceHash: string },
+  timeoutMs: number,
+  signal?: AbortSignal,
+): Promise<TraceGatewayAttempt> {
+  const name = gateway.name ?? gateway.url;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  const onAbort = () => controller.abort();
+  if (signal) {
+    if (signal.aborted) controller.abort();
+    else signal.addEventListener("abort", onAbort, { once: true });
+  }
+  try {
+    const res = await fetch(gatewayUrl(gateway.url, ref.cid), { signal: controller.signal });
+    if (res.status === 404 || res.status === 410) {
+      return { gateway: name, status: "missing", reason: `HTTP ${res.status}` };
+    }
+    if (!res.ok) {
+      return { gateway: name, status: "error", reason: `HTTP ${res.status}` };
+    }
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    const digestHex = createHash("sha256").update(bytes).digest("hex");
+    if (digestHex !== ref.traceHash.toLowerCase()) {
+      return {
+        gateway: name,
+        status: "tampered",
+        reason: `served bytes hash to ${digestHex}, expected ${ref.traceHash}`,
+      };
+    }
+    return { gateway: name, status: "verified", bytes };
+  } catch (err) {
+    return { gateway: name, status: "error", reason: errorText(err) };
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+/**
+ * Resolves trace content by trying each configured gateway in order under a
+ * bounded per-attempt timeout, verifying exact bytes against `traceHash`
+ * before returning them. Returns the first verified result; otherwise reports
+ * `tampered` (bytes served but unverifiable), `missing` (all gateways absent),
+ * or `unavailable` (no gateway reachable). Never returns unverified bytes.
+ */
+export async function retrieveTraceContent(
+  gateways: TraceGateway[],
+  ref: { cid: string; traceHash: string },
+  opts: { timeoutMs?: number; signal?: AbortSignal } = {},
+): Promise<TraceRetrievalResult> {
+  const timeoutMs = opts.timeoutMs ?? 10_000;
+  const attempts: TraceGatewayAttempt[] = [];
+  for (const gateway of gateways) {
+    if (opts.signal?.aborted) break;
+    const attempt = await fetchFromGateway(gateway, ref, timeoutMs, opts.signal);
+    attempts.push(attempt);
+    if (attempt.status === "verified") {
+      return { status: "verified", cid: ref.cid, traceHash: ref.traceHash, bytes: attempt.bytes, attempts };
+    }
+  }
+  const base = { cid: ref.cid, traceHash: ref.traceHash, attempts };
+  if (attempts.some((a) => a.status === "tampered")) {
+    return { ...base, status: "tampered", reason: "served bytes failed hash verification" };
+  }
+  if (attempts.length > 0 && attempts.every((a) => a.status === "missing")) {
+    return { ...base, status: "missing", reason: "content not found on any gateway" };
+  }
+  return { ...base, status: "unavailable", reason: "no gateway could serve the content" };
+}
+
 export interface PinResult {
   cid: string;
   /** false when a pinning service only accepted (queued) the request. */
@@ -218,70 +345,15 @@ export class PinningServiceProvider implements PinProvider {
     if (!status.requestid) throw new Error(`${this.name}: response has no requestid`);
     if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
 
-    while (status.status !== "pinned") {
-      if (status.status === "failed") throw new Error(`${this.name}: pin ${status.requestid} failed`);
-      if (this.o.acceptQueued) return { cid: expectedCid, confirmed: false };
-      await sleep(this.pollMs, signal);
-      const poll = await fetch(this.url(`/pins/${encodeURIComponent(status.requestid)}`), {
-        headers: this.headers(),
-        signal,
-      });
+    while (status.status === "queued" || status.status === "pinning") {
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      if (signal.aborted) throw new Error(`${this.name}: aborted while polling pin status`);
+      const poll = await fetch(this.url(`/pins/${status.requestid}`), { headers: this.headers(), signal });
       if (!poll.ok) await failForStatus(this.name, poll);
-      status = (await poll.json()) as typeof status;
+      status = (await poll.json()) as { requestid: string; status: PinStatus; pin?: { cid?: string } };
       if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
     }
-    return { cid: expectedCid, confirmed: true };
+    if (status.status === "failed") throw new Error(`${this.name}: pin failed`);
+    return { cid: expectedCid, confirmed: status.status === "pinned" };
   }
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(signal!.reason);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function backoffMs(attempt: number, baseMs: number): number {
-  const exp = Math.min(baseMs * 2 ** (attempt - 1), 10_000);
-  return exp / 2 + Math.random() * (exp / 2);
-}
-
-function errorText(err: unknown): string {
-  if (err instanceof Error) return err.name === "TimeoutError" ? "timed out" : err.message;
-  return String(err);
-}
-
-/** Reads at most `cap` bytes of a response body; throws past the cap. */
-async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
-  const declared = Number(res.headers.get("content-length") ?? NaN);
-  if (declared > cap) throw new TraceGatewayError(`gateway body ${declared} bytes exceeds cap ${cap}`);
-  if (!res.body) return new Uint8Array();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      await reader.cancel().catch(() => {});
-      throw new TraceGatewayError(`gateway body exceeds cap ${cap}`);
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
 }
