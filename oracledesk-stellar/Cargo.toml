@@ -11,6 +11,13 @@ members = [
 ]
 resolver = "2"
 
+# Pin the Rust toolchain so every contributor and CI runner builds with the
+# same compiler. `rust-version` is the minimum supported toolchain; the
+# `rust-toolchain.toml` file pins the exact channel used for reproducible
+# builds. Keep these in sync when bumping the toolchain.
+[workspace.package]
+rust-version = "1.79"
+
 [profile.release]
 opt-level = "z"
 overflow-checks = true
