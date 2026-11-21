@@ -5,8 +5,13 @@ const deployment = {
 
 const explorer = "https://stellar.expert/explorer/testnet/contract/";
 const apiBase = localStorage.getItem("oracledeskApiUrl") || "http://localhost:3000";
+const expectedNetwork = "TESTNET";
 const clock = document.querySelector("#clock");
 const apiStatus = document.querySelector("#api-status");
+const walletButton = document.querySelector("#wallet-button");
+const walletStatus = document.querySelector("#wallet-status");
+
+let walletState = { connected: false, publicKey: null, network: null };
 
 // --- Explicit network selection (#107) ---
 // Networks are declared explicitly. Only networks with a validated deployment
@@ -340,8 +345,12 @@ document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("
   loadLifecycle(row.dataset.market);
 }));
 
-document.querySelector("#wallet-button").addEventListener("click", (event) => {
-  event.currentTarget.innerHTML = '<span class="wallet-dot"></span> Wallet ready';
+walletButton.addEventListener("click", () => {
+  if (walletState.connected) {
+    disconnectWallet();
+  } else {
+    connectWallet();
+  }
 });
 document.querySelector("#refresh-button").addEventListener("click", checkApi);
 
