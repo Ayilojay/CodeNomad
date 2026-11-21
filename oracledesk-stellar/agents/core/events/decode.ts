@@ -214,6 +214,28 @@ export class EventDecoder {
           traceHash: Buffer.from(d.trace_hash as Uint8Array).toString("hex"),
           ipfsCid: String(d.ipfs_cid),
         };
+      case "treasury.FeeCollected":
+        return {
+          ...meta,
+          kind: "FeeCollected",
+          marketId: d.market_id as bigint,
+          amount: d.amount as bigint,
+          recipient: d.recipient as string,
+        };
+      case "treasury.PayoutClaimed":
+        return {
+          ...meta,
+          kind: "PayoutClaimed",
+          marketId: d.market_id as bigint,
+          claimant: d.claimant as string,
+          outcome: side(d.outcome),
+          shares: d.shares as bigint,
+          amount: d.amount as bigint,
+        };
+      case "treasury.Deposit":
+        return { ...meta, kind: "TreasuryDeposit", from: d.from as string, amount: d.amount as bigint };
+      case "treasury.Withdrawal":
+        return { ...meta, kind: "TreasuryWithdrawal", to: d.to as string, amount: d.amount as bigint };
       default:
         return { ...meta, kind: "Unknown", name: parsed.name, data: d, raw: rawXdr };
     }
