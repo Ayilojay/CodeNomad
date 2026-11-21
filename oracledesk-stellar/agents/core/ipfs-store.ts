@@ -114,6 +114,114 @@ export async function resolveVerifiedTraceContent(
   return { status: "verified", cid: ref.cid, traceHash: ref.traceHash, bytes };
 }
 
+/**
+ * A single gateway probe outcome. `available` means the gateway served bytes
+ * hashing to the expected `trace_hash`; `missing` means the gateway could not
+ * serve the content; `tampered` means bytes were served but did not match.
+ */
+export type GatewayProbeStatus = "available" | "missing" | "tampered";
+
+export interface GatewayProbeResult {
+  gateway: string;
+  status: GatewayProbeStatus;
+  /** HTTP status when the gateway responded, if any. */
+  httpStatus?: number;
+  /** Human-readable detail for non-available states. */
+  reason?: string;
+}
+
+export interface TraceAvailabilityEvidence {
+  cid: string;
+  traceHash: string;
+  /** True when at least one gateway served bytes matching `traceHash`. */
+  available: boolean;
+  /** True when any gateway served bytes that did not match `traceHash`. */
+  tampered: boolean;
+  probes: GatewayProbeResult[];
+  checkedAt: string;
+}
+
+export interface TraceAvailabilityCheckerOptions {
+  /** Gateway base URLs, e.g. `https://ipfs.io/ipfs/`. */
+  gateways: string[];
+  /** Per-gateway fetch timeout in milliseconds. */
+  timeoutMs?: number;
+  /** Injectable fetch for deterministic tests. */
+  fetchImpl?: typeof fetch;
+}
+
+function gatewayUrl(base: string, cid: string): string {
+  return `${base.replace(/\/+$/, "")}/${cid}`;
+}
+
+/**
+ * Samples trace CIDs across configurable IPFS gateways and verifies the served
+ * bytes against the on-chain `trace_hash`. Read-only: it never rewrites
+ * registry data, it only records availability evidence and reports failures.
+ */
+export class TraceAvailabilityChecker {
+  private readonly gateways: string[];
+  private readonly timeoutMs: number;
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(o: TraceAvailabilityCheckerOptions) {
+    if (!o.gateways.length) throw new TraceGatewayError("at least one gateway is required");
+    this.gateways = o.gateways;
+    this.timeoutMs = o.timeoutMs ?? 10_000;
+    this.fetchImpl = o.fetchImpl ?? fetch;
+  }
+
+  private async probe(gateway: string, ref: { cid: string; traceHash: string }): Promise<GatewayProbeResult> {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const res = await this.fetchImpl(gatewayUrl(gateway, ref.cid), { signal: controller.signal });
+      if (!res.ok) {
+        return { gateway, status: "missing", httpStatus: res.status, reason: `HTTP ${res.status}` };
+      }
+      const bytes = new Uint8Array(await res.arrayBuffer());
+      const digestHex = createHash("sha256").update(bytes).digest("hex");
+      if (digestHex !== ref.traceHash.toLowerCase()) {
+        return {
+          gateway,
+          status: "tampered",
+          httpStatus: res.status,
+          reason: `served bytes hash to ${digestHex}, expected ${ref.traceHash}`,
+        };
+      }
+      return { gateway, status: "available", httpStatus: res.status };
+    } catch (err) {
+      return { gateway, status: "missing", reason: errorText(err) };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  /**
+   * Probes every configured gateway for one trace reference and returns the
+   * aggregated availability evidence. Never throws on gateway failures.
+   */
+  async check(ref: { cid: string; traceHash: string }): Promise<TraceAvailabilityEvidence> {
+    const probes = await Promise.all(this.gateways.map((g) => this.probe(g, ref)));
+    return {
+      cid: ref.cid,
+      traceHash: ref.traceHash,
+      available: probes.some((p) => p.status === "available"),
+      tampered: probes.some((p) => p.status === "tampered"),
+      probes,
+      checkedAt: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Samples a batch of trace references, returning evidence for each. Failures
+   * are reported in the evidence, never thrown, so a scheduled run completes.
+   */
+  async sample(refs: Array<{ cid: string; traceHash: string }>): Promise<TraceAvailabilityEvidence[]> {
+    return Promise.all(refs.map((ref) => this.check(ref)));
+  }
+}
+
 export interface PinResult {
   cid: string;
   /** false when a pinning service only accepted (queued) the request. */
@@ -218,70 +326,21 @@ export class PinningServiceProvider implements PinProvider {
     if (!status.requestid) throw new Error(`${this.name}: response has no requestid`);
     if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
 
-    while (status.status !== "pinned") {
-      if (status.status === "failed") throw new Error(`${this.name}: pin ${status.requestid} failed`);
-      if (this.o.acceptQueued) return { cid: expectedCid, confirmed: false };
-      await sleep(this.pollMs, signal);
-      const poll = await fetch(this.url(`/pins/${encodeURIComponent(status.requestid)}`), {
-        headers: this.headers(),
-        signal,
-      });
+    while (status.status === "queued" || status.status === "pinning") {
+      await new Promise((r) => setTimeout(r, this.pollMs));
+      const poll = await fetch(this.url(`/pins/${status.requestid}`), { headers: this.headers(), signal });
       if (!poll.ok) await failForStatus(this.name, poll);
-      status = (await poll.json()) as typeof status;
-      if (status.pin?.cid) assertSameCid(this.name, status.pin.cid, expectedCid);
+      status = (await poll.json()) as { requestid: string; status: PinStatus; pin?: { cid?: string } };
+    }
+    if (status.status === "failed") throw new Error(`${this.name}: pin failed`);
+    if (status.status !== "pinned") {
+      if (!this.o.acceptQueued) throw new Error(`${this.name}: pin not confirmed (${status.status})`);
+      return { cid: expectedCid, confirmed: false };
     }
     return { cid: expectedCid, confirmed: true };
   }
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) return reject(signal.reason);
-    const t = setTimeout(() => {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }, ms);
-    const onAbort = () => {
-      clearTimeout(t);
-      reject(signal!.reason);
-    };
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-function backoffMs(attempt: number, baseMs: number): number {
-  const exp = Math.min(baseMs * 2 ** (attempt - 1), 10_000);
-  return exp / 2 + Math.random() * (exp / 2);
-}
-
 function errorText(err: unknown): string {
-  if (err instanceof Error) return err.name === "TimeoutError" ? "timed out" : err.message;
-  return String(err);
-}
-
-/** Reads at most `cap` bytes of a response body; throws past the cap. */
-async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
-  const declared = Number(res.headers.get("content-length") ?? NaN);
-  if (declared > cap) throw new TraceGatewayError(`gateway body ${declared} bytes exceeds cap ${cap}`);
-  if (!res.body) return new Uint8Array();
-  const chunks: Uint8Array[] = [];
-  let total = 0;
-  const reader = res.body.getReader();
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    total += value.byteLength;
-    if (total > cap) {
-      await reader.cancel().catch(() => {});
-      throw new TraceGatewayError(`gateway body exceeds cap ${cap}`);
-    }
-    chunks.push(value);
-  }
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.byteLength;
-  }
-  return out;
+  return err instanceof Error ? err.message : String(err);
 }
