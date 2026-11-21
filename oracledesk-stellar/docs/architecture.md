@@ -1009,7 +1009,7 @@ indexer**, and the two must not be confused:
 | Purpose | Wake an agent when something it cares about happens | Durable, queryable history for UIs and analytics |
 | Storage | One checkpoint per network and contract set: `{cursor, lastLedger}` plus recently processed event ids, in `EVENTS_STATE_DIR` | Every event, in Postgres |
 | History | None. Starts at the latest ledger; never replays | Replayable from any ledger it has stored |
-| Retention gap | Detected; triggers a full state resync from chain reads | Is the thing it exists to cover |
+| Retention gap | Detected; bounded backfill is attempted from the last acknowledged ledger. If RPC retention blocks repair, alerts and does not advance the checkpoint; a full state resync still protects trading decisions. | Is the thing it exists to cover |
 | Source of truth | Chain state, re-read before every action | Its own tables |
 
 Flow: `EventSubscriber` polls `getEvents` (cursor pagination, filters
@@ -1029,6 +1029,19 @@ each page to the `Dispatcher`. Events are decoded with the binding specs
   `<EVENTS_STATE_DIR>/dead-letter.jsonl` and the page moves on.
 - **Idle polls** still advance `lastLedger`, so a quiet stretch is not
   mistaken for a retention gap.
+- **Backfill.** Set `EVENTS_START_LEDGER` to choose the inclusive first ledger
+  when there is no saved checkpoint; otherwise the first run still starts at
+  the RPC tip. `EVENTS_BACKFILL_MAX_PAGES` (default 10, allowed 1-1000)
+  bounds each poll, with later polls resuming from the acknowledged cursor.
+  When RPC reports that the requested ledger is outside retention,
+  `EVENTS_BACKFILL_BLOCKED` is logged with the missing range, the regular
+  state resync runs, and the checkpoint is left unchanged. This means the
+  event history remains visibly behind instead of being marked healthy; an
+  RPC/archive endpoint retaining that range is required to repair it.
+- **Compatibility.** The checkpoint JSON shape and event payload/API are
+  unchanged. Existing checkpoints take precedence over `EVENTS_START_LEDGER`;
+  the new settings affect only initialization and how much work one poll
+  performs. No changes are made to payment handling or contract verification.
 
 Handlers (`handlers.ts`): `TradeReevaluate` queues a market for the trader
 after a trade of at least `EVENTS_TRADE_THRESHOLD` stroops (re-reading the

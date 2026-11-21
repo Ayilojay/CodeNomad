@@ -105,6 +105,234 @@ async function checkApi() {
   }
 }
 
+// --- Paid trace viewer ---------------------------------------------------
+// Trace content is only rendered after the x402 payment completes AND the
+// returned payload passes hash/signature verification. Each failure mode is
+// surfaced as its own explicit state; we never fall back to sample data.
+
+const TRACE_STATES = {
+  idle: "idle",
+  payment_required: "payment_required",
+  verifying: "verifying",
+  verified: "verified",
+  invalid: "invalid",
+  unavailable: "unavailable",
+  retrying: "retrying",
+  error: "error"
+};
+
+const traceViewer = {
+  state: TRACE_STATES.idle,
+  traceId: null,
+  content: null,
+  provenance: null,
+  verification: null,
+  message: "",
+  attempts: 0
+};
+
+function setTraceState(state, message) {
+  traceViewer.state = state;
+  traceViewer.message = message || "";
+  renderTraceViewer();
+}
+
+// Provenance fields we surface. These are descriptive metadata only; a valid
+// signature proves integrity/authenticity of the payload, NOT that the
+// strategy is economically sound.
+const PROVENANCE_FIELDS = [
+  ["registry", "Registry"],
+  ["agent", "Agent"],
+  ["key_identity", "Key identity"],
+  ["hash", "Hash"],
+  ["schema_version", "Schema version"]
+];
+
+function renderProvenance(container, provenance) {
+  container.textContent = "";
+  if (!provenance) return;
+  const dl = document.createElement("dl");
+  dl.className = "trace-provenance";
+  PROVENANCE_FIELDS.forEach(([key, label]) => {
+    const dt = document.createElement("dt");
+    dt.textContent = label;
+    const dd = document.createElement("dd");
+    const value = provenance[key];
+    dd.textContent = value === undefined || value === null || value === "" ? "—" : String(value);
+    dl.appendChild(dt);
+    dl.appendChild(dd);
+  });
+  container.appendChild(dl);
+}
+
+function renderVerification(container, verification) {
+  container.textContent = "";
+  if (!verification) return;
+  const badge = document.createElement("span");
+  badge.className = "trace-verification";
+  badge.dataset.result = verification.result;
+  badge.textContent = verification.result === "verified" ? "Signature verified" : "Signature verification failed";
+  container.appendChild(badge);
+  const note = document.createElement("p");
+  note.className = "trace-verification-note";
+  note.textContent = "A valid signature proves payload integrity and signer identity only; it does not imply the strategy is economically sound.";
+  container.appendChild(note);
+}
+
+function renderTraceViewer() {
+  const root = document.querySelector("#trace-viewer");
+  if (!root) return;
+  const status = root.querySelector("#trace-status");
+  const body = root.querySelector("#trace-body");
+  const retry = root.querySelector("#trace-retry");
+  const provenanceEl = root.querySelector("#trace-provenance");
+  const verificationEl = root.querySelector("#trace-verification");
+  const exportBtn = root.querySelector("#trace-export");
+  if (!status || !body) return;
+
+  status.dataset.state = traceViewer.state;
+  status.textContent = traceViewer.message;
+  body.textContent = "";
+  if (provenanceEl) renderProvenance(provenanceEl, traceViewer.provenance);
+  if (verificationEl) renderVerification(verificationEl, traceViewer.verification);
+  if (retry) retry.hidden = traceViewer.state !== TRACE_STATES.unavailable && traceViewer.state !== TRACE_STATES.error;
+  if (exportBtn) exportBtn.hidden = traceViewer.state !== TRACE_STATES.verified;
+
+  if (traceViewer.state === TRACE_STATES.verified && traceViewer.content) {
+    const pre = document.createElement("pre");
+    pre.className = "trace-content";
+    pre.textContent = JSON.stringify(traceViewer.content, null, 2);
+    body.appendChild(pre);
+  }
+}
+
+// Deterministic verification: recompute the SHA-256 of the canonical trace
+// payload and compare it to the hash the server signed. A mismatch means the
+// content is invalid and must not be displayed.
+async function sha256Hex(text) {
+  const data = new TextEncoder().encode(text);
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+async function verifyTrace(payload) {
+  if (!payload || typeof payload !== "object") return false;
+  if (!payload.content || !payload.hash) return false;
+  const canonical = typeof payload.content === "string" ? payload.content : JSON.stringify(payload.content);
+  const expected = await sha256Hex(canonical);
+  return expected === payload.hash;
+}
+
+// Build an offline-verifiable evidence bundle: the raw payload plus the
+// provenance and verification result, so an operator can re-check the hash
+// and signature without trusting this UI.
+function buildEvidenceExport() {
+  return {
+    trace_id: traceViewer.traceId,
+    exported_at: new Date().toISOString(),
+    provenance: traceViewer.provenance,
+    verification: traceViewer.verification,
+    content: traceViewer.content
+  };
+}
+
+function exportEvidence() {
+  if (traceViewer.state !== TRACE_STATES.verified) return;
+  const blob = new Blob([JSON.stringify(buildEvidenceExport(), null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `trace-evidence-${traceViewer.traceId || "unknown"}.json`;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  URL.revokeObjectURL(url);
+}
+
+async function loadTrace(traceId, { retry = false } = {}) {
+  traceViewer.traceId = traceId;
+  traceViewer.content = null;
+  traceViewer.provenance = null;
+  traceViewer.verification = null;
+  traceViewer.attempts = retry ? traceViewer.attempts + 1 : 0;
+  if (retry) setTraceState(TRACE_STATES.retrying, `Retrying trace fetch (attempt ${traceViewer.attempts + 1})…`);
+  else setTraceState(TRACE_STATES.idle, "Requesting trace…");
+
+  let response;
+  try {
+    response = await fetch(`${apiBase}/traces/${encodeURIComponent(traceId)}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(8000)
+    });
+  } catch {
+    setTraceState(TRACE_STATES.unavailable, "Trace service unavailable. Retry when the API is reachable.");
+    return;
+  }
+
+  if (response.status === 402) {
+    setTraceState(TRACE_STATES.payment_required, "Payment required (x402). Complete payment to view this trace.");
+    return;
+  }
+  if (response.status === 404) {
+    setTraceState(TRACE_STATES.unavailable, "Trace not found or not yet available.");
+    return;
+  }
+  if (!response.ok) {
+    setTraceState(TRACE_STATES.error, `Trace request failed (HTTP ${response.status}).`);
+    return;
+  }
+
+  let payload;
+  try {
+    payload = await response.json();
+  } catch {
+    setTraceState(TRACE_STATES.invalid, "Trace response could not be parsed; content withheld.");
+    return;
+  }
+
+  setTraceState(TRACE_STATES.verifying, "Verifying trace hash and signature…");
+  let ok = false;
+  try {
+    ok = await verifyTrace(payload);
+  } catch {
+    ok = false;
+  }
+  if (!ok) {
+    traceViewer.provenance = payload && payload.provenance ? payload.provenance : null;
+    traceViewer.verification = { result: "failed" };
+    setTraceState(TRACE_STATES.invalid, "Trace failed hash/signature verification; content withheld.");
+    return;
+  }
+
+  traceViewer.content = payload.content;
+  traceViewer.provenance = payload.provenance || null;
+  traceViewer.verification = { result: "verified" };
+  setTraceState(TRACE_STATES.verified, "Verified trace content.");
+}
+
+const traceForm = document.querySelector("#trace-form");
+if (traceForm) {
+  traceForm.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const input = traceForm.querySelector("#trace-id");
+    const traceId = input && input.value.trim();
+    if (!traceId) return;
+    loadTrace(traceId);
+  });
+}
+const traceRetry = document.querySelector("#trace-retry");
+if (traceRetry) {
+  traceRetry.addEventListener("click", () => {
+    if (traceViewer.traceId) loadTrace(traceViewer.traceId, { retry: true });
+  });
+}
+const traceExport = document.querySelector("#trace-export");
+if (traceExport) {
+  traceExport.addEventListener("click", exportEvidence);
+}
+renderTraceViewer();
+// ------------------------------------------------------------------------
+
 document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("click", () => {
   document.querySelectorAll(".market-row").forEach((item) => item.classList.remove("selected"));
   row.classList.add("selected");

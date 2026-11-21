@@ -65,6 +65,55 @@ export function sameCid(a: string, b: string): boolean {
   }
 }
 
+/**
+ * Distinct, non-success outcomes when resolving indexed trace content through
+ * the independent verifier. `unavailable` means the content could not be
+ * fetched at all; `hash-mismatch` means bytes were served but did not hash to
+ * the expected `trace_hash`/CID. Neither is ever treated as success.
+ */
+export type TraceContentStatus = "verified" | "unavailable" | "hash-mismatch";
+
+export interface TraceContentResult {
+  status: TraceContentStatus;
+  /** CID the indexer referenced for this trace event. */
+  cid: string;
+  /** `trace_hash` published on-chain next to the CID. */
+  traceHash: string;
+  /** Present only when `status === "verified"`. */
+  bytes?: Uint8Array;
+  /** Human-readable detail for non-verified states. */
+  reason?: string;
+}
+
+/**
+ * Resolves trace content for an indexed event by fetching through the
+ * independent verifier and checking the served bytes against the expected
+ * `trace_hash`. Never trusts indexed data: a mismatch is reported as
+ * `hash-mismatch`, a fetch failure as `unavailable`.
+ */
+export async function resolveVerifiedTraceContent(
+  verifier: { fetch(cid: string, signal?: AbortSignal): Promise<Uint8Array> },
+  ref: { cid: string; traceHash: string },
+  signal?: AbortSignal,
+): Promise<TraceContentResult> {
+  let bytes: Uint8Array;
+  try {
+    bytes = await verifier.fetch(ref.cid, signal);
+  } catch (err) {
+    return { status: "unavailable", cid: ref.cid, traceHash: ref.traceHash, reason: errorText(err) };
+  }
+  const digestHex = createHash("sha256").update(bytes).digest("hex");
+  if (digestHex !== ref.traceHash.toLowerCase()) {
+    return {
+      status: "hash-mismatch",
+      cid: ref.cid,
+      traceHash: ref.traceHash,
+      reason: `served bytes hash to ${digestHex}, expected ${ref.traceHash}`,
+    };
+  }
+  return { status: "verified", cid: ref.cid, traceHash: ref.traceHash, bytes };
+}
+
 export interface PinResult {
   cid: string;
   /** false when a pinning service only accepted (queued) the request. */
@@ -228,114 +277,11 @@ async function readCapped(res: Response, cap: number): Promise<Uint8Array> {
     }
     chunks.push(value);
   }
-  return Buffer.concat(chunks);
-}
-
-export interface IpfsTraceStoreOptions {
-  providers: PinProvider[];
-  /** Confirmed pins required (default 1). */
-  minPins?: number;
-  /** Gateway base, e.g. `https://ipfs.io/ipfs` — same one x402 reads from. */
-  gatewayUrl: string;
-  /** Per-attempt timeout for each provider and the gateway (default 60s). */
-  pinTimeoutMs?: number;
-  /** Attempts per provider and for the gateway check (default 3). */
-  retries?: number;
-  backoffBaseMs?: number;
-  gatewayTimeoutMs?: number;
-  /** Largest gateway body accepted (default MAX_TRACE_BYTES). */
-  gatewayMaxBytes?: number;
-  /** Count queued (accepted, unconfirmed) pinning-service pins toward minPins. */
-  acceptQueued?: boolean;
-}
-
-export class IpfsTraceStore implements TraceStore {
-  private readonly minPins: number;
-  private readonly retries: number;
-  private readonly pinTimeoutMs: number;
-  private readonly backoffBaseMs: number;
-
-  constructor(private readonly o: IpfsTraceStoreOptions) {
-    this.minPins = o.minPins ?? 1;
-    this.retries = Math.max(1, o.retries ?? 3);
-    this.pinTimeoutMs = o.pinTimeoutMs ?? 60_000;
-    this.backoffBaseMs = o.backoffBaseMs ?? 500;
-    if (o.providers.length === 0) throw new Error("IpfsTraceStore needs at least one pin provider");
-    if (this.minPins < 1 || this.minPins > o.providers.length) {
-      throw new Error(`minPins ${this.minPins} must be between 1 and ${o.providers.length} providers`);
-    }
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const c of chunks) {
+    out.set(c, off);
+    off += c.byteLength;
   }
-
-  async put(hash: string, json: string): Promise<{ cid: string }> {
-    // The exact UTF-8 bytes buildTrace hashed; never re-serialized after this.
-    const bytes = new TextEncoder().encode(json);
-    if (bytes.byteLength > MAX_TRACE_BYTES) {
-      throw new TraceStoreIntegrityError(`trace is ${bytes.byteLength} bytes; the limit is ${MAX_TRACE_BYTES} (one block)`);
-    }
-    const { cid, digestHex } = await rawCidForBytes(bytes);
-    if (digestHex !== hash.toLowerCase().replace(/^0x/, "")) {
-      throw new TraceStoreIntegrityError(`trace hash ${hash} does not match sha256 of the json bytes (${digestHex})`);
-    }
-
-    const attempts: PinAttempt[] = [];
-    const results = await Promise.all(this.o.providers.map((p) => this.pinWithRetry(p, bytes, cid, attempts)));
-    const integrity = results.find((r): r is TraceStoreIntegrityError => r instanceof TraceStoreIntegrityError);
-    if (integrity) throw integrity;
-    const confirmed = results.filter((r) => !(r instanceof Error) && (r.confirmed || this.o.acceptQueued)).length;
-    if (confirmed < this.minPins) {
-      throw new TracePinError(`only ${confirmed} of required ${this.minPins} pin(s) confirmed for ${cid}`, attempts);
-    }
-
-    await this.verifyGateway(cid, digestHex);
-    return { cid };
-  }
-
-  private async pinWithRetry(
-    provider: PinProvider,
-    bytes: Uint8Array,
-    cid: string,
-    attempts: PinAttempt[],
-  ): Promise<PinResult | Error> {
-    let last: Error = new Error("no attempts");
-    for (let attempt = 1; attempt <= this.retries; attempt++) {
-      try {
-        const result = await provider.pin(bytes, cid, AbortSignal.timeout(this.pinTimeoutMs));
-        assertSameCid(provider.name, result.cid, cid);
-        attempts.push({ provider: provider.name, attempt, ok: true });
-        return result;
-      } catch (err) {
-        attempts.push({ provider: provider.name, attempt, ok: false, error: errorText(err) });
-        // A wrong CID is misconfiguration or malice, not a transient fault.
-        if (err instanceof TraceStoreIntegrityError) return err;
-        last = err instanceof Error ? err : new Error(String(err));
-      }
-      if (attempt < this.retries) await sleep(backoffMs(attempt, this.backoffBaseMs));
-    }
-    return last;
-  }
-
-  /** GETs the CID from the gateway (following redirects) and re-hashes the body. */
-  private async verifyGateway(cid: string, digestHex: string): Promise<void> {
-    const base = this.o.gatewayUrl.replace(/\/+$/, "");
-    const cap = this.o.gatewayMaxBytes ?? MAX_TRACE_BYTES;
-    const timeoutMs = this.o.gatewayTimeoutMs ?? this.pinTimeoutMs;
-    let last = "";
-    for (let attempt = 1; attempt <= this.retries; attempt++) {
-      try {
-        const res = await fetch(`${base}/${cid}`, { redirect: "follow", signal: AbortSignal.timeout(timeoutMs) });
-        if (!res.ok) throw new TraceGatewayError(`gateway HTTP ${res.status}`);
-        const body = await readCapped(res, cap);
-        const got = createHash("sha256").update(body).digest("hex");
-        if (got !== digestHex) {
-          throw new TraceStoreIntegrityError(`gateway served ${cid} with sha256 ${got}, expected ${digestHex}`);
-        }
-        return;
-      } catch (err) {
-        if (err instanceof TraceStoreIntegrityError) throw err;
-        last = errorText(err);
-      }
-      if (attempt < this.retries) await sleep(backoffMs(attempt, this.backoffBaseMs));
-    }
-    throw new TraceGatewayError(`trace ${cid} not retrievable from ${base}: ${last}`);
-  }
+  return out;
 }

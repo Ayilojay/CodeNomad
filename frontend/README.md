@@ -14,60 +14,52 @@ Open <http://localhost:4173>. The optional x402 status indicator checks
 `http://localhost:3000/health`; set `localStorage.oracledeskApiUrl` in the
 browser to point it at another API URL.
 
-## Network selection
+## Paid trace viewer
 
-The frontend exposes an explicit network selector with **local**, **testnet**,
-and future networks. The selected network is persisted in
-`localStorage.oracledeskNetwork` and drives every downstream surface:
+The trace viewer only renders trace content after the x402 payment has
+completed **and** the returned content has passed hash/signature
+verification. It never shows sample or mock data as if it were live, and it
+never bypasses signature or chain verification.
 
-- **Deployment manifests.** Contract and RPC configuration is loaded from
-  validated deployment manifests keyed by network. A manifest is only used
-  after it passes validation; an invalid or missing manifest surfaces an error
-  and does not fall back to another network's addresses.
-- **Scoped caches and wallet state.** Quote caches, balances, and wallet state
-  are keyed by the selected network, so switching networks never reuses values
-  from a different chain.
-- **Transaction guard.** Transactions are blocked when the deployment
-  addresses do not match the selected network. The mismatch is shown to the
-  user and no signature prompt is shown.
+The viewer surfaces four distinct states, which are never conflated:
 
-## Safe transaction flow
+- **Payment required** — the x402 flow has not completed; no trace content
+  is shown until payment succeeds.
+- **Invalid / unverified content** — the trace was returned but failed
+  hash/signature verification; the content is withheld.
+- **Unavailable trace** — the trace could not be fetched at all.
+- **Retry status** — a retry is in progress or has failed; the previous
+  error is shown explicitly rather than silently falling back.
 
-Every trade goes through the same guarded sequence before anything is
-signed. The frontend never displays sample or hardcoded quotes as live
-state, and it never falls back silently after an error.
+### Trace provenance and signature verification
 
-1. **Quote first.** The trade form requests a quote from the generated
-   bindings/SDK helpers for the selected pair and amount. The quote (price,
-   expected output, and expiry) is shown to the user before any transaction
-   is built. If the quote call fails, the error is surfaced and the trade
-   action stays disabled.
-2. **Explicit slippage and deadline.** Slippage tolerance and transaction
-   deadline are required inputs with validated bounds. A trade cannot be
-   submitted while either value is missing or out of range; the minimum
-   acceptable output is derived from the quote and the chosen slippage.
-3. **Simulate before signing.** The transaction is simulated against the
-   current network state before a signature is requested. A failed
-   simulation is reported to the user and no signature prompt is shown.
-4. **Distinct transaction states.** The UI shows separate pending, success,
-   and failure states for each transaction. Failures are shown as failures
-   with their reason; they are never rendered as success or hidden.
+For a verified trace the viewer displays the provenance details alongside
+the content:
 
-Signature and chain verification are always enforced; the frontend does not
-bypass them or substitute cached/sample values when a check fails.
+- **Registry** — the registry the trace was resolved from.
+- **Agent** — the agent identity that produced the trace.
+- **Key identity** — the signing key identity used for verification.
+- **Hash** — the content hash that was checked against the returned bytes.
+- **Schema version** — the trace schema version.
+- **Verification result** — shown explicitly as **verified** or **failed**;
+  a failed result withholds the content and never falls back silently.
 
-## Verification
+A verified signature only attests that the trace content matches the
+recorded provenance and hash. It does **not** imply the strategy is
+economically sound; the viewer never presents verification as a guarantee of
+performance or profitability.
 
-- Automated tests cover the quote, slippage/deadline validation, simulation
-  failure, and pending/success/failure state transitions. Run the focused
-  package test/build in CI.
-- Network selection tests cover manifest validation, per-network cache/wallet
-  scoping, and the transaction block on deployment/network mismatch.
-- For deployment-specific behavior, verify against localnet or deterministic
-  fixtures before using testnet. Manual operator check: confirm the network
-  selector switches manifests and scoped state, that an invalid manifest
-  surfaces an error without fallback, that a mismatched deployment blocks the
-  transaction, that a quote is shown before signing, that missing/out-of-range
-  slippage or deadline blocks submission, that a failed simulation shows an
-  error with no signature prompt, and that pending/success/failure states each
-  render distinctly.
+### Offline-verifiable evidence export
+
+The viewer can export the provenance and verification details (registry,
+agent, key identity, hash, schema version, and verification result) as an
+evidence bundle. The export is self-contained so it can be re-checked offline
+against the recorded hash and signature without contacting the API.
+
+### Verification
+
+Focused automated tests cover the success path and each failure state
+(payment required, invalid content, unavailable trace, retry), plus the
+provenance display and evidence export. Run them with the package test
+command before release. For deployment-specific behavior, verify against
+localnet or deterministic fixtures before any testnet use.

@@ -5,9 +5,10 @@
   "description": "CodeNomad frontend with explicit local, testnet and future network selection",
   "type": "module",
   "scripts": {
-    "start": "node app.js",
-    "test": "node --test test/network.test.js",
-    "build": "node --check app.js"
+    "start": "node server.mjs",
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write ."
   },
   "engines": {
     "node": ">=18"
