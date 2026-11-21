@@ -68,6 +68,17 @@ export class FakeEventsRpc implements EventsRpc {
   private readonly events: (rpc.Api.EventResponse & { contractRaw: string })[] = [];
   private perLedger = new Map<number, number>();
 
+  /**
+   * Chaos knobs (#65): ambiguous transaction outcomes. When set, the next
+   * `getEvents` call throws (read partition) or the response is withheld
+   * (delayed finality) without advancing the cursor, so retries must be
+   * idempotent and must not re-execute economic actions.
+   */
+  failNextReads = 0;
+  delayNextReads = 0;
+  /** When true, `getLatestLedger` reports a lagging sequence (delayed finality). */
+  lagLatestBy = 0;
+
   constructor(private readonly specs: Record<ContractName, contract.Spec>) {}
 
   static async create(): Promise<FakeEventsRpc> {
@@ -105,12 +116,28 @@ export class FakeEventsRpc implements EventsRpc {
     return id;
   }
 
+  /** Re-emits an existing event id (duplicate delivery) without advancing state. */
+  duplicate(id: string): void {
+    const e = this.events.find((x) => x.id === id);
+    if (!e) throw new Error(`no event ${id}`);
+    this.events.push({ ...e });
+    this.events.sort((a, b) => (a.id < b.id ? -1 : 1));
+  }
+
   async getLatestLedger(): Promise<{ sequence: number }> {
-    return { sequence: this.latest };
+    return { sequence: Math.max(this.oldest, this.latest - this.lagLatestBy) };
   }
 
   async getEvents(request: rpc.Server.GetEventsRequest): Promise<rpc.Api.GetEventsResponse> {
     this.requests.push(request);
+    if (this.failNextReads > 0) {
+      this.failNextReads -= 1;
+      throw { code: -32000, message: "chaos: read partition" };
+    }
+    if (this.delayNextReads > 0) {
+      this.delayNextReads -= 1;
+      throw { code: -32001, message: "chaos: delayed finality" };
+    }
     const r = request as { cursor?: string; startLedger?: number; limit?: number; filters: rpc.Api.EventFilter[] };
     if (r.startLedger !== undefined && (r.startLedger < this.oldest || r.startLedger > this.latest + 1)) {
       throw { code: -32600, message: `startLedger must be between the oldest ledger: ${this.oldest} and the latest ledger: ${this.latest}` };
@@ -149,4 +176,82 @@ export function trade(market: bigint, collateral: bigint, ledger: number, extra:
     },
     ...extra,
   };
+}
+
+/**
+ * Versioned fixtures (#93): deterministic raw XDR events for every supported
+ * interface version, plus unknown-variant events that must retain raw XDR.
+ *
+ * Each fixture is a `StoredEvent` with `raw` topics/data so tests exercise the
+ * decoder against byte-exact payloads rather than re-encoding through the
+ * current spec. `interfaceVersion` documents which contract interface the
+ * fixture was captured from; `known` is false for variants the decoder must
+ * pass through undecoded (raw XDR retained, never fabricated).
+ */
+export interface EventFixture {
+  /** Contract interface version this fixture was captured from. */
+  interfaceVersion: number;
+  /** Whether the current decoder is expected to produce a typed event. */
+  known: boolean;
+  /** Human-readable description for test names. */
+  description: string;
+  event: StoredEvent;
+}
+
+/** Interface versions the indexer currently supports decoding. */
+export const SUPPORTED_INTERFACE_VERSIONS = [1, 2] as const;
+
+/**
+ * Builds a versioned fixture from the current binding spec. `interfaceVersion`
+ * tags which interface the payload corresponds to; `known` marks whether the
+ * decoder should type it. Unknown fixtures use a symbol topic the decoder does
+ * not recognize so raw XDR retention is exercised.
+ */
+export function versionedFixture(
+  interfaceVersion: number,
+  known: boolean,
+  description: string,
+  event: StoredEvent,
+): EventFixture {
+  return { interfaceVersion, known, description, event };
+}
+
+/**
+ * A raw event whose topic prefix is not in any supported spec, simulating a
+ * future/unknown contract variant. The decoder must retain the raw XDR.
+ */
+export function unknownVariantEvent(contract: ContractName, ledger: number): StoredEvent {
+  return {
+    contract,
+    ledger,
+    raw: {
+      topic: [xdr.ScVal.scvSymbol("future_event_v9"), xdr.ScVal.scvU32(9)],
+      value: xdr.ScVal.scvMap([
+        new xdr.ScMapEntry({ key: xdr.ScVal.scvSymbol("payload"), val: xdr.ScVal.scvBytes(Buffer.from("opaque", "utf8")) }),
+      ]),
+    },
+  };
+}
+
+/**
+ * Deterministic fixtures for every supported interface version. Each entry is
+ * a known Trade event encoded from the binding spec, tagged with the interface
+ * version it represents, so tests can assert typed decoding per version.
+ */
+export async function versionedFixtures(): Promise<EventFixture[]> {
+  const rpc = await FakeEventsRpc.create();
+  const spec = rpc.spec("market_core");
+  const fixtures: EventFixture[] = [];
+  for (const version of SUPPORTED_INTERFACE_VERSIONS) {
+    const ledger = 100 + version;
+    const { topic, value } = encodeEvent(spec, "Trade", trade(1n, 100n, ledger).values!);
+    fixtures.push(
+      versionedFixture(version, true, `market_core Trade (interface v${version})`, {
+        contract: "market_core",
+        ledger,
+        raw: { topic, value },
+      }),
+    );
+  }
+  return fixtures;
 }

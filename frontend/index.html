@@ -10,9 +10,16 @@
   <body>
     <a class="skip-link" href="#main-content">Skip to main content</a>
     <header class="topbar">
-      <a class="wordmark" href="/" aria-label="CodeNomad home"><span class="mark" aria-hidden="true">C</span> CodeNomad</a>
-      <div class="network" role="status" aria-live="polite"><span class="pulse" aria-hidden="true"></span> Stellar testnet <span class="divider" aria-hidden="true"></span> <span id="clock">--:--:--</span></div>
-      <button class="wallet-button" id="wallet-button" type="button" aria-label="Connect wallet"><span class="wallet-dot" aria-hidden="true"></span> Connect wallet</button>
+      <a class="wordmark" href="/" aria-label="CodeNomad home"><span class="mark">C</span> CodeNomad</a>
+      <div class="network"><span class="pulse"></span> <span id="network-label">Stellar testnet</span> <span class="divider"></span> <span id="clock">--:--:--</span></div>
+      <label class="network-select" for="network-select">Network
+        <select id="network-select" aria-label="Select network">
+          <option value="local">Local</option>
+          <option value="testnet" selected>Testnet</option>
+          <option value="future" disabled>Future (unavailable)</option>
+        </select>
+      </label>
+      <button class="wallet-button" id="wallet-button" type="button"><span class="wallet-dot"></span> Connect wallet</button>
     </header>
 
     <main id="main-content" tabindex="-1">
@@ -23,8 +30,8 @@
           <p class="lede">A clear window into OracleDesk markets, treasury health, and the reasoning trail behind every agent action.</p>
         </div>
         <div class="intro-meta">
-          <span class="live-badge" role="status" aria-live="polite"><span class="pulse" aria-hidden="true"></span> Live network</span>
-          <a href="https://stellar.expert/explorer/testnet" target="_blank" rel="noreferrer">Open explorer <span aria-hidden="true">↗</span></a>
+          <span class="live-badge"><span class="pulse"></span> Live network</span>
+          <a id="explorer-link" href="https://stellar.expert/explorer/testnet" target="_blank" rel="noreferrer">Open explorer <span aria-hidden="true">↗</span></a>
         </div>
       </section>
 
@@ -56,7 +63,41 @@
         </div>
       </section>
 
-      <section class="bottom-grid reveal"><article class="panel trace-panel"><div class="section-heading compact"><div><p class="eyebrow">Reasoning registry</p><h2>Latest traces</h2></div><span class="verified">● Verified on-chain</span></div><div class="trace"><span class="trace-number">01</span><div><strong>Trader / buy YES</strong><small>Election turnout over 70% · 2 min ago</small></div><span class="hash">0x8c…b41</span></div><div class="trace"><span class="trace-number">02</span><div><strong>Market maker / seed</strong><small>Fed holds rates in May · 18 min ago</small></div><span class="hash">0xe2…91f</span></div><div class="trace"><span class="trace-number">03</span><div><strong>Trader / sell NO</strong><small>BTC above $120k by June · 41 min ago</small></div><span class="hash">0x31…d09</span></div></article><article class="panel contract-panel"><div class="section-heading compact"><div><p class="eyebrow">Connected contracts</p><h2>Testnet wiring</h2></div><span class="network-tag">TESTNET</span></div><div class="contract-row"><span>Market core</span><a id="market-link" target="_blank" rel="noreferrer">CC4M…SRK2O ↗</a></div><div class="contract-row"><span>Reasoning registry</span><a id="registry-link" target="_blank" rel="noreferrer">CAFE…CH6M ↗</a></div><div class="contract-row"><span>x402 trace API</span><span id="api-status" class="api-status" role="status" aria-live="polite"><span class="status-dot" aria-hidden="true"></span>Checking</span></div></article></section>
+      <section class="bottom-grid reveal"><article class="panel trace-panel"><div class="section-heading compact"><div><p class="eyebrow">Reasoning registry</p><h2>Latest traces</h2></div><span class="verified">● Verified on-chain</span></div><div class="trace"><span class="trace-number">01</span><div><strong>Trader / buy YES</strong><small>Election turnout over 70% · 2 min ago</small></div><span class="hash">0x8c…b41</span></div><div class="trace"><span class="trace-number">02</span><div><strong>Market maker / seed</strong><small>Fed holds rates in May · 18 min ago</small></div><span class="hash">0xe2…91f</span></div><div class="trace"><span class="trace-number">03</span><div><strong>Trader / sell NO</strong><small>BTC above $120k by June · 41 min ago</small></div><span class="hash">0x31…d09</span></div></article><article class="panel contract-panel"><div class="section-heading compact"><div><p class="eyebrow">Connected contracts</p><h2>Testnet wiring</h2></div><span class="network-tag">TESTNET</span></div><div class="contract-row"><span>Market core</span><a id="market-link" target="_blank" rel="noreferrer">CC4M…SRK2O ↗</a></div><div class="contract-row"><span>Reasoning registry</span><a id="registry-link" target="_blank" rel="noreferrer">CAFE…CH6M ↗</a></div><div class="contract-row"><span>x402 trace API</span><span id="api-status" class="api-status"><span class="status-dot"></span>Checking</span></div></article></section>
+
+      <section class="trace-viewer reveal" id="trace-viewer" aria-labelledby="trace-viewer-title">
+        <div class="section-heading"><div><p class="eyebrow">Paid trace viewer</p><h2 id="trace-viewer-title">Inspect a verified trace</h2></div><span class="network-tag">x402</span></div>
+        <form class="trace-viewer-form" id="trace-viewer-form">
+          <label class="trace-viewer-field">
+            <span>Trace hash</span>
+            <input id="trace-hash-input" name="traceHash" type="text" autocomplete="off" spellcheck="false" placeholder="0x…" required />
+          </label>
+          <button class="text-button" id="trace-viewer-submit" type="submit">Request trace <span aria-hidden="true">→</span></button>
+        </form>
+        <div class="trace-viewer-status" id="trace-viewer-status" role="status" aria-live="polite" data-state="idle">
+          <p class="trace-viewer-message" id="trace-viewer-message">Enter a trace hash to request the paid trace. Content is shown only after payment and hash/signature verification.</p>
+        </div>
+        <div class="trace-viewer-content" id="trace-viewer-content" hidden></div>
+        <div class="trace-provenance" id="trace-provenance" hidden aria-labelledby="trace-provenance-title">
+          <div class="section-heading compact">
+            <div><p class="eyebrow">Provenance</p><h3 id="trace-provenance-title">Trace provenance &amp; verification</h3></div>
+            <span class="provenance-source" id="trace-provenance-source" data-source="unknown">Unknown source</span>
+          </div>
+          <dl class="provenance-grid" id="trace-provenance-grid">
+            <div class="provenance-item"><dt>Registry</dt><dd id="provenance-registry">—</dd></div>
+            <div class="provenance-item"><dt>Agent</dt><dd id="provenance-agent">—</dd></div>
+            <div class="provenance-item"><dt>Key identity</dt><dd id="provenance-key">—</dd></div>
+            <div class="provenance-item"><dt>Trace hash</dt><dd id="provenance-hash">—</dd></div>
+            <div class="provenance-item"><dt>Schema version</dt><dd id="provenance-schema">—</dd></div>
+            <div class="provenance-item"><dt>Signature</dt><dd id="provenance-signature" data-state="unknown">—</dd></div>
+          </dl>
+          <p class="provenance-disclaimer" id="provenance-disclaimer">A valid signature proves the trace was authored by the listed key and matches the on-chain hash. It does not prove the strategy is economically sound.</p>
+          <div class="provenance-actions">
+            <button class="text-button" id="provenance-export" type="button" disabled>Export evidence <span aria-hidden="true">↓</span></button>
+            <span class="provenance-export-note" id="provenance-export-note">Export is available only after verification succeeds.</span>
+          </div>
+        </div>
+      </section>
     </main>
     <footer><span>ORACLE<span class="footer-accent">DESK</span> · AUTONOMOUS MARKETS</span><span>Built on Stellar / Soroban</span></footer>
     <script type="module" src="/app.js"></script>

@@ -5,9 +5,12 @@
  *
  * - The checkpoint `{cursor, lastLedger}` is written only after the batch
  *   handler resolves (acknowledges). A crash before that redelivers the batch.
- * - With no checkpoint it starts at the latest ledger; history is not replayed.
- * - If RPC retention has moved past `lastLedger`, the missed events cannot be
- *   fetched: it calls `onResync` for a full state reload and restarts at the tip.
+ * - With no checkpoint it starts at `startLedger`, or at the latest ledger
+ *   when no start ledger is configured.
+ * - Backfill is bounded by `maxBackfillPages` per poll and resumes from the
+ *   acknowledged cursor on the next poll.
+ * - If RPC retention has moved past `lastLedger`, it calls `onResync` and
+ *   alerts, but does not advance the checkpoint over the missing range.
  * - Idle polls still advance the checkpoint, so a quiet period never looks
  *   like a retention gap.
  * - Events from failed contract calls are dropped; filters are checked
@@ -115,6 +118,10 @@ export interface SubscriberOptions {
   /** Defaults to one contract filter over every contract the decoder knows. */
   filters?: rpc.Api.EventFilter[];
   pageLimit?: number;
+  /** Inclusive first ledger to read when there is no saved checkpoint. */
+  startLedger?: number;
+  /** Maximum RPC pages to fetch in one poll; defaults to 10. */
+  maxBackfillPages?: number;
   pollIntervalMs?: number;
   /** Handles one page of events; resolving acknowledges it. */
   onBatch: (events: OracleDeskEvent[]) => Promise<void>;
@@ -195,6 +202,7 @@ export function mergeProcessed(processed: readonly string[], ids: readonly strin
 export class EventSubscriber {
   private readonly filters: rpc.Api.EventFilter[];
   private readonly pageLimit: number;
+  private readonly maxBackfillPages: number;
   private stopped = false;
 
   constructor(private readonly o: SubscriberOptions) {
@@ -203,6 +211,13 @@ export class EventSubscriber {
     this.pageLimit = o.pageLimit ?? 100;
     if (this.pageLimit < 1 || this.pageLimit > RPC_LIMITS.pageLimit) {
       throw new RpcFilterError(`page limit must be 1-${RPC_LIMITS.pageLimit}, got ${this.pageLimit}`);
+    }
+    this.maxBackfillPages = o.maxBackfillPages ?? 10;
+    if (!Number.isInteger(this.maxBackfillPages) || this.maxBackfillPages < 1 || this.maxBackfillPages > 1_000) {
+      throw new RpcFilterError(`backfill page limit must be 1-1000, got ${this.maxBackfillPages}`);
+    }
+    if (o.startLedger !== undefined && (!Number.isInteger(o.startLedger) || o.startLedger < 1 || o.startLedger > 4_294_967_295)) {
+      throw new RpcFilterError(`start ledger must be 1-4294967295, got ${o.startLedger}`);
     }
   }
 
@@ -214,10 +229,11 @@ export class EventSubscriber {
     await this.o.checkpoints.save({ ...cp, processed: this.o.processedIds?.() ?? [] });
   }
 
-  private async resync(reason: string, latest: number): Promise<void> {
-    this.log("EVENTS_RETENTION_GAP", { reason });
+  private async retentionGap(reason: string, lastLedger: number, latest: number, oldestLedger?: number): Promise<void> {
+    const fields = { reason, requestedLedger: lastLedger + 1, latestLedger: latest, oldestLedger };
+    this.log("EVENTS_RETENTION_GAP", fields);
+    this.log("EVENTS_BACKFILL_BLOCKED", fields);
     await this.o.onResync(reason);
-    await this.save({ cursor: undefined, lastLedger: latest });
   }
 
   /**
@@ -225,19 +241,25 @@ export class EventSubscriber {
    * Returns the number of events delivered.
    */
   async pollOnce(): Promise<number> {
-    const cp = await this.o.checkpoints.load();
+    let cp = await this.o.checkpoints.load();
     const latest = (await this.o.rpc.getLatestLedger()).sequence;
     if (cp.lastLedger === undefined) {
-      // No checkpoint: start at the tip rather than replaying history.
-      await this.save({ cursor: undefined, lastLedger: latest });
-      this.log("EVENTS_START_AT_TIP", { ledger: latest });
-      return 0;
+      if (this.o.startLedger === undefined) {
+        // No configured checkpoint: preserve the historical start-at-tip behavior.
+        await this.save({ cursor: undefined, lastLedger: latest });
+        this.log("EVENTS_START_AT_TIP", { ledger: latest });
+        return 0;
+      }
+      if (this.o.startLedger > latest + 1) {
+        throw new RpcFilterError(`configured start ledger ${this.o.startLedger} is ahead of latest ledger ${latest}`);
+      }
+      cp = { ...cp, cursor: undefined, lastLedger: this.o.startLedger - 1 };
     }
+    if (cp.lastLedger === undefined) throw new Error("event checkpoint ledger was not initialized");
     let cursor = cp.cursor;
     let lastLedger = cp.lastLedger;
     let delivered = 0;
-    const processed = new Set(cp.processed);
-    for (;;) {
+    for (let pages = 0; pages < this.maxBackfillPages; pages++) {
       const request = (cursor
         ? { filters: this.filters, cursor, limit: this.pageLimit }
         : { filters: this.filters, startLedger: lastLedger + 1, limit: this.pageLimit }) as rpc.Server.GetEventsRequest;
@@ -246,13 +268,13 @@ export class EventSubscriber {
         page = await this.o.rpc.getEvents(request);
       } catch (err) {
         if (isRetentionError(err)) {
-          await this.resync(`ledger ${lastLedger + 1} is outside RPC retention`, latest);
+          await this.retentionGap(`ledger ${lastLedger + 1} is outside RPC retention`, lastLedger, latest);
           return delivered;
         }
         throw err;
       }
       if (page.oldestLedger > lastLedger + 1) {
-        await this.resync(`RPC retention starts at ledger ${page.oldestLedger}, after ${lastLedger}`, page.latestLedger);
+        await this.retentionGap(`RPC retention starts at ledger ${page.oldestLedger}, after ${lastLedger}`, lastLedger, page.latestLedger, page.oldestLedger);
         return delivered;
       }
       const decoded = page.events
@@ -271,5 +293,17 @@ export class EventSubscriber {
       if (page.events.length < this.pageLimit) break;
     }
     return delivered;
+  }
+
+  /** Polls until `stop()`; `sleep` is injectable for tests. */
+  async run(sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms))): Promise<void> {
+    while (!this.stopped) {
+      await this.pollOnce();
+      if (!this.stopped) await sleep(this.o.pollIntervalMs ?? 10_000);
+    }
+  }
+
+  stop(): void {
+    this.stopped = true;
   }
 }
