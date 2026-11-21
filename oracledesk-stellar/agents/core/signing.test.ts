@@ -146,3 +146,70 @@ test("trace attestation verifies with real reasoning trace JSON hash offline", (
     false,
   );
 });
+
+test("multisig envelope collects signatures up to threshold", () => {
+  const envelope = createMultisigEnvelope({
+    payload: Buffer.from("transfer:100"),
+    threshold: 2,
+    expiresAt: 1_000,
+  });
+
+  const a = Keypair.random();
+  const b = Keypair.random();
+
+  assert.equal(envelope.status(500).collected, 0);
+  assert.equal(envelope.status(500).ready, false);
+
+  assert.equal(envelope.addSignature(a, 500), true);
+  assert.equal(envelope.status(500).collected, 1);
+  assert.equal(envelope.status(500).ready, false);
+
+  assert.equal(envelope.addSignature(b, 500), true);
+  const status = envelope.status(500);
+  assert.equal(status.collected, 2);
+  assert.equal(status.ready, true);
+  assert.equal(status.threshold, 2);
+});
+
+test("multisig envelope rejects duplicate participant signatures", () => {
+  const envelope = createMultisigEnvelope({
+    payload: Buffer.from("transfer:100"),
+    threshold: 2,
+    expiresAt: 1_000,
+  });
+  const a = Keypair.random();
+
+  assert.equal(envelope.addSignature(a, 500), true);
+  assert.equal(envelope.addSignature(a, 500), false);
+  assert.equal(envelope.status(500).collected, 1);
+});
+
+test("multisig envelope rejects expired envelopes", () => {
+  const envelope = createMultisigEnvelope({
+    payload: Buffer.from("transfer:100"),
+    threshold: 1,
+    expiresAt: 1_000,
+  });
+  const a = Keypair.random();
+
+  assert.equal(envelope.addSignature(a, 1_001), false);
+  assert.equal(envelope.status(1_001).expired, true);
+  assert.equal(envelope.status(1_001).ready, false);
+});
+
+test("multisig envelope rejects altered payload envelopes", () => {
+  const envelope = createMultisigEnvelope({
+    payload: Buffer.from("transfer:100"),
+    threshold: 1,
+    expiresAt: 1_000,
+  });
+  const a = Keypair.random();
+  assert.equal(envelope.addSignature(a, 500), true);
+
+  // Altered payload no longer matches the bound payload hash
+  assert.equal(
+    envelope.verifyPayload(Buffer.from("transfer:999")),
+    false,
+  );
+  assert.equal(envelope.verifyPayload(Buffer.from("transfer:100")), true);
+});

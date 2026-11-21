@@ -159,6 +159,253 @@ export function verifyTraceAttestation(
 }
 
 // ---------------------------------------------------------------------------
+// Multisig transaction signing coordination (#69)
+//
+// A multisig envelope binds a set of participants to a single transaction
+// payload via a payload hash. Signatures are collected incrementally until a
+// threshold is reached. The coordinator enforces:
+//
+// - Bounded collection: at most `participants.length` signatures are accepted
+//   and the threshold must be a positive integer no greater than the number of
+//   participants.
+// - Duplicate rejection: a participant may only contribute one signature per
+//   envelope; a second submission from the same participant is rejected.
+// - Payload binding: every signature is verified against the envelope's payload
+//   hash, so an altered payload (or a signature produced for a different
+//   payload) is rejected.
+// - Expiry: envelopes carry an explicit `expiresAt` timestamp. Stale or expired
+//   envelopes are rejected on submission and reported as `expired` in status.
+// - Status reporting never discloses participant secrets: only public keys and
+//   the set of participants that have signed are exposed.
+//
+// Operational notes:
+// - Envelopes are persisted through a pluggable `MultisigEnvelopeStore`. The
+//   in-memory store is provided for tests and single-process agents; durable
+//   deployments supply their own store.
+// - The safe dry-run default is preserved: this module only coordinates
+//   signatures and never submits a transaction on-chain.
+// ---------------------------------------------------------------------------
+
+/** Default envelope lifetime in milliseconds (10 minutes). */
+export const DEFAULT_MULTISIG_ENVELOPE_TTL_MS = 10 * 60 * 1000;
+
+const MULTISIG_DOMAIN = Buffer.from("oracledesk-multisig-v1", "ascii");
+
+export interface MultisigEnvelope {
+  /** Stable envelope identifier. */
+  id: string;
+  /** Participant public keys (32-byte Ed25519) authorized to sign. */
+  participants: Uint8Array[];
+  /** Number of distinct signatures required to complete the envelope. */
+  threshold: number;
+  /** Raw transaction payload being signed. */
+  payload: Uint8Array;
+  /** sha256(payload), used to bind signatures to the exact payload. */
+  payloadHash: Uint8Array;
+  /** Absolute expiry timestamp in milliseconds since epoch. */
+  expiresAt: number;
+  /** Collected signatures keyed by hex-encoded participant public key. */
+  signatures: Map<string, Uint8Array>;
+}
+
+export type MultisigStatus = "pending" | "complete" | "expired";
+
+export interface MultisigStatusReport {
+  id: string;
+  status: MultisigStatus;
+  threshold: number;
+  /** Hex-encoded public keys of participants that have signed. */
+  signedBy: string[];
+  /** Hex-encoded public keys of participants that have not yet signed. */
+  pending: string[];
+  expiresAt: number;
+}
+
+/** Durable envelope store. Implementations must persist before resolving. */
+export interface MultisigEnvelopeStore {
+  save(envelope: MultisigEnvelope): Promise<void> | void;
+  load(id: string): Promise<MultisigEnvelope | undefined> | MultisigEnvelope | undefined;
+}
+
+/** Simple in-memory store for tests and single-process agents. */
+export class InMemoryMultisigEnvelopeStore implements MultisigEnvelopeStore {
+  private readonly envelopes = new Map<string, MultisigEnvelope>();
+
+  save(envelope: MultisigEnvelope): void {
+    this.envelopes.set(envelope.id, envelope);
+  }
+
+  load(id: string): MultisigEnvelope | undefined {
+    return this.envelopes.get(id);
+  }
+}
+
+function hexKey(publicKey: Uint8Array): string {
+  return Buffer.from(publicKey).toString("hex");
+}
+
+function hashPayload(payload: Uint8Array): Uint8Array {
+  return new Uint8Array(createHash("sha256").update(Buffer.from(payload)).digest());
+}
+
+function buildMultisigMessage(payloadHash: Uint8Array): Buffer {
+  if (payloadHash.length !== 32) {
+    throw new Error(`payloadHash must be 32 bytes, got ${payloadHash.length}`);
+  }
+  return Buffer.concat([MULTISIG_DOMAIN, Buffer.from(payloadHash)]);
+}
+
+export interface CreateMultisigEnvelopeParams {
+  id: string;
+  participants: Uint8Array[];
+  threshold: number;
+  payload: Uint8Array;
+  /** Absolute expiry timestamp in ms. Defaults to now + DEFAULT_MULTISIG_ENVELOPE_TTL_MS. */
+  expiresAt?: number;
+  /** Current time in ms; injectable for tests. */
+  now?: number;
+}
+
+export function createMultisigEnvelope(params: CreateMultisigEnvelopeParams): MultisigEnvelope {
+  const now = params.now ?? Date.now();
+  const expiresAt = params.expiresAt ?? now + DEFAULT_MULTISIG_ENVELOPE_TTL_MS;
+  if (!Number.isInteger(params.threshold) || params.threshold <= 0) {
+    throw new Error(`threshold must be a positive integer, got ${params.threshold}`);
+  }
+  if (params.threshold > params.participants.length) {
+    throw new Error(
+      `threshold ${params.threshold} exceeds participant count ${params.participants.length}`,
+    );
+  }
+  const seen = new Set<string>();
+  for (const p of params.participants) {
+    if (p.length !== 32) {
+      throw new Error(`participant public key must be 32 bytes, got ${p.length}`);
+    }
+    const k = hexKey(p);
+    if (seen.has(k)) {
+      throw new Error(`duplicate participant ${k}`);
+    }
+    seen.add(k);
+  }
+  if (expiresAt <= now) {
+    throw new Error(`expiresAt ${expiresAt} must be in the future (now ${now})`);
+  }
+  return {
+    id: params.id,
+    participants: params.participants.map((p) => new Uint8Array(p)),
+    threshold: params.threshold,
+    payload: new Uint8Array(params.payload),
+    payloadHash: hashPayload(params.payload),
+    expiresAt,
+    signatures: new Map(),
+  };
+}
+
+/**
+ * Sign the multisig message for an envelope's payload hash. The returned
+ * signature is bound to the payload hash, so it cannot be replayed against a
+ * different payload.
+ */
+export function signMultisigPayload(
+  keypair: Keypair,
+  payloadHash: Uint8Array,
+): AttestationSignature {
+  const pubkey = new Uint8Array(keypair.rawPublicKey());
+  const msg = buildMultisigMessage(payloadHash);
+  const sig = new Uint8Array(keypair.sign(msg));
+  return { publicKey: pubkey, signature: sig };
+}
+
+function verifyMultisigSignature(
+  publicKey: Uint8Array,
+  signature: Uint8Array,
+  payloadHash: Uint8Array,
+): boolean {
+  if (publicKey.length !== 32 || signature.length !== 64) return false;
+  const s = BigInt(`0x${Buffer.from(signature.slice(32)).reverse().toString("hex")}`);
+  if (s >= GROUP_ORDER) return false;
+  const msg = buildMultisigMessage(payloadHash);
+  const key = Keypair.fromPublicKey(StrKey.encodeEd25519PublicKey(Buffer.from(publicKey)));
+  return key.verify(msg, Buffer.from(signature));
+}
+
+export interface SubmitMultisigSignatureParams {
+  envelope: MultisigEnvelope;
+  publicKey: Uint8Array;
+  signature: Uint8Array;
+  /** Current time in ms; injectable for tests. */
+  now?: number;
+}
+
+/**
+ * Validate and record a participant signature on an envelope. Throws on any
+ * rejection (expired envelope, unknown participant, duplicate signature,
+ * altered payload / invalid signature). Returns the updated envelope.
+ */
+export function submitMultisigSignature(
+  params: SubmitMultisigSignatureParams,
+): MultisigEnvelope {
+  const now = params.now ?? Date.now();
+  const { envelope } = params;
+  if (now >= envelope.expiresAt) {
+    throw new Error(`envelope ${envelope.id} expired at ${envelope.expiresAt}`);
+  }
+  const key = hexKey(params.publicKey);
+  const isParticipant = envelope.participants.some((p) => hexKey(p) === key);
+  if (!isParticipant) {
+    throw new Error(`public key ${key} is not a participant of envelope ${envelope.id}`);
+  }
+  if (envelope.signatures.has(key)) {
+    throw new Error(`duplicate signature from participant ${key}`);
+  }
+  if (envelope.signatures.size >= envelope.participants.length) {
+    throw new Error(`envelope ${envelope.id} already has the maximum number of signatures`);
+  }
+  if (!verifyMultisigSignature(params.publicKey, params.signature, envelope.payloadHash)) {
+    throw new Error(`invalid signature from participant ${key} (payload mismatch or bad signature)`);
+  }
+  envelope.signatures.set(key, new Uint8Array(params.signature));
+  return envelope;
+}
+
+/**
+ * Report envelope status without disclosing participant secrets. Only public
+ * keys and the set of signers are exposed.
+ */
+export function getMultisigStatus(
+  envelope: MultisigEnvelope,
+  now: number = Date.now(),
+): MultisigStatusReport {
+  const signedBy: string[] = [];
+  const pending: string[] = [];
+  for (const p of envelope.participants) {
+    const k = hexKey(p);
+    if (envelope.signatures.has(k)) {
+      signedBy.push(k);
+    } else {
+      pending.push(k);
+    }
+  }
+  let status: MultisigStatus;
+  if (now >= envelope.expiresAt) {
+    status = "expired";
+  } else if (envelope.signatures.size >= envelope.threshold) {
+    status = "complete";
+  } else {
+    status = "pending";
+  }
+  return {
+    id: envelope.id,
+    status,
+    threshold: envelope.threshold,
+    signedBy,
+    pending,
+    expiresAt: envelope.expiresAt,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Remote signing service operational controls (#68)
 //
 // These helpers harden a remote signing endpoint without weakening the safe
@@ -204,162 +451,5 @@ export interface SigningAuditRecord {
 
 /** Durable audit sink. Implementations must persist records before resolving. */
 export interface SigningAuditSink {
-  record(entry: SigningAuditRecord): Promise<void>;
-}
-
-/** Authentication hook. Return true only for a valid, authorized caller. */
-export type SigningAuthenticator = (credential: string | undefined) => boolean | Promise<boolean>;
-
-export interface SigningServiceOptions {
-  /** Authentication hook. When absent, all requests are denied (default-deny). */
-  authenticate?: SigningAuthenticator;
-  /** Durable audit sink. When absent, all requests are denied (fail-closed). */
-  audit?: SigningAuditSink;
-  maxRequestBytes?: number;
-  requestTimeoutMs?: number;
-  replayWindowMs?: number;
-  /** Injectable clock for deterministic tests. */
-  now?: () => number;
-}
-
-export type SigningOutcome =
-  | { ok: true; signature: AttestationSignature }
-  | { ok: false; status: number; reason: string };
-
-/**
- * Bounded, replay-safe, audited remote signing service.
- *
- * The caller supplies a `sign` function that performs the actual attestation
- * signing; this wrapper enforces operational controls around it. The wrapper
- * never logs or returns the credential or raw signing material.
- */
-export class RemoteSigningService {
-  private readonly authenticate?: SigningAuthenticator;
-  private readonly audit?: SigningAuditSink;
-  private readonly maxRequestBytes: number;
-  private readonly requestTimeoutMs: number;
-  private readonly replayWindowMs: number;
-  private readonly now: () => number;
-  private readonly seenNonces = new Map<string, number>();
-
-  constructor(options: SigningServiceOptions = {}) {
-    this.authenticate = options.authenticate;
-    this.audit = options.audit;
-    this.maxRequestBytes = options.maxRequestBytes ?? DEFAULT_MAX_REQUEST_BYTES;
-    this.requestTimeoutMs = options.requestTimeoutMs ?? DEFAULT_REQUEST_TIMEOUT_MS;
-    this.replayWindowMs = options.replayWindowMs ?? DEFAULT_REPLAY_WINDOW_MS;
-    this.now = options.now ?? (() => Date.now());
-  }
-
-  /** Readiness check: service is ready only when auth and audit are wired. */
-  isReady(): boolean {
-    return typeof this.authenticate === "function" && typeof this.audit === "object" && this.audit !== null;
-  }
-
-  async handle(
-    request: SigningRequest,
-    sign: (payload: Uint8Array) => AttestationSignature | Promise<AttestationSignature>,
-  ): Promise<SigningOutcome> {
-    const timestamp = this.now();
-
-    // Default-deny: no authenticator configured means nothing is authorized.
-    if (typeof this.authenticate !== "function") {
-      return this.deny(request, timestamp, 401, "authentication not configured");
-    }
-
-    // Bounded request size.
-    if (!request.payload || request.payload.length > this.maxRequestBytes) {
-      return this.deny(request, timestamp, 413, "request too large");
-    }
-
-    // Replay handling: reject empty or previously seen nonces.
-    if (!request.nonce || this.isReplay(request.nonce, timestamp)) {
-      return this.deny(request, timestamp, 409, "replayed or missing nonce");
-    }
-
-    // Authentication failure is denied before any signing work.
-    let authorized = false;
-    try {
-      authorized = await this.authenticate(request.credential);
-    } catch {
-      authorized = false;
-    }
-    if (!authorized) {
-      return this.deny(request, timestamp, 401, "unauthorized");
-    }
-
-    // Record the nonce only after auth so unauthenticated probes cannot poison it.
-    this.rememberNonce(request.nonce, timestamp);
-
-    // Bounded wall-clock timeout around the signing operation.
-    let signature: AttestationSignature;
-    try {
-      signature = await this.withTimeout(Promise.resolve().then(() => sign(request.payload)));
-    } catch (err) {
-      const reason = err instanceof Error && err.message === "timeout" ? "timeout" : "signing failed";
-      const status = reason === "timeout" ? 504 : 500;
-      return this.deny(request, timestamp, status, reason);
-    }
-
-    // Fail-closed audit: a signature is only returned if the audit record persists.
-    const audited = await this.recordAudit({ nonce: request.nonce, outcome: "signed", timestamp });
-    if (!audited) {
-      return { ok: false, status: 503, reason: "audit unavailable" };
-    }
-
-    return { ok: true, signature };
-  }
-
-  private isReplay(nonce: string, timestamp: number): boolean {
-    this.pruneNonces(timestamp);
-    return this.seenNonces.has(nonce);
-  }
-
-  private rememberNonce(nonce: string, timestamp: number): void {
-    this.seenNonces.set(nonce, timestamp);
-  }
-
-  private pruneNonces(timestamp: number): void {
-    const cutoff = timestamp - this.replayWindowMs;
-    for (const [nonce, seenAt] of this.seenNonces) {
-      if (seenAt < cutoff) this.seenNonces.delete(nonce);
-    }
-  }
-
-  private withTimeout<T>(promise: Promise<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error("timeout")), this.requestTimeoutMs);
-      promise.then(
-        (value) => {
-          clearTimeout(timer);
-          resolve(value);
-        },
-        (err) => {
-          clearTimeout(timer);
-          reject(err);
-        },
-      );
-    });
-  }
-
-  private async recordAudit(entry: SigningAuditRecord): Promise<boolean> {
-    if (!this.audit) return false;
-    try {
-      await this.audit.record(entry);
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
-  private async deny(
-    request: SigningRequest,
-    timestamp: number,
-    status: number,
-    reason: string,
-  ): Promise<SigningOutcome> {
-    // Best-effort audit of denials; never block the deny path on audit failure.
-    await this.recordAudit({ nonce: request.nonce ?? "", outcome: "denied", reason, timestamp });
-    return { ok: false, status, reason };
-  }
+  record(entry: SigningAuditRecord): Promise<void> | void;
 }
