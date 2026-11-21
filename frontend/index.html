@@ -10,7 +10,14 @@
   <body>
     <header class="topbar">
       <a class="wordmark" href="/" aria-label="CodeNomad home"><span class="mark">C</span> CodeNomad</a>
-      <div class="network"><span class="pulse"></span> Stellar testnet <span class="divider"></span> <span id="clock">--:--:--</span></div>
+      <div class="network"><span class="pulse"></span> <span id="network-label">Stellar testnet</span> <span class="divider"></span> <span id="clock">--:--:--</span></div>
+      <label class="network-select" for="network-select">Network
+        <select id="network-select" aria-label="Select network">
+          <option value="local">Local</option>
+          <option value="testnet" selected>Testnet</option>
+          <option value="future" disabled>Future (unavailable)</option>
+        </select>
+      </label>
       <button class="wallet-button" id="wallet-button" type="button"><span class="wallet-dot"></span> Connect wallet</button>
     </header>
 
@@ -23,7 +30,7 @@
         </div>
         <div class="intro-meta">
           <span class="live-badge"><span class="pulse"></span> Live network</span>
-          <a href="https://stellar.expert/explorer/testnet" target="_blank" rel="noreferrer">Open explorer <span aria-hidden="true">↗</span></a>
+          <a id="explorer-link" href="https://stellar.expert/explorer/testnet" target="_blank" rel="noreferrer">Open explorer <span aria-hidden="true">↗</span></a>
         </div>
       </section>
 
