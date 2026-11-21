@@ -1,63 +1,135 @@
-# CodeNomad
+# OracleDesk
 
-## Reproducible builds
+OracleDesk is a coordination layer for autonomous agents on Stellar. It exposes an
+x402-style HTTP API for paid agent coordination, backed by Soroban contracts and a
+versioned event stream.
 
-CodeNomad pins its toolchains and dependency lockfiles so that clean installs and builds are reproducible across machines and CI.
+## x402 API contract
 
-### Pinned tool versions
+The HTTP surface is described by an OpenAPI 3.1 contract published at
+[`docs/openapi.yaml`](docs/openapi.yaml). The contract is the source of truth for
+routes, request/response schemas, and error shapes; clients and CI validate
+against it.
 
-- **Rust**: the toolchain is pinned via `rust-toolchain.toml` at the repository root. Use the pinned channel; do not override it locally when validating a release.
-- **Node**: the supported Node version is declared in `.nvmrc` and in the `engines` field of `package.json`. Use the declared version (e.g. via `nvm use`) before installing.
-- **Python**: the interpreter version is pinned in `.python-version`.
+### Routes
 
-### Lockfiles
+| Method | Path | Description |
+| ------ | ---- | ----------- |
+| `GET`  | `/health` | Liveness/readiness probe. Returns `200` with `{ status, version }`. |
+| `GET`  | `/agents` | Paginated agent listing. Query params `limit` (1–100, default 20) and `cursor` (opaque). |
+| `GET`  | `/agents/{agentId}` | Single agent record. |
+| `POST` | `/coordination` | Submit a coordination request. Requires a valid x402 payment header. |
+| `GET`  | `/coordination/{requestId}` | Fetch a coordination request and its verification result. |
 
-- `Cargo.lock` is committed and must be used for all builds (`cargo build --locked`).
-- `package-lock.json` is committed and must be used for all installs (`npm ci`).
+### 402 payment challenge
 
-Do not regenerate lockfiles or bump tool versions as part of an unrelated change. If a dependency update is required, update the manifest and the corresponding lockfile together in a dedicated change.
+Any paid route (`POST /coordination`) responds with `402 Payment Required` when
+the `X-PAYMENT` header is missing or invalid. The body is an x402 challenge:
 
-### CI verification
+```json
+{
+  "x402Version": 1,
+  "error": "payment required",
+  "accepts": [
+    {
+      "scheme": "exact",
+      "network": "stellar:testnet",
+      "maxAmountRequired": "1000000",
+      "resource": "/coordination",
+      "description": "Agent coordination request",
+      "mimeType": "application/json",
+      "payTo": "G...",
+      "asset": "USDC:GA...",
+      "maxTimeoutSeconds": 60,
+      "extra": { "contract": "C..." }
+    }
+  ]
+}
+```
 
-CI verifies reproducibility by:
+A request is only accepted once the payment payload verifies on-chain. There is
+no success-shaped fallback: if verification fails, the request is rejected with
+`402` (payment) or `422` (verification) and no coordination state is written.
 
-- installing with `npm ci` and building with `cargo build --locked`, which fail loudly if a lockfile is out of sync with its manifest;
-- checking that the working tree is clean after install/build, so no manifest or lockfile is mutated unexpectedly;
-- asserting the active tool versions match the pinned versions, failing the job on mismatch.
+### Verification response
 
-These checks fail loudly rather than falling back to unpinned versions or silently regenerating lockfiles.
+`GET /coordination/{requestId}` returns the stored request together with its
+verification result:
 
-## Security checks
+```json
+{
+  "requestId": "...",
+  "status": "verified",
+  "verification": {
+    "verified": true,
+    "txHash": "...",
+    "ledger": 123456,
+    "verifiedAt": "2024-01-01T00:00:00Z"
+  }
+}
+```
 
-CI runs repository-appropriate security checks on every push and pull request. All checks fail the job on findings; none fall back to a warning-only mode.
+`status` is one of `pending`, `verified`, `failed`. `verification.verified` is
+`false` for `failed` requests and the failure reason is included in
+`verification.error`.
 
-### Dependency scanning
+### Pagination
 
-- **Node**: `npm audit --audit-level=high` runs against the committed `package-lock.json`.
-- **Rust**: `cargo audit` runs against the committed `Cargo.lock`.
+List endpoints accept `limit` and `cursor` and return:
 
-### Secret scanning
+```json
+{ "items": [], "nextCursor": null }
+```
 
-- `gitleaks` scans the full repository history for committed credentials.
+`nextCursor` is `null` on the last page. Invalid `limit` (non-integer, `< 1`, or
+`> 100`) yields `400` with the standard error schema.
 
-### Artifact checks
+### Error schema
 
-- Build artifacts are produced from the pinned toolchains and lockfiles, and the working tree is asserted clean after the build so no artifact is generated from mutated inputs.
+All non-2xx responses share a single error shape:
 
-### Suppressions
+```json
+{ "error": { "code": "invalid_request", "message": "...", "details": {} } }
+```
 
-Any suppression (audit advisory ignore, gitleaks allowlist entry) must be recorded with a rationale:
+| Status | `code` | Meaning |
+| ------ | ------ | ------- |
+| `400`  | `invalid_request` | Malformed query/body (e.g. bad pagination). |
+| `402`  | `payment_required` | Missing/invalid x402 payment header. |
+| `404`  | `not_found` | Unknown agent or coordination request. |
+| `422`  | `verification_failed` | Payment payload failed on-chain verification. |
+| `500`  | `internal_error` | Unexpected server error. |
 
-- **Dependency advisories**: add the advisory ID and a short justification to the audit ignore configuration; remove the entry once the dependency is upgraded.
-- **Secret scanning**: add the path or fingerprint to the gitleaks allowlist only for non-usable test fixtures, with a comment explaining why the value is not a real credential.
+## Configuration
 
-Test fixtures must never contain usable credentials. If a fixture needs a credential-shaped value, use an obviously fake placeholder and allowlist it with a rationale.
+| Variable | Required | Description |
+| -------- | -------- | ----------- |
+| `STELLAR_NETWORK` | yes | `testnet` or `localnet`. |
+| `SOROBAN_RPC_URL` | yes | Soroban RPC endpoint used for payment verification. |
+| `X402_PAY_TO` | yes | Stellar account receiving payments. |
+| `X402_ASSET` | yes | Asset identifier (`CODE:ISSUER`). |
+| `X402_CONTRACT` | yes | Soroban contract address used for verification. |
 
-### Manual release / operator verification
+## Validation
 
-Before a release, on a clean checkout:
+CI validates the OpenAPI contract and runs client smoke tests against
+deterministic fixtures:
 
-1. Confirm the active tool versions match the pinned files (`rustc --version`, `node --version`, `python --version`).
-2. Run `npm ci` and `cargo build --locked` and confirm both succeed without modifying tracked files (`git status --porcelain` is empty).
-3. Run the dependency and secret scans locally (`npm audit --audit-level=high`, `cargo audit`, `gitleaks detect`) and confirm they pass or that every finding is a documented suppression.
-4. For deployment-specific behavior, verify against localnet or deterministic fixtures before testnet use.
+```sh
+# Lint/validate the OpenAPI contract
+npx @redocly/cli lint docs/openapi.yaml
+
+# Client smoke tests exercising the documented contract
+npm test -- --testPathPattern=openapi
+```
+
+Smoke tests use deterministic fixtures and require no network access. To
+exercise the contract against a live node, run against localnet with
+`STELLAR_NETWORK=localnet` and a running `SOROBAN_RPC_URL`; this is an external
+prerequisite and is not required for CI.
+
+## Compatibility
+
+The API is versioned via the `x402Version` field in challenges. Additive schema
+changes (new optional fields) are non-breaking; removing or renaming fields is a
+breaking change and requires a version bump.

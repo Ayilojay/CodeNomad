@@ -103,3 +103,61 @@ test("an event the spec cannot decode is Unknown, and a foreign contract is igno
   });
   assert.equal(foreign, undefined);
 });
+
+test("unknown variants retain raw XDR instead of fabricating decoded fields", async () => {
+  const rawTopic = [xdr.ScVal.scvSymbol("FutureEventV9")];
+  const rawValue = xdr.ScVal.scvU32(42);
+  const e = await decodeOne({ contract: "market_core", ledger: 11, raw: { topic: rawTopic, value: rawValue } });
+  assert.equal(e?.kind, "Unknown");
+  if (e?.kind !== "Unknown") return;
+  assert.equal(e.name, "FutureEventV9");
+  assert.ok(e.raw, "unknown variant must retain raw XDR");
+  assert.equal(e.raw.topic[0].toXDR("base64"), rawTopic[0].toXDR("base64"));
+  assert.equal(e.raw.value.toXDR("base64"), rawValue.toXDR("base64"));
+});
+
+test("every supported interface version decodes its fixture", async () => {
+  const decoder = await testDecoder();
+  const versions = decoder.versions();
+  assert.ok(versions.length > 0, "at least one interface version must be registered");
+  for (const version of versions) {
+    const spec = decoder.spec("market_core", version);
+    const { topic, value } = encodeEvent(spec, "MarketResolved", { market_id: 1n, outcome: undefined });
+    const decoded = decoder.decode({
+      id: "1",
+      type: "contract",
+      ledger: 1,
+      ledgerClosedAt: new Date().toISOString(),
+      transactionIndex: 0,
+      operationIndex: 0,
+      inSuccessfulContractCall: true,
+      txHash: "00",
+      contractId: new Contract(IDS.market_core),
+      topic,
+      value,
+    });
+    assert.equal(decoded?.kind, "MarketResolved", `version ${version} must decode MarketResolved`);
+    assert.equal(decoded?.kind === "MarketResolved" ? decoded.marketId : -1n, 1n);
+  }
+});
+
+test("a malformed payload for a known event is Unknown, never a success-shaped fallback", async () => {
+  const decoder = await testDecoder();
+  const spec = decoder.spec("market_core");
+  const { topic } = encodeEvent(spec, "MarketResolved", { market_id: 1n, outcome: undefined });
+  const decoded = decoder.decode({
+    id: "1",
+    type: "contract",
+    ledger: 1,
+    ledgerClosedAt: new Date().toISOString(),
+    transactionIndex: 0,
+    operationIndex: 0,
+    inSuccessfulContractCall: true,
+    txHash: "00",
+    contractId: new Contract(IDS.market_core),
+    topic,
+    value: xdr.ScVal.scvVoid(),
+  });
+  assert.equal(decoded?.kind, "Unknown");
+  assert.equal(decoded?.kind === "Unknown" ? decoded.name : "x", "MarketResolved");
+});
