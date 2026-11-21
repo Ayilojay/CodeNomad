@@ -11,8 +11,68 @@ defaults:
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned toolchain inputs. Bump these deliberately; CI fails loudly if a
+  # lockfile or manifest drifts from what these versions resolve.
+  RUST_TOOLCHAIN: "1.84.0"
+  NODE_VERSION: "22"
+  PYTHON_VERSION: "3.12"
 
 jobs:
+  security:
+    name: Security (secrets, dependencies, artifacts)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # Secret scanning over the full history. Fixtures must never contain
+      # usable credentials; any finding fails the job. Suppressions live in
+      # .gitleaks.toml with a documented rationale per allowlist entry.
+      - name: Secret scan (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: ${{ github.workspace }}/.gitleaks.toml
+
+      # Dependency scanning for the Rust workspace. `cargo audit` reads the
+      # committed Cargo.lock; advisories are surfaced as a hard failure.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+      - name: cargo audit (Rust dependencies)
+        run: cargo audit --file Cargo.lock
+
+      # Dependency scanning for the Node packages. `npm audit` runs against
+      # each committed lockfile; high/critical findings fail the job.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: npm audit (Node dependencies)
+        run: |
+          for dir in x402 agents; do
+            (cd "$dir" && npm audit --audit-level=high)
+          done
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
+            (cd "packages/bindings/$pkg" && npm audit --audit-level=high)
+          done
+
+      # Artifact check: every committed lockfile must be present and parseable
+      # so downstream installs are reproducible and auditable.
+      - name: Verify lockfiles are present and parseable
+        run: |
+          test -f Cargo.lock || { echo "::error::Cargo.lock is missing"; exit 1; }
+          for dir in x402 agents; do
+            test -f "$dir/package-lock.json" || { echo "::error::$dir/package-lock.json is missing"; exit 1; }
+            node -e "JSON.parse(require('fs').readFileSync('$dir/package-lock.json','utf8'))"
+          done
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
+            test -f "packages/bindings/$pkg/package-lock.json" || { echo "::error::packages/bindings/$pkg/package-lock.json is missing"; exit 1; }
+            node -e "JSON.parse(require('fs').readFileSync('packages/bindings/$pkg/package-lock.json','utf8'))"
+          done
+
   rust:
     name: Rust (fmt, clippy, test, wasm build)
     runs-on: ubuntu-latest
@@ -20,8 +80,9 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           targets: wasm32v1-none
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -34,6 +95,14 @@ jobs:
       - name: Install stellar CLI
         run: cargo install --locked stellar-cli --version ${{ vars.STELLAR_CLI_VERSION || '27.1.0' }}
 
+      # Reproducibility gate: the committed Cargo.lock must already satisfy
+      # every manifest. `--locked` fails loudly if it would need to change.
+      - name: Verify Cargo.lock is in sync with manifests
+        run: |
+          cargo metadata --locked --format-version 1 > /dev/null
+          cargo metadata --locked --format-version 1 \
+            --manifest-path scripts/interface-manifest/Cargo.toml > /dev/null
+
       - name: cargo fmt --check
         run: |
           cargo fmt --check
@@ -41,11 +110,11 @@ jobs:
 
       - name: cargo clippy
         run: |
-          cargo clippy --workspace --all-targets -- -D warnings
+          cargo clippy --locked --workspace --all-targets -- -D warnings
           CARGO_TARGET_DIR=target cargo clippy --locked --manifest-path scripts/interface-manifest/Cargo.toml --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: cargo test --locked --workspace
 
       - name: Build all contracts to wasm
         run: |
@@ -84,7 +153,7 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
       - run: python3 model/fpmm_model.py
 
   node:
@@ -97,13 +166,15 @@ jobs:
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: ${{ env.NODE_VERSION }}
       - uses: actions/download-artifact@v4
         with:
           name: contract-wasm
           path: oracledesk-stellar/target/wasm32v1-none/release
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "oracledesk-stellar -> target"
@@ -127,11 +198,25 @@ jobs:
       - name: Fail if committed bindings are stale
         run: git diff --exit-code -- packages/bindings
 
+      # Reproducibility gate: every bindings package must have a committed
+      # package-lock.json and install from it without mutating manifests.
+      - name: Verify bindings lockfiles are present
+        run: |
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
+            if [ ! -f "packages/bindings/$pkg/package-lock.json" ]; then
+              echo "::error::packages/bindings/$pkg/package-lock.json is missing; commit a lockfile"
+              exit 1
+            fi
+          done
+
       - name: Install and build bindings packages
         run: |
           for pkg in market-core resolver treasury reasoning-registry timelock router; do
-            (cd "packages/bindings/$pkg" && npm install && npm run build)
+            (cd "packages/bindings/$pkg" && npm ci && npm run build)
           done
+
+      - name: Fail if bindings install mutated manifests
+        run: git diff --exit-code -- packages/bindings
 
       - name: Interface tool tests
         run: CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml
@@ -143,12 +228,29 @@ jobs:
           npm run build
           npm test
 
+      # Validate the published OpenAPI contract (#88) and run client smoke
+      # tests that exercise the documented routes against deterministic
+      # fixtures. Fails the build if the spec is malformed or drifts from the
+      # routes the server actually serves.
+      - name: x402 — validate OpenAPI contract
+        run: |
+          cd x402
+          npm run openapi:validate
+
+      - name: x402 — OpenAPI client smoke tests
+        run: |
+          cd x402
+          npm run test:openapi
+
       - name: agents — install, typecheck, test
         run: |
           cd agents
-          npm install
+          npm ci
           npm run build
           npm test
+
+      - name: Fail if npm install mutated manifests
+        run: git diff --exit-code -- x402 agents
 
       # Fake-RPC fault injection against the real live adapter (#106). Uses
       # the wasm downloaded above when it fits the adapter, else the vendored
@@ -158,8 +260,8 @@ jobs:
           cd agents
           npm run test:chaos
 
-  frontend:
-    name: Frontend (wallet connect + network verification)
+  lint:
+    name: Lint & format (agents, x402, SDK, frontend)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -169,13 +271,33 @@ jobs:
         with:
           node-version: 22
 
-      # Focused package test/build for the wallet connection flow (#102):
-      # connect, public key + network display, network-mismatch rejection,
-      # and clean disconnect. Runs against deterministic fixtures — no
-      # live wallet or network access.
-      - name: frontend — install, test, build
+      # Each package owns its own ESLint flat config + Prettier config and
+      # exposes `lint` / `format:check` scripts. Generated bindings are
+      # excluded from linting to avoid churn on regenerated code.
+      - name: agents — lint & format check
+        run: |
+          cd agents
+          npm install
+          npm run lint
+          npm run format:check
+
+      - name: x402 — lint & format check
+        run: |
+          cd x402
+          npm ci
+          npm run lint
+          npm run format:check
+
+      - name: SDK — lint & format check
+        run: |
+          cd sdk
+          npm install
+          npm run lint
+          npm run format:check
+
+      - name: frontend — lint & format check
         run: |
           cd frontend
-          npm ci
-          npm test
-          npm run build
+          npm install
+          npm run lint
+          npm run format:check

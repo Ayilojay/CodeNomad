@@ -2,13 +2,13 @@
   "name": "codenomad-frontend",
   "version": "0.1.0",
   "private": true,
+  "description": "CodeNomad frontend with explicit local, testnet and future network selection",
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
-    "test": "node --test"
-  },
-  "dependencies": {
-    "@creit.tech/stellar-wallets-kit": "^1.7.1"
+    "lint": "eslint .",
+    "format": "prettier --check .",
+    "format:write": "prettier --write ."
   },
   "engines": {
     "node": ">=18"
