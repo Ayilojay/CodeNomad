@@ -1,32 +1,31 @@
-# Bindings Release Pipeline Implementation Plan
+# Bindings Release Pipeline
 
-## Overview
-Implementation plan for adding a complete release pipeline for `@oracledesk/bindings-*` packages with semantic versioning, changelogs, npm publishing with provenance, and wasm hash tracking.
+This document describes how generated bindings and WASM artifacts are produced,
+verified, and released for the OracleDesk Stellar contracts.
 
-## Current State Analysis
+## Supported toolchains
 
-### Already Implemented ✅
-- `scripts/gen-bindings.sh` preserves versions, CHANGELOG.md, and package-lock.json across regeneration
-- Interface snapshots extracted to `interface.json` via `scripts/interface-manifest`
-- Packages already at v0.1.0 with scoped names (`@oracledesk/bindings-<name>`)
-- Six bindings packages: market-core, resolver, reasoning-registry, treasury, timelock, router
+The pipeline is validated against a matrix of toolchain versions. The
+**minimum** column is the oldest version we support; the **pinned** column is
+the version used for release artifacts and determinism checks.
 
-### Missing Components ❌
-- `package.json` metadata: `files`, `repository`, `license`, `publishConfig`, `keywords`, `oracledesk.wasmSha256`
-- Semantic versioning automation based on contract interface diffs
-- Changesets integration for version bumps and changelog generation
-- Root-level release workflow (`/.github/workflows/release-bindings.yml`)
-- Package validation scripts
-- Documentation for downstream consumers
-- CI job for testing packed tarballs
+| Tool          | Minimum supported | Pinned CI / release |
+| ------------- | ----------------- | ------------------- |
+| Rust          | 1.74.0            | 1.79.0              |
+| Node.js       | 18.18.0           | 20.11.0             |
+| Stellar CLI   | 21.0.0            | 21.1.0              |
 
-## Implementation Steps
+Any combination outside these ranges is **unsupported**. The CI matrix job
+(`bindings-toolchain-matrix`) runs the focused build/test suite for each
+supported combination and fails loudly on unsupported combinations — there is
+no silent fallback to a different toolchain.
 
-### 1. Package Metadata Enhancement
+## CI matrix
 
-**File:** `oracledesk-stellar/scripts/gen-bindings.sh` (modify)
+The `bindings-toolchain-matrix` workflow job runs the following combinations:
 
-Add metadata merge step after `stellar contract bindings typescript`:
+- **minimum**: Rust 1.74.0, Node 18.18.0, Stellar CLI 21.0.0
+- **pinned**: Rust 1.79.0, Node 20.11.0, Stellar CLI 21.1.0
 
 ```bash
 # After the bindings generation and before the jq .name/.version step:
