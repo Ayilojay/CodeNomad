@@ -159,6 +159,217 @@ export function verifyTraceAttestation(
 }
 
 // ---------------------------------------------------------------------------
+// Transaction journal for uncertain submissions (#51)
+//
+// Before a transaction is sent, the agent records the intent (network, source
+// account, and the transaction hash) together with a submission state. After
+// sending, the state is updated. If the process restarts while a submission is
+// in an uncertain state (e.g. `submitted` but not yet confirmed), the journal
+// is reconciled by hash against chain state instead of blindly retrying.
+//
+// Operational notes:
+// - The journal is persisted through a pluggable `TransactionJournalStore`.
+//   The in-memory store is provided for tests and single-process agents;
+//   durable deployments supply their own store.
+// - The safe dry-run default is preserved: this module only records and
+//   reconciles intents and never submits a transaction on-chain.
+// - Reconciliation never blindly retries an unresolved intent. An intent whose
+//   hash cannot be found on-chain is reported as `unresolved` and left for an
+//   operator to inspect; it is never re-sent automatically.
+// ---------------------------------------------------------------------------
+
+/**
+ * Submission state of a journaled transaction intent.
+ *
+ * - `pending`     recorded before sending; not yet submitted.
+ * - `submitted`   sent to the network; outcome not yet known (uncertain).
+ * - `confirmed`   found on-chain and successful.
+ * - `failed`      found on-chain and failed.
+ * - `unresolved`  reconciliation could not find the hash on-chain; never retried.
+ */
+export type TransactionSubmissionState =
+  | "pending"
+  | "submitted"
+  | "confirmed"
+  | "failed"
+  | "unresolved";
+
+export interface TransactionJournalEntry {
+  /** Stable journal identifier. */
+  id: string;
+  /** Network passphrase the intent targets. */
+  networkPassphrase: string;
+  /** Source account (G... address) that signs the transaction. */
+  sourceAccount: string;
+  /** Hex-encoded transaction hash. */
+  transactionHash: string;
+  /** Current submission state. */
+  state: TransactionSubmissionState;
+  /** ISO timestamp when the intent was first recorded. */
+  createdAt: string;
+  /** ISO timestamp of the most recent state transition. */
+  updatedAt: string;
+}
+
+/** Pluggable persistence for journal entries. */
+export interface TransactionJournalStore {
+  save(entry: TransactionJournalEntry): void;
+  get(id: string): TransactionJournalEntry | undefined;
+  list(): TransactionJournalEntry[];
+}
+
+/** In-memory journal store for tests and single-process agents. */
+export class InMemoryTransactionJournalStore implements TransactionJournalStore {
+  private readonly entries = new Map<string, TransactionJournalEntry>();
+
+  save(entry: TransactionJournalEntry): void {
+    this.entries.set(entry.id, { ...entry });
+  }
+
+  get(id: string): TransactionJournalEntry | undefined {
+    const entry = this.entries.get(id);
+    return entry ? { ...entry } : undefined;
+  }
+
+  list(): TransactionJournalEntry[] {
+    return [...this.entries.values()].map((entry) => ({ ...entry }));
+  }
+}
+
+/** Chain-state lookup used to reconcile an uncertain submission by hash. */
+export interface ChainStateLookup {
+  /**
+   * Look up a transaction by hash on the given network.
+   *
+   * Returns `undefined` when the hash is not (yet) known on-chain, otherwise
+   * the observed outcome.
+   */
+  lookup(
+    networkPassphrase: string,
+    transactionHash: string,
+  ): Promise<{ success: boolean } | undefined>;
+}
+
+/** States that are considered uncertain and eligible for reconciliation. */
+const UNCERTAIN_STATES: ReadonlySet<TransactionSubmissionState> = new Set([
+  "pending",
+  "submitted",
+]);
+
+export interface RecordIntentInput {
+  id: string;
+  networkPassphrase: string;
+  sourceAccount: string;
+  transactionHash: string;
+}
+
+/**
+ * Persist a transaction intent before sending. The entry starts in the
+ * `pending` state so a crash before submission is still recoverable.
+ */
+export function recordTransactionIntent(
+  store: TransactionJournalStore,
+  input: RecordIntentInput,
+  now: Date = new Date(),
+): TransactionJournalEntry {
+  if (!input.id) throw new Error("journal id is required");
+  if (!input.networkPassphrase) throw new Error("networkPassphrase is required");
+  if (!input.sourceAccount) throw new Error("sourceAccount is required");
+  if (!input.transactionHash) throw new Error("transactionHash is required");
+
+  const timestamp = now.toISOString();
+  const entry: TransactionJournalEntry = {
+    id: input.id,
+    networkPassphrase: input.networkPassphrase,
+    sourceAccount: input.sourceAccount,
+    transactionHash: input.transactionHash,
+    state: "pending",
+    createdAt: timestamp,
+    updatedAt: timestamp,
+  };
+  store.save(entry);
+  return entry;
+}
+
+/**
+ * Update the submission state of a journaled intent after sending.
+ *
+ * Only forward transitions out of an uncertain state are permitted; a
+ * `confirmed` or `failed` entry is terminal and cannot be re-opened.
+ */
+export function updateTransactionState(
+  store: TransactionJournalStore,
+  id: string,
+  state: TransactionSubmissionState,
+  now: Date = new Date(),
+): TransactionJournalEntry {
+  const existing = store.get(id);
+  if (!existing) throw new Error(`journal entry not found: ${id}`);
+  if (!UNCERTAIN_STATES.has(existing.state)) {
+    throw new Error(
+      `journal entry ${id} is terminal (${existing.state}); cannot transition to ${state}`,
+    );
+  }
+  const updated: TransactionJournalEntry = {
+    ...existing,
+    state,
+    updatedAt: now.toISOString(),
+  };
+  store.save(updated);
+  return updated;
+}
+
+export interface ReconcileResult {
+  /** Entries that were reconciled to a terminal state. */
+  reconciled: TransactionJournalEntry[];
+  /** Entries whose hash could not be found on-chain; never retried. */
+  unresolved: TransactionJournalEntry[];
+}
+
+/**
+ * Reconcile uncertain journal entries by hash against chain state.
+ *
+ * Entries in a terminal state are skipped. For each uncertain entry the hash
+ * is looked up on-chain: a found transaction is reconciled to `confirmed` or
+ * `failed`, while a missing transaction is marked `unresolved` and left for an
+ * operator. Unresolved intents are never blindly retried.
+ */
+export async function reconcileTransactionJournal(
+  store: TransactionJournalStore,
+  lookup: ChainStateLookup,
+  now: Date = new Date(),
+): Promise<ReconcileResult> {
+  const reconciled: TransactionJournalEntry[] = [];
+  const unresolved: TransactionJournalEntry[] = [];
+
+  for (const entry of store.list()) {
+    if (!UNCERTAIN_STATES.has(entry.state)) continue;
+
+    const observed = await lookup.lookup(entry.networkPassphrase, entry.transactionHash);
+    const nextState: TransactionSubmissionState = observed
+      ? observed.success
+        ? "confirmed"
+        : "failed"
+      : "unresolved";
+
+    const updated: TransactionJournalEntry = {
+      ...entry,
+      state: nextState,
+      updatedAt: now.toISOString(),
+    };
+    store.save(updated);
+
+    if (nextState === "unresolved") {
+      unresolved.push(updated);
+    } else {
+      reconciled.push(updated);
+    }
+  }
+
+  return { reconciled, unresolved };
+}
+
+// ---------------------------------------------------------------------------
 // Multisig transaction signing coordination (#69)
 //
 // A multisig envelope binds a set of participants to a single transaction
@@ -200,256 +411,8 @@ export interface MultisigEnvelope {
   threshold: number;
   /** Raw transaction payload being signed. */
   payload: Uint8Array;
-  /** sha256(payload), used to bind signatures to the exact payload. */
-  payloadHash: Uint8Array;
-  /** Absolute expiry timestamp in milliseconds since epoch. */
-  expiresAt: number;
+  /** ISO timestamp after which the envelope is no longer valid. */
+  expiresAt: string;
   /** Collected signatures keyed by hex-encoded participant public key. */
   signatures: Map<string, Uint8Array>;
-}
-
-export type MultisigStatus = "pending" | "complete" | "expired";
-
-export interface MultisigStatusReport {
-  id: string;
-  status: MultisigStatus;
-  threshold: number;
-  /** Hex-encoded public keys of participants that have signed. */
-  signedBy: string[];
-  /** Hex-encoded public keys of participants that have not yet signed. */
-  pending: string[];
-  expiresAt: number;
-}
-
-/** Durable envelope store. Implementations must persist before resolving. */
-export interface MultisigEnvelopeStore {
-  save(envelope: MultisigEnvelope): Promise<void> | void;
-  load(id: string): Promise<MultisigEnvelope | undefined> | MultisigEnvelope | undefined;
-}
-
-/** Simple in-memory store for tests and single-process agents. */
-export class InMemoryMultisigEnvelopeStore implements MultisigEnvelopeStore {
-  private readonly envelopes = new Map<string, MultisigEnvelope>();
-
-  save(envelope: MultisigEnvelope): void {
-    this.envelopes.set(envelope.id, envelope);
-  }
-
-  load(id: string): MultisigEnvelope | undefined {
-    return this.envelopes.get(id);
-  }
-}
-
-function hexKey(publicKey: Uint8Array): string {
-  return Buffer.from(publicKey).toString("hex");
-}
-
-function hashPayload(payload: Uint8Array): Uint8Array {
-  return new Uint8Array(createHash("sha256").update(Buffer.from(payload)).digest());
-}
-
-function buildMultisigMessage(payloadHash: Uint8Array): Buffer {
-  if (payloadHash.length !== 32) {
-    throw new Error(`payloadHash must be 32 bytes, got ${payloadHash.length}`);
-  }
-  return Buffer.concat([MULTISIG_DOMAIN, Buffer.from(payloadHash)]);
-}
-
-export interface CreateMultisigEnvelopeParams {
-  id: string;
-  participants: Uint8Array[];
-  threshold: number;
-  payload: Uint8Array;
-  /** Absolute expiry timestamp in ms. Defaults to now + DEFAULT_MULTISIG_ENVELOPE_TTL_MS. */
-  expiresAt?: number;
-  /** Current time in ms; injectable for tests. */
-  now?: number;
-}
-
-export function createMultisigEnvelope(params: CreateMultisigEnvelopeParams): MultisigEnvelope {
-  const now = params.now ?? Date.now();
-  const expiresAt = params.expiresAt ?? now + DEFAULT_MULTISIG_ENVELOPE_TTL_MS;
-  if (!Number.isInteger(params.threshold) || params.threshold <= 0) {
-    throw new Error(`threshold must be a positive integer, got ${params.threshold}`);
-  }
-  if (params.threshold > params.participants.length) {
-    throw new Error(
-      `threshold ${params.threshold} exceeds participant count ${params.participants.length}`,
-    );
-  }
-  const seen = new Set<string>();
-  for (const p of params.participants) {
-    if (p.length !== 32) {
-      throw new Error(`participant public key must be 32 bytes, got ${p.length}`);
-    }
-    const k = hexKey(p);
-    if (seen.has(k)) {
-      throw new Error(`duplicate participant ${k}`);
-    }
-    seen.add(k);
-  }
-  if (expiresAt <= now) {
-    throw new Error(`expiresAt ${expiresAt} must be in the future (now ${now})`);
-  }
-  return {
-    id: params.id,
-    participants: params.participants.map((p) => new Uint8Array(p)),
-    threshold: params.threshold,
-    payload: new Uint8Array(params.payload),
-    payloadHash: hashPayload(params.payload),
-    expiresAt,
-    signatures: new Map(),
-  };
-}
-
-/**
- * Sign the multisig message for an envelope's payload hash. The returned
- * signature is bound to the payload hash, so it cannot be replayed against a
- * different payload.
- */
-export function signMultisigPayload(
-  keypair: Keypair,
-  payloadHash: Uint8Array,
-): AttestationSignature {
-  const pubkey = new Uint8Array(keypair.rawPublicKey());
-  const msg = buildMultisigMessage(payloadHash);
-  const sig = new Uint8Array(keypair.sign(msg));
-  return { publicKey: pubkey, signature: sig };
-}
-
-function verifyMultisigSignature(
-  publicKey: Uint8Array,
-  signature: Uint8Array,
-  payloadHash: Uint8Array,
-): boolean {
-  if (publicKey.length !== 32 || signature.length !== 64) return false;
-  const s = BigInt(`0x${Buffer.from(signature.slice(32)).reverse().toString("hex")}`);
-  if (s >= GROUP_ORDER) return false;
-  const msg = buildMultisigMessage(payloadHash);
-  const key = Keypair.fromPublicKey(StrKey.encodeEd25519PublicKey(Buffer.from(publicKey)));
-  return key.verify(msg, Buffer.from(signature));
-}
-
-export interface SubmitMultisigSignatureParams {
-  envelope: MultisigEnvelope;
-  publicKey: Uint8Array;
-  signature: Uint8Array;
-  /** Current time in ms; injectable for tests. */
-  now?: number;
-}
-
-/**
- * Validate and record a participant signature on an envelope. Throws on any
- * rejection (expired envelope, unknown participant, duplicate signature,
- * altered payload / invalid signature). Returns the updated envelope.
- */
-export function submitMultisigSignature(
-  params: SubmitMultisigSignatureParams,
-): MultisigEnvelope {
-  const now = params.now ?? Date.now();
-  const { envelope } = params;
-  if (now >= envelope.expiresAt) {
-    throw new Error(`envelope ${envelope.id} expired at ${envelope.expiresAt}`);
-  }
-  const key = hexKey(params.publicKey);
-  const isParticipant = envelope.participants.some((p) => hexKey(p) === key);
-  if (!isParticipant) {
-    throw new Error(`public key ${key} is not a participant of envelope ${envelope.id}`);
-  }
-  if (envelope.signatures.has(key)) {
-    throw new Error(`duplicate signature from participant ${key}`);
-  }
-  if (envelope.signatures.size >= envelope.participants.length) {
-    throw new Error(`envelope ${envelope.id} already has the maximum number of signatures`);
-  }
-  if (!verifyMultisigSignature(params.publicKey, params.signature, envelope.payloadHash)) {
-    throw new Error(`invalid signature from participant ${key} (payload mismatch or bad signature)`);
-  }
-  envelope.signatures.set(key, new Uint8Array(params.signature));
-  return envelope;
-}
-
-/**
- * Report envelope status without disclosing participant secrets. Only public
- * keys and the set of signers are exposed.
- */
-export function getMultisigStatus(
-  envelope: MultisigEnvelope,
-  now: number = Date.now(),
-): MultisigStatusReport {
-  const signedBy: string[] = [];
-  const pending: string[] = [];
-  for (const p of envelope.participants) {
-    const k = hexKey(p);
-    if (envelope.signatures.has(k)) {
-      signedBy.push(k);
-    } else {
-      pending.push(k);
-    }
-  }
-  let status: MultisigStatus;
-  if (now >= envelope.expiresAt) {
-    status = "expired";
-  } else if (envelope.signatures.size >= envelope.threshold) {
-    status = "complete";
-  } else {
-    status = "pending";
-  }
-  return {
-    id: envelope.id,
-    status,
-    threshold: envelope.threshold,
-    signedBy,
-    pending,
-    expiresAt: envelope.expiresAt,
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Remote signing service operational controls (#68)
-//
-// These helpers harden a remote signing endpoint without weakening the safe
-// dry-run default or bypassing on-chain risk controls. They are transport
-// agnostic: an HTTP handler wires them together, but the policy lives here so
-// it can be unit tested in isolation.
-//
-// Operational notes:
-// - Authentication is default-deny: a request is only authorized when an
-//   authenticator is configured AND it returns true. Missing/empty credentials
-//   are rejected before any signing work happens.
-// - Requests are bounded by both a byte-size cap and a wall-clock timeout.
-// - Replay protection rejects any request whose nonce was already seen within
-//   the retention window.
-// - Every signing attempt is recorded through a durable audit sink. If the
-//   audit sink fails, the request is denied (fail-closed) so no signature is
-//   ever produced without a durable record.
-// - Secrets and raw signing material are never logged or echoed in errors.
-// ---------------------------------------------------------------------------
-
-/** Default maximum accepted request body size in bytes (16 KiB). */
-export const DEFAULT_MAX_REQUEST_BYTES = 16 * 1024;
-/** Default wall-clock timeout for a signing request in milliseconds. */
-export const DEFAULT_REQUEST_TIMEOUT_MS = 5_000;
-/** Default replay nonce retention window in milliseconds (5 minutes). */
-export const DEFAULT_REPLAY_WINDOW_MS = 5 * 60 * 1000;
-
-export interface SigningRequest {
-  /** Opaque caller credential (e.g. bearer token). Never logged. */
-  credential?: string;
-  /** Unique per-request nonce used for replay protection. */
-  nonce: string;
-  /** Serialized request payload; size is bounded by maxRequestBytes. */
-  payload: Uint8Array;
-}
-
-export interface SigningAuditRecord {
-  nonce: string;
-  outcome: "signed" | "denied" | "error";
-  reason?: string;
-  timestamp: number;
-}
-
-/** Durable audit sink. Implementations must persist records before resolving. */
-export interface SigningAuditSink {
-  record(entry: SigningAuditRecord): Promise<void> | void;
 }

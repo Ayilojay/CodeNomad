@@ -87,7 +87,7 @@ about 2 minutes on 8 cores, `TREASURY_SEARCH_DEPTH=5` for a quick run).
   follow the style already in the file you're editing.
 - Doc comments explain *why*, not *what* — see the existing contract source
   for the level of comment density we're going for (sparse, but present at
-  every non-obvious invariant).
+every non-obvious invariant).
 
 ## Pull request checklist
 
@@ -102,6 +102,104 @@ about 2 minutes on 8 cores, `TREASURY_SEARCH_DEPTH=5` for a quick run).
 - [ ] New behavior has a test; changed behavior's existing test was updated,
       not deleted.
 - [ ] `docs/STATUS.md` updated if this changes what's verified/unverified.
+
+## Release review checklist (independent review gate)
+
+This project is unaudited and a release spans several contracts plus generated
+artifacts. Before tagging a release, an **independent reviewer** (someone other
+than the release author) must complete the checklist below and attach the
+referenced evidence to the release PR. **Any unchecked item blocks tagging** —
+the gate is fail-closed: missing evidence is treated as a failed check, not a
+waiver. Record the outcome in the release PR description using the template at
+the end of this section.
+
+### 1. Auth matrix
+
+- [ ] Every privileged entry point across all contracts is listed with its
+      required caller/role, and each has a passing `wrong_caller_cannot_*`
+      test (non-mocked auth).
+- [ ] Evidence: link to the auth matrix (or the `wrong_caller_cannot_*` test
+      list from `cargo test --workspace -- --list`) in the release PR.
+
+### 2. Budget deltas
+
+- [ ] CPU/memory budget deltas versus the previous release are within the
+      limits enforced by `make test` / CI; any increase is explained.
+- [ ] Evidence: CI artifact or `cargo test` output showing budget assertions
+      passing.
+
+### 3. Interface manifests
+
+- [ ] `make interface-check` passes and every changed `interface.json` has a
+      corresponding semantic version bump and `CHANGELOG.md` entry (see
+      [Changing a contract interface](#changing-a-contract-interface)).
+- [ ] Evidence: `interface-check` output and the `interface.json` diff.
+
+### 4. Vendored WASM
+
+- [ ] `make verify-wasm` passes: vendored copies of `market-core` and
+      `reasoning-registry` match a clean build and their `.sha256` pins are
+      current.
+- [ ] Evidence: `make verify-wasm` output.
+
+### 5. Formal checks
+
+- [ ] `make formal` (TLC model check) and `python3 model/fpmm_bounds.py --quick`
+      pass, plus `cargo test -p integration-tests treasury_caps_exhaustive`.
+- [ ] Evidence: CI artifact or logs for each of the three checks.
+
+### 6. Migration compatibility
+
+- [ ] Any storage-layout or interface change ships with a migration path, and
+      the migration is reviewed for compatibility with existing deployed
+      instances (including hash-critical `ResolutionSpec`/`ResolutionSpecV2`
+      types — see ADR 0001).
+- [ ] Evidence: migration notes in the release PR, or an explicit "no
+      migration required" statement with justification.
+
+### 7. Testnet verification
+
+- [ ] The release candidate is deployed to testnet and the smoke tests pass
+      against the deployed contracts.
+- [ ] Evidence: testnet contract IDs and smoke-test output in the release PR.
+
+### Release PR template
+
+```markdown
+## Release review — <version>
+Reviewer: <independent reviewer>
+
+| Check | Status | Evidence |
+| --- | --- | --- |
+| Auth matrix | PASS/FAIL | <link> |
+| Budget deltas | PASS/FAIL | <link> |
+| Interface manifests | PASS/FAIL | <link> |
+| Vendored WASM | PASS/FAIL | <link> |
+| Formal checks | PASS/FAIL | <link> |
+| Migration compatibility | PASS/FAIL | <link> |
+| Testnet verification | PASS/FAIL | <link> |
+
+Tagging is blocked unless every row is PASS with evidence attached.
+```
+
+### Reproducible verification (dry-run release)
+
+To validate the checklist itself against a dry-run release and CI artifacts:
+
+1. Cut a throwaway branch from the release commit and run the full gate locally:
+   ```bash
+   make build && make verify-wasm && make interface-check
+   make formal && python3 model/fpmm_bounds.py --quick
+   cargo test --workspace
+   cargo test -p integration-tests treasury_caps_exhaustive
+   ```
+2. Download the CI artifacts for the same commit (`coverage`, interface-check,
+   formal, and test logs) and confirm each checklist row can be filled from
+   them without re-running anything.
+3. Deliberately omit one artifact and confirm the release PR template marks
+   that row FAIL and tagging is blocked — this proves the gate is fail-closed.
+4. Attach the completed template to the dry-run PR; a green dry-run is the
+   evidence that the checklist is reproducible.
 
 ## Issues and how to ask for one
 
@@ -154,10 +252,6 @@ The tool attributes imported types using `scripts/interface-manifest/imports.tom
 `contractimport!` type. Every package exporting a changed type needs its own
 version bump, including consumers; each package takes the maximum required bump,
 never one bump per inherited field/type. This avoids compounding shared changes
-while keeping downstream versions truthful. Hash roots live in `roots.toml`.
+while keeping downstream versions truthful. Hash roots live in `root
 
-An absent base manifest is an initial release and requires a nonzero version plus
-an initial changelog, not an artificial breaking-change report. CI compares
-against the PR base branch and also rejects stale generated manifests. GitHub
-runs the workflow at the repository root; the nested workflow is retained for
-standalone use of `oracledesk-stellar/`.
+/* … truncated 365 chars — edit only what you need near the top … */

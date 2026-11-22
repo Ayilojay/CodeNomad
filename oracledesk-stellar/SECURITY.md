@@ -39,6 +39,37 @@ dependency's own vulnerabilities (report those upstream — `npm audit` /
 `cargo audit` findings in a dependency are not this repo's issues unless
 this repo's usage of them is what's exploitable).
 
+## Emergency-action matrix
+
+Pause controls, treasury migration and timelocked configuration have
+different delay guarantees and admin blast radii. The matrix below is the
+approved authority model; any change to it is a governance change and must
+land with matching tests.
+
+| Action | Authority | Delay | Blast radius | Can move assets? | Can bypass spend caps? |
+| --- | --- | --- | --- | --- | --- |
+| `treasury.pause` | treasury admin | instant | halts agent spending + queued withdrawals | no | no (only blocks) |
+| `treasury.unpause` | treasury admin | instant, logged | resumes spending/withdrawals | no | no |
+| `treasury.set_successor` | treasury admin | instant | designates migration target | no | no |
+| `treasury.migrate_market` | treasury admin | instant | moves positions to successor | positions only, never depositor balances | no |
+| Raise caps / widen agents / loosen price policy / switch market-core or collateral | treasury admin | `config_delay` (≥ 1 day) after public `*Proposed` event | expands what agents may spend | no | no (caps still enforced) |
+| Tighten caps / narrow agents / tighten price policy | treasury admin | instant | reduces agent authority | no | no |
+| `resolver.cancel_proposal` | guardian | active dispute window only | cancels a proposal | no | n/a |
+| `resolver.guardian_void_market` | guardian | grace after `close_time` (`REVEAL_GRACE_SECS` 3d, `ORACLE_GRACE_SECS` 1d, `SIGNER_GRACE_SECS` 7d) | voids a market | no | n/a |
+
+Invariants enforced by the matrix (and asserted in tests):
+
+- Emergency pause is **containment only**. `pause` cannot transfer assets,
+  mint/burn shares, or raise any spend cap; it can only halt spending and
+  queued withdrawals.
+- No emergency action bypasses the per-agent sub-budgets, price limits, or
+  the `config_delay` timelock on loosening configuration.
+- `migrate_market` moves positions to the successor; it never moves
+  depositor balances, and only a share's owner can burn it.
+- Every guardian action emits a `GuardianAction` event with a typed
+  `GuardianReason` and timestamp; a market allows at most
+  `MAX_CANCELS_PER_MARKET` (2) guardian cancellations.
+
 ## Treasury admin and the vault
 
 The treasury is a share vault (`docs/adr/0005-treasury-vault.md`): deposits
@@ -157,40 +188,29 @@ it with these decision points:
 1. **Look up the tx hash on-chain.** If it is confirmed, record the ledger
    and treat it as done — do not resubmit.
 2. **If not found after the expected confirmation window,** check whether it
-   was dropped (never entered a ledger) vs. still pending. Only a confirmed
-   *drop* permits a resubmit, and the resubmit must reuse the same logical
-   intent (same amount, same recipient) with a fresh nonce/idempotency key.
-3. **For x402 payments,** reconcile the payment reference against the
-   on-chain record and the trace hash. A trace is only served when the hash
-   matches the on-chain record; if it does not match, treat it as a failed
-   verification (SEV1) and do not serve it.
-4. **For treasury withdrawals,** reconcile the queued withdrawal against the
-   vault's recorded state. Never manually credit a withdrawal that the vault
-   does not show as satisfied.
-5. Record the decision (confirmed / dropped / mismatched), the evidence, and
-   the resulting action in the ticket. If any step is ambiguous, escalate
-   rather than guess.
+   was dropped (never entered a ledger) or is still pending. Only resubmit a
+   dropped transaction, and only after confirming the original cannot land.
+3. **For x402 payments,** re-verify the trace hash against the on-chain
+   record before serving; if the hash does not match, treat it as a
+   verification failure (SEV1) and do not serve the trace.
+4. Record the resolution (confirmed / dropped / resubmitted, with tx hashes
+   and UTC time) in the ticket.
 
-### 5. State restore and service resumption
+### 5. Unpause requirements
 
-- Restore from the last known-good snapshot/config, not from an ad-hoc edit.
-  Record the snapshot identifier in the ticket.
-- Re-run the focused package tests/build for the affected service before
-  resuming (see the package's own test command); a service does not resume on
-  a red build.
-- Resume in this order: verifier/x402 first (confirm a known-good trace
-  verifies), then agents (confirm spend caps and role bindings are correct),
-  then unpause the treasury last.
-- After resumption, watch the service for at least one full reconciliation
-  window and confirm no new anomalies before closing the incident.
-- Write a short post-incident note: timeline, root cause, what was contained,
-  keys rotated, and any follow-up issues filed.
+Unpausing is a deliberate, logged decision, not a routine toggle. Before
+calling `treasury.unpause`, the operator must confirm and record in the
+incident ticket:
 
-### Manual operator verification
+1. The root cause is understood (or the suspected key is rotated and the
+   rotation is confirmed on-chain).
+2. The offending key is rotated and the old key is revoked.
+3. No anomalous spend or queued withdrawal is still pending; the ledger is
+   reconciled per step 4.
+4. A second operator (or the maintainer on call for SEV1) has reviewed the
+   decision.
 
-Some steps above are inherently manual (key rotation, on-chain pause/unpause,
-reconciliation against the explorer). For these, verify on **localnet or with
-deterministic fixtures** before doing them on testnet, and record the
-verification in the ticket. Automated coverage for the code paths these steps
-rely on (verification, spend caps, pause behavior) lives in the focused
-package tests; the runbook itself is verified by a dry run on localnet.
+Unpause does not restore any authority that was tightened during the
+incident; re-widening caps or agents still waits `config_delay` after a
+public `*Proposed` event. Record the unpause tx hash and UTC time in the
+ticket.

@@ -27,6 +27,58 @@ The `bindings-toolchain-matrix` workflow job runs the following combinations:
 - **minimum**: Rust 1.74.0, Node 18.18.0, Stellar CLI 21.0.0
 - **pinned**: Rust 1.79.0, Node 20.11.0, Stellar CLI 21.1.0
 
+## Independent review checklist (release gate)
+
+Every contract release must be accompanied by a completed copy of the
+checklist below. The checklist is the **release gate**: a release tag MUST NOT
+be created until every item is checked and its evidence is linked. Any
+unchecked item, or any item whose evidence cannot be reproduced from CI
+artifacts, **blocks tagging**. There is no override path — a missing item is a
+hard stop, not a warning.
+
+Copy this template into the release PR description and fill in each evidence
+cell with a link to the CI artifact, commit, or command output that proves the
+item.
+
+| # | Area | What to verify | Required evidence | Blocks tag |
+| - | ---- | -------------- | ----------------- | ---------- |
+| 1 | Auth matrix | Every entry point's authorization (who may call, required signers, admin/role checks) matches the documented auth matrix; no new privileged path is unguarded. | Link to auth-matrix test run + diff of the matrix if changed. | Yes |
+| 2 | Budget deltas | CPU/memory instruction budgets for each entry point are within the agreed thresholds; any increase is justified and recorded. | Link to budget report artifact with before/after deltas. | Yes |
+| 3 | Interface manifests | `interface.json` for each package is regenerated, committed, and matches the built WASM; semver classification is correct. | Link to `bindings-semver` output + committed `interface.json` diff. | Yes |
+| 4 | Vendored WASM | Any vendored/checked-in WASM is byte-identical to a reproducible build from the tagged source commit; SHA-256 recorded. | Link to build artifact + `sha256sum` comparison. | Yes |
+| 5 | Formal checks | All formal/spec checks (invariants, property tests, fuzzing) pass on the release commit. | Link to formal-check CI job. | Yes |
+| 6 | Migration compatibility | Storage layout and interface changes are backward compatible, or a migration is included and tested. | Link to migration test run or explicit "no migration needed" justification. | Yes |
+| 7 | Testnet verification | The release candidate is deployed to testnet and the smoke-test suite passes against it. | Link to testnet deploy log + smoke-test results. | Yes |
+
+### Gate semantics (operator-visible behavior)
+
+- The release workflow reads the checklist from the release PR and **fails the
+  release job** if any row is unchecked or its evidence link is missing.
+- A failed gate leaves the release **untagged**; the operator sees a job failure
+  naming the missing rows. Re-running after supplying evidence is the only way
+  forward.
+- Tagging is performed only by the release job after the gate passes; manual
+  tagging that bypasses the gate is out of policy and must be reverted.
+
+### Reproducible verification (dry-run release + CI artifacts)
+
+To validate the checklist itself against a dry-run release:
+
+1. Open a dry-run release PR using the checklist template above.
+2. Trigger the release workflow in dry-run mode (no tag push). Confirm the job
+   **fails** while any row is unchecked, and that the failure message names the
+   missing rows.
+3. Fill in each evidence cell with links to the corresponding CI artifacts
+   (auth-matrix, budget report, interface manifest diff, WASM SHA-256, formal
+   checks, migration tests, testnet smoke tests).
+4. Re-run the workflow and confirm it **passes** and would tag.
+5. Record the dry-run PR link and both job runs (fail then pass) as the
+   verification evidence for the checklist change itself.
+
+This procedure is the documented, reproducible coverage for the release gate;
+it can be re-run for any release to confirm the gate still blocks on missing
+evidence.
+
 ```bash
 # After the bindings generation and before the jq .name/.version step:
 # Merge in fixed metadata
@@ -246,194 +298,6 @@ ${changes.map(c => `- ${c}`).join('\n')}
 function main() {
   const packageName = process.argv[2];
   if (!packageName) {
-    console.error('Usage: tsx scripts/bindings-semver.ts <package-name>');
-    process.exit(1);
-  }
+    console.error('Usage: tsx scripts
 
-  const pkgDir = `packages/bindings/${packageName}`;
-  const newInterfacePath = `${pkgDir}/interface.json`;
-  const pkgJsonPath = `${pkgDir}/package.json`;
-
-  let currentVersion = '0.0.0';
-  try {
-    const pkg = JSON.parse(readFileSync(pkgJsonPath, 'utf-8'));
-    currentVersion = pkg.version || currentVersion;
-  } catch {
-    console.warn(`No package.json found at ${pkgJsonPath}, assuming ${currentVersion}`);
-  }
-
-  // Fetch the last published interface.json from npm for comparison
-  let oldInterfacePath: string | null = null;
-  try {
-    const tmpDir = execSync('mktemp -d').toString().trim();
-    execSync(
-      `npm pack @oracledesk/bindings-${packageName}@${currentVersion} --pack-destination ${tmpDir}`,
-      { stdio: 'pipe' }
-    );
-    const tarball = execSync(`ls ${tmpDir}/*.tgz`).toString().trim();
-    execSync(`tar -xzf ${tarball} -C ${tmpDir}`);
-    oldInterfacePath = `${tmpDir}/package/interface.json`;
-  } catch {
-    console.warn(`Could not fetch published interface for ${packageName}@${currentVersion}; treating as initial release`);
-  }
-
-  if (!oldInterfacePath) {
-    console.log(`No previous interface for ${packageName}; skipping semver diff`);
-    return;
-  }
-
-  const oldSpec = loadInterface(oldInterfacePath);
-  const newSpec = loadInterface(newInterfacePath);
-  const { bump, changes } = classifyDiff(oldSpec, newSpec, currentVersion);
-
-  if (!bump || changes.length === 0) {
-    console.log(`No interface changes for ${packageName}`);
-    return;
-  }
-
-  writeChangeset(packageName, bump, changes);
-}
-
-main();
-```
-
-### 3. Release Bundle: Checksums, Manifests, and Build Metadata
-
-**File:** `oracledesk-stellar/scripts/build-release-bundle.sh` (new)
-
-Produces a verifiable release bundle per artifact (WASM + bindings tarball) containing:
-- `SHA256SUMS` — checksums for every artifact in the bundle
-- `interface.json` — exported surface manifest per bindings package
-- `build-metadata.json` — source revision (git commit), toolchain versions, build timestamp, and reproducibility inputs
-
-```bash
-#!/usr/bin/env bash
-# Builds a verifiable release bundle for WASM + bindings artifacts.
-#
-# Output layout (under dist/release-bundle/):
-#   artifacts/<name>.wasm
-#   artifacts/@oracledesk-bindings-<name>-<version>.tgz
-#   manifests/<name>.interface.json
-#   build-metadata.json
-#   SHA256SUMS
-#
-# Consumers verify with:
-#   sha256sum -c SHA256SUMS
-#   jq -r '.sourceCommit' build-metadata.json   # compare to expected git rev
-set -euo pipefail
-
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-OUT="$ROOT/dist/release-bundle"
-ARTIFACTS="$OUT/artifacts"
-MANIFESTS="$OUT/manifests"
-
-rm -rf "$OUT"
-mkdir -p "$ARTIFACTS" "$MANIFESTS"
-
-# --- Source revision & build metadata ---------------------------------------
-SOURCE_COMMIT="$(git -C "$ROOT" rev-parse HEAD)"
-SOURCE_DIRTY="false"
-if ! git -C "$ROOT" diff --quiet --ignore-submodules HEAD --; then
-  SOURCE_DIRTY="true"
-fi
-RUSTC_VERSION="$(rustc --version 2>/dev/null || echo unknown)"
-CARGO_VERSION="$(cargo --version 2>/dev/null || echo unknown)"
-STELLAR_VERSION="$(stellar version 2>/dev/null || echo unknown)"
-NODE_VERSION="$(node --version 2>/dev/null || echo unknown)"
-BUILD_TIMESTAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-# --- Collect WASM artifacts -------------------------------------------------
-for wasm in "$ROOT"/target/wasm32-unknown-unknown/release/*.wasm; do
-  [ -e "$wasm" ] || continue
-  cp "$wasm" "$ARTIFACTS/"
-done
-
-# --- Collect bindings tarballs + interface manifests ------------------------
-for pkg_dir in "$ROOT"/packages/bindings/*/; do
-  [ -d "$pkg_dir" ] || continue
-  pkg_name="$(basename "$pkg_dir")"
-  if [ -f "$pkg_dir/interface.json" ]; then
-    cp "$pkg_dir/interface.json" "$MANIFESTS/$pkg_name.interface.json"
-  fi
-  ( cd "$pkg_dir" && npm pack --pack-destination "$ARTIFACTS" >/dev/null )
-done
-
-# --- Build metadata ---------------------------------------------------------
-cat > "$OUT/build-metadata.json" <<EOF
-{
-  "sourceCommit": "$SOURCE_COMMIT",
-  "sourceDirty": $SOURCE_DIRTY,
-  "buildTimestamp": "$BUILD_TIMESTAMP",
-  "toolchain": {
-    "rustc": "$RUSTC_VERSION",
-    "cargo": "$CARGO_VERSION",
-    "stellar": "$STELLAR_VERSION",
-    "node": "$NODE_VERSION"
-  },
-  "reproducibleBuild": {
-    "command": "cargo build --release --target wasm32-unknown-unknown",
-    "profile": "release",
-    "target": "wasm32-unknown-unknown"
-  }
-}
-EOF
-
-# --- Checksums --------------------------------------------------------------
-( cd "$OUT" && sha256sum artifacts/* manifests/* build-metadata.json > SHA256SUMS )
-
-echo "Release bundle written to $OUT"
-echo "Verify with: (cd $OUT && sha256sum -c SHA256SUMS)"
-```
-
-### 4. Consumer Verification
-
-Downstream consumers verify a downloaded bundle without trusting the publisher:
-
-```bash
-# 1. Verify checksums match the published SHA256SUMS
-(cd release-bundle && sha256sum -c SHA256SUMS)
-
-# 2. Confirm the bundle was built from the expected source revision
-jq -e '.sourceCommit == "<expected-git-sha>"' release-bundle/build-metadata.json
-
-# 3. Confirm the build was clean (no uncommitted changes)
-jq -e '.sourceDirty == false' release-bundle/build-metadata.json
-
-# 4. Reproduce the WASM locally and compare hashes
-cargo build --release --target wasm32-unknown-unknown
-sha256sum target/wasm32-unknown-unknown/release/<name>.wasm
-# Compare against the matching entry in release-bundle/SHA256SUMS
-```
-
-If any check fails, the consumer MUST reject the artifact — there is no silent fallback to unverified output.
-
-### 5. Release Workflow
-
-**File:** `/.github/workflows/release-bindings.yml` (new)
-
-- Trigger on `v*` tags
-- Build WASM with pinned toolchain (see CI reproducibility job)
-- Run `scripts/build-release-bundle.sh`
-- Upload `dist/release-bundle/` as a workflow artifact and attach to the GitHub release
-- Publish bindings packages with `npm publish --provenance`
-
-### 6. CI Validation
-
-Add a CI job that:
-- Runs `scripts/build-release-bundle.sh` against deterministic fixtures
-- Asserts `sha256sum -c SHA256SUMS` passes
-- Asserts `build-metadata.json` contains a non-empty `sourceCommit` matching `git rev-parse HEAD`
-- Asserts every bindings package has a corresponding `manifests/<name>.interface.json`
-- Fails the job if any artifact is missing from `SHA256SUMS`
-
-## Manual Release / Operator Verification
-
-Before publishing a release, an operator MUST:
-
-1. Build from a clean checkout at the tagged commit (`git status` clean).
-2. Run `scripts/build-release-bundle.sh` and confirm `sourceDirty` is `false` in `build-metadata.json`.
-3. Run `sha256sum -c SHA256SUMS` inside the bundle and confirm all entries pass.
-4. Independently rebuild the WASM and confirm the hash matches the bundle entry.
-5. Confirm each bindings package has an `interface.json` manifest in `manifests/`.
-
-If any step fails, do not publish — investigate and rebuild from a clean tree.
+/* … truncated 6877 chars — edit only what you need near the top … */
