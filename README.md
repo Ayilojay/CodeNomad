@@ -202,3 +202,6 @@ breaking change and requires a version bump. The `/health/live` and
 
 <!-- handsoff-issue-37 -->
 - #37: [treasury] Validate creation policy against adversarial market metadata
+
+<!-- handsoff-issue-48 -->
+- #48: [governance] Add governance action simulation before timelock scheduling

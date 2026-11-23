@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean interface-check
+.PHONY: setup build test lint fmt deploy-testnet deploy-timelock seed-market demo bindings clean interface-check
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -100,8 +100,39 @@ coverage-gate:
 formal:
 	./scripts/formal.sh
 
+# Default deploy: the deployer EOA is admin (unchanged behavior).
 deploy-testnet: build
 	./scripts/deploy-testnet.sh
+
+# Timelock-admin deployment mode (issue #46). Opt-in: the deployer EOA is NOT
+# left as admin. The script deploys, proposes the timelock as admin on each
+# contract, verifies the accepted admin, and writes a machine-readable
+# manifest of proposals/handovers. Re-runs are idempotent and resumable via
+# the manifest at $(TIMELOCK_MANIFEST) (default: deploy/timelock-manifest.json).
+#
+#   make deploy-timelock TIMELOCK_ADMIN=<G...>
+#
+# See contracts/treasury/README.md for the operator-visible flow.
+TIMELOCK_ADMIN ?=
+TIMELOCK_MANIFEST ?= deploy/timelock-manifest.json
+deploy-timelock: build
+	@if [ -z "$(TIMELOCK_ADMIN)" ]; then \
+		echo "error: TIMELOCK_ADMIN is required (e.g. make deploy-timelock TIMELOCK_ADMIN=G...)" >&2; \
+		exit 1; \
+	fi
+	DEPLOY_MODE=timelock \
+	TIMELOCK_ADMIN="$(TIMELOCK_ADMIN)" \
+	TIMELOCK_MANIFEST="$(TIMELOCK_MANIFEST)" \
+	./scripts/deploy-testnet.sh
+
+# Multisig admin-rotation runbook smoke test (issue #47). Exercises the
+# two-step transfer lifecycle (propose → accept → expiry → cancel) against a
+# hermetic localnet for each contract and the timelock, and verifies signer
+# identity for multisig/smart-account addresses. Requires `make build` first;
+# see contracts/treasury/README.md for the operator runbook this validates.
+ADMIN_ROTATION_CONTRACT ?=
+admin-rotation-smoke: build
+	./scripts/admin-rotation-smoke.sh $(if $(ADMIN_ROTATION_CONTRACT),--contract $(ADMIN_ROTATION_CONTRACT),)
 
 seed-market:
 	./scripts/seed-market.sh
