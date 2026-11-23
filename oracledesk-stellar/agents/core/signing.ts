@@ -159,6 +159,176 @@ export function verifyTraceAttestation(
 }
 
 // ---------------------------------------------------------------------------
+// Least-privilege signer policy generation (#67)
+//
+// A signer policy is generated from an explicit deployment/workflow manifest.
+// Each manifest entry names a contract, a function, and the argument values
+// that the agent is permitted to sign. The generator derives a stable argument
+// hash for every entry and emits a signer allowlist keyed by
+// (contract, function, argumentHash).
+//
+// Operational notes:
+// - The manifest is explicit: nothing is permitted unless it appears in the
+//   manifest. There is no wildcard or implicit allow.
+// - The generated policy is a pure data structure. It never submits a
+//   transaction and never bypasses on-chain risk controls; it only describes
+//   which invocations an off-chain signer may authorize. The safe dry-run
+//   default is preserved.
+// - `diffSignerPolicy` renders a reviewable, line-oriented diff of each
+//   contract/function/argument-hash entry so reviewers can inspect additions
+//   and removals before a policy is adopted.
+// ---------------------------------------------------------------------------
+
+/** A single permitted invocation declared in a deployment/workflow manifest. */
+export interface SignerPolicyManifestEntry {
+  /** Contract address (C...) the invocation targets. */
+  contract: string;
+  /** Contract function name. */
+  function: string;
+  /** Argument values, in call order, that identify the invocation. */
+  args: ReadonlyArray<string | number | bigint | boolean>;
+}
+
+/** Explicit deployment/workflow manifest consumed by the generator. */
+export interface SignerPolicyManifest {
+  entries: ReadonlyArray<SignerPolicyManifestEntry>;
+}
+
+/** A single allowlist rule keyed by contract, function, and argument hash. */
+export interface SignerPolicyRule {
+  contract: string;
+  function: string;
+  argumentHash: string;
+}
+
+/** Generated signer allowlist. */
+export interface SignerPolicy {
+  rules: ReadonlyArray<SignerPolicyRule>;
+}
+
+/** A single line in a reviewable signer policy diff. */
+export interface SignerPolicyDiffLine {
+  kind: "added" | "removed" | "unchanged";
+  contract: string;
+  function: string;
+  argumentHash: string;
+  /** Rendered diff line, e.g. `+ C...::buy(0xabc...)`. */
+  text: string;
+}
+
+/**
+ * Derive a stable argument hash for a manifest entry.
+ *
+ * Values are serialized with an explicit type tag so that e.g. the number `1`
+ * and the string `"1"` do not collide. The hash is the hex-encoded sha256 of
+ * the canonical serialization.
+ */
+export function hashSignerPolicyArgs(
+  args: ReadonlyArray<string | number | bigint | boolean>,
+): string {
+  const canonical = args.map((arg) => {
+    if (typeof arg === "bigint") return `bigint:${arg.toString()}`;
+    if (typeof arg === "number") {
+      if (!Number.isFinite(arg)) {
+        throw new Error(`argument must be finite, got ${String(arg)}`);
+      }
+      return `number:${arg.toString()}`;
+    }
+    if (typeof arg === "boolean") return `boolean:${arg ? "true" : "false"}`;
+    return `string:${arg}`;
+  });
+  return createHash("sha256").update(canonical.join("\u0000")).digest("hex");
+}
+
+function ruleKey(rule: SignerPolicyRule): string {
+  return `${rule.contract}\u0000${rule.function}\u0000${rule.argumentHash}`;
+}
+
+/**
+ * Generate a least-privilege signer allowlist from an explicit manifest.
+ *
+ * Duplicate entries collapse to a single rule. Entries with an empty contract
+ * or function are rejected so a malformed manifest cannot silently widen the
+ * allowlist.
+ */
+export function generateSignerPolicy(manifest: SignerPolicyManifest): SignerPolicy {
+  const seen = new Set<string>();
+  const rules: SignerPolicyRule[] = [];
+  for (const entry of manifest.entries) {
+    if (!entry.contract) {
+      throw new Error("manifest entry is missing a contract address");
+    }
+    if (!entry.function) {
+      throw new Error(`manifest entry for ${entry.contract} is missing a function name`);
+    }
+    const rule: SignerPolicyRule = {
+      contract: entry.contract,
+      function: entry.function,
+      argumentHash: hashSignerPolicyArgs(entry.args),
+    };
+    const key = ruleKey(rule);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    rules.push(rule);
+  }
+  rules.sort((a, b) => ruleKey(a).localeCompare(ruleKey(b)));
+  return { rules };
+}
+
+/**
+ * Render a reviewable diff between two signer policies.
+ *
+ * Each contract/function/argument-hash entry is shown on its own line with a
+ * `+` (added), `-` (removed), or ` ` (unchanged) prefix so reviewers can
+ * inspect exactly what a policy change permits.
+ */
+export function diffSignerPolicy(
+  previous: SignerPolicy,
+  next: SignerPolicy,
+): SignerPolicyDiffLine[] {
+  const prevByKey = new Map(previous.rules.map((r) => [ruleKey(r), r]));
+  const nextByKey = new Map(next.rules.map((r) => [ruleKey(r), r]));
+  const allKeys = new Set<string>([...prevByKey.keys(), ...nextByKey.keys()]);
+
+  const lines: SignerPolicyDiffLine[] = [];
+  for (const key of [...allKeys].sort((a, b) => a.localeCompare(b))) {
+    const prev = prevByKey.get(key);
+    const nextRule = nextByKey.get(key);
+    const rule = (nextRule ?? prev)!;
+    const kind: SignerPolicyDiffLine["kind"] = nextRule && prev ? "unchanged" : nextRule ? "added" : "removed";
+    const prefix = kind === "added" ? "+" : kind === "removed" ? "-" : " ";
+    lines.push({
+      kind,
+      contract: rule.contract,
+      function: rule.function,
+      argumentHash: rule.argumentHash,
+      text: `${prefix} ${rule.contract}::${rule.function}(${rule.argumentHash})`,
+    });
+  }
+  return lines;
+}
+
+/**
+ * Check whether an invocation is permitted by a generated signer policy.
+ *
+ * Returns `false` for any invocation not explicitly present in the allowlist,
+ * including when the contract or function matches but the argument hash does
+ * not.
+ */
+export function isSignerPolicyPermitted(
+  policy: SignerPolicy,
+  invocation: SignerPolicyManifestEntry,
+): boolean {
+  const argumentHash = hashSignerPolicyArgs(invocation.args);
+  return policy.rules.some(
+    (rule) =>
+      rule.contract === invocation.contract &&
+      rule.function === invocation.function &&
+      rule.argumentHash === argumentHash,
+  );
+}
+
+// ---------------------------------------------------------------------------
 // Transaction journal for uncertain submissions (#51)
 //
 // Before a transaction is sent, the agent records the intent (network, source
@@ -205,214 +375,4 @@ export interface TransactionJournalEntry {
   transactionHash: string;
   /** Current submission state. */
   state: TransactionSubmissionState;
-  /** ISO timestamp when the intent was first recorded. */
-  createdAt: string;
-  /** ISO timestamp of the most recent state transition. */
-  updatedAt: string;
-}
-
-/** Pluggable persistence for journal entries. */
-export interface TransactionJournalStore {
-  save(entry: TransactionJournalEntry): void;
-  get(id: string): TransactionJournalEntry | undefined;
-  list(): TransactionJournalEntry[];
-}
-
-/** In-memory journal store for tests and single-process agents. */
-export class InMemoryTransactionJournalStore implements TransactionJournalStore {
-  private readonly entries = new Map<string, TransactionJournalEntry>();
-
-  save(entry: TransactionJournalEntry): void {
-    this.entries.set(entry.id, { ...entry });
-  }
-
-  get(id: string): TransactionJournalEntry | undefined {
-    const entry = this.entries.get(id);
-    return entry ? { ...entry } : undefined;
-  }
-
-  list(): TransactionJournalEntry[] {
-    return [...this.entries.values()].map((entry) => ({ ...entry }));
-  }
-}
-
-/** Chain-state lookup used to reconcile an uncertain submission by hash. */
-export interface ChainStateLookup {
-  /**
-   * Look up a transaction by hash on the given network.
-   *
-   * Returns `undefined` when the hash is not (yet) known on-chain, otherwise
-   * the observed outcome.
-   */
-  lookup(
-    networkPassphrase: string,
-    transactionHash: string,
-  ): Promise<{ success: boolean } | undefined>;
-}
-
-/** States that are considered uncertain and eligible for reconciliation. */
-const UNCERTAIN_STATES: ReadonlySet<TransactionSubmissionState> = new Set([
-  "pending",
-  "submitted",
-]);
-
-export interface RecordIntentInput {
-  id: string;
-  networkPassphrase: string;
-  sourceAccount: string;
-  transactionHash: string;
-}
-
-/**
- * Persist a transaction intent before sending. The entry starts in the
- * `pending` state so a crash before submission is still recoverable.
- */
-export function recordTransactionIntent(
-  store: TransactionJournalStore,
-  input: RecordIntentInput,
-  now: Date = new Date(),
-): TransactionJournalEntry {
-  if (!input.id) throw new Error("journal id is required");
-  if (!input.networkPassphrase) throw new Error("networkPassphrase is required");
-  if (!input.sourceAccount) throw new Error("sourceAccount is required");
-  if (!input.transactionHash) throw new Error("transactionHash is required");
-
-  const timestamp = now.toISOString();
-  const entry: TransactionJournalEntry = {
-    id: input.id,
-    networkPassphrase: input.networkPassphrase,
-    sourceAccount: input.sourceAccount,
-    transactionHash: input.transactionHash,
-    state: "pending",
-    createdAt: timestamp,
-    updatedAt: timestamp,
-  };
-  store.save(entry);
-  return entry;
-}
-
-/**
- * Update the submission state of a journaled intent after sending.
- *
- * Only forward transitions out of an uncertain state are permitted; a
- * `confirmed` or `failed` entry is terminal and cannot be re-opened.
- */
-export function updateTransactionState(
-  store: TransactionJournalStore,
-  id: string,
-  state: TransactionSubmissionState,
-  now: Date = new Date(),
-): TransactionJournalEntry {
-  const existing = store.get(id);
-  if (!existing) throw new Error(`journal entry not found: ${id}`);
-  if (!UNCERTAIN_STATES.has(existing.state)) {
-    throw new Error(
-      `journal entry ${id} is terminal (${existing.state}); cannot transition to ${state}`,
-    );
-  }
-  const updated: TransactionJournalEntry = {
-    ...existing,
-    state,
-    updatedAt: now.toISOString(),
-  };
-  store.save(updated);
-  return updated;
-}
-
-export interface ReconcileResult {
-  /** Entries that were reconciled to a terminal state. */
-  reconciled: TransactionJournalEntry[];
-  /** Entries whose hash could not be found on-chain; never retried. */
-  unresolved: TransactionJournalEntry[];
-}
-
-/**
- * Reconcile uncertain journal entries by hash against chain state.
- *
- * Entries in a terminal state are skipped. For each uncertain entry the hash
- * is looked up on-chain: a found transaction is reconciled to `confirmed` or
- * `failed`, while a missing transaction is marked `unresolved` and left for an
- * operator. Unresolved intents are never blindly retried.
- */
-export async function reconcileTransactionJournal(
-  store: TransactionJournalStore,
-  lookup: ChainStateLookup,
-  now: Date = new Date(),
-): Promise<ReconcileResult> {
-  const reconciled: TransactionJournalEntry[] = [];
-  const unresolved: TransactionJournalEntry[] = [];
-
-  for (const entry of store.list()) {
-    if (!UNCERTAIN_STATES.has(entry.state)) continue;
-
-    const observed = await lookup.lookup(entry.networkPassphrase, entry.transactionHash);
-    const nextState: TransactionSubmissionState = observed
-      ? observed.success
-        ? "confirmed"
-        : "failed"
-      : "unresolved";
-
-    const updated: TransactionJournalEntry = {
-      ...entry,
-      state: nextState,
-      updatedAt: now.toISOString(),
-    };
-    store.save(updated);
-
-    if (nextState === "unresolved") {
-      unresolved.push(updated);
-    } else {
-      reconciled.push(updated);
-    }
-  }
-
-  return { reconciled, unresolved };
-}
-
-// ---------------------------------------------------------------------------
-// Multisig transaction signing coordination (#69)
-//
-// A multisig envelope binds a set of participants to a single transaction
-// payload via a payload hash. Signatures are collected incrementally until a
-// threshold is reached. The coordinator enforces:
-//
-// - Bounded collection: at most `participants.length` signatures are accepted
-//   and the threshold must be a positive integer no greater than the number of
-//   participants.
-// - Duplicate rejection: a participant may only contribute one signature per
-//   envelope; a second submission from the same participant is rejected.
-// - Payload binding: every signature is verified against the envelope's payload
-//   hash, so an altered payload (or a signature produced for a different
-//   payload) is rejected.
-// - Expiry: envelopes carry an explicit `expiresAt` timestamp. Stale or expired
-//   envelopes are rejected on submission and reported as `expired` in status.
-// - Status reporting never discloses participant secrets: only public keys and
-//   the set of participants that have signed are exposed.
-//
-// Operational notes:
-// - Envelopes are persisted through a pluggable `MultisigEnvelopeStore`. The
-//   in-memory store is provided for tests and single-process agents; durable
-//   deployments supply their own store.
-// - The safe dry-run default is preserved: this module only coordinates
-//   signatures and never submits a transaction on-chain.
-// ---------------------------------------------------------------------------
-
-/** Default envelope lifetime in milliseconds (10 minutes). */
-export const DEFAULT_MULTISIG_ENVELOPE_TTL_MS = 10 * 60 * 1000;
-
-const MULTISIG_DOMAIN = Buffer.from("oracledesk-multisig-v1", "ascii");
-
-export interface MultisigEnvelope {
-  /** Stable envelope identifier. */
-  id: string;
-  /** Participant public keys (32-byte Ed25519) authorized to sign. */
-  participants: Uint8Array[];
-  /** Number of distinct signatures required to complete the envelope. */
-  threshold: number;
-  /** Raw transaction payload being signed. */
-  payload: Uint8Array;
-  /** ISO timestamp after which the envelope is no longer valid. */
-  expiresAt: string;
-  /** Collected signatures keyed by hex-encoded participant public key. */
-  signatures: Map<string, Uint8Array>;
-}
+  /** ISO ti

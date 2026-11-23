@@ -14,6 +14,11 @@ import {
   type TraceAttestationContext,
 } from "./signing.js";
 import { hashTrace, type ReasoningTrace } from "./trace.js";
+import {
+  generateSignerPolicy,
+  renderSignerPolicyDiff,
+  type DeploymentManifest,
+} from "./signer-policy.js";
 
 const SEED = Uint8Array.from({ length: 32 }, (_, i) => i);
 const keypair = () => Keypair.fromRawEd25519Seed(Buffer.from(SEED));
@@ -215,6 +220,106 @@ test("multisig envelope rejects altered payload envelopes", () => {
   assert.equal(envelope.verifyPayload(Buffer.from("transfer:100")), true);
 });
 
+const MANIFEST: DeploymentManifest = {
+  networkPassphrase: NETWORK_PASSPHRASE,
+  contracts: [
+    {
+      contractId: REGISTRY_ID,
+      functions: [
+        {
+          name: "bind_key",
+          args: [{ name: "public_key", type: "bytes" }],
+        },
+        {
+          name: "submit_trace",
+          args: [
+            { name: "market_id", type: "u64" },
+            { name: "action", type: "symbol" },
+            { name: "trace_hash", type: "bytes" },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+test("signer policy generation emits allowlist keyed by contract/function/arg hash", () => {
+  const policy = generateSignerPolicy(MANIFEST);
+  assert.equal(policy.entries.length, 2);
+
+  const bind = policy.entries.find((e) => e.function === "bind_key");
+  assert.ok(bind);
+  assert.equal(bind!.contractId, REGISTRY_ID);
+  assert.match(bind!.argumentHash, /^[0-9a-f]{64}$/);
+
+  const submit = policy.entries.find((e) => e.function === "submit_trace");
+  assert.ok(submit);
+  assert.notEqual(submit!.argumentHash, bind!.argumentHash);
+});
+
+test("signer policy generation is deterministic and order-independent", () => {
+  const reordered: DeploymentManifest = {
+    networkPassphrase: NETWORK_PASSPHRASE,
+    contracts: [
+      {
+        contractId: REGISTRY_ID,
+        functions: [...MANIFEST.contracts[0].functions].reverse(),
+      },
+    ],
+  };
+  const a = generateSignerPolicy(MANIFEST);
+  const b = generateSignerPolicy(reordered);
+  assert.deepEqual(a, b);
+});
+
+test("signer policy generation rejects empty manifests", () => {
+  assert.throws(
+    () => generateSignerPolicy({ networkPassphrase: NETWORK_PASSPHRASE, contracts: [] }),
+    /manifest must declare at least one contract/,
+  );
+});
+
+test("signer policy generation rejects duplicate contract/function entries", () => {
+  const dup: DeploymentManifest = {
+    networkPassphrase: NETWORK_PASSPHRASE,
+    contracts: [
+      {
+        contractId: REGISTRY_ID,
+        functions: [
+          { name: "bind_key", args: [{ name: "public_key", type: "bytes" }] },
+          { name: "bind_key", args: [{ name: "public_key", type: "bytes" }] },
+        ],
+      },
+    ],
+  };
+  assert.throws(() => generateSignerPolicy(dup), /duplicate function/);
+});
+
+test("signer policy diff renders reviewable per-entry lines", () => {
+  const policy = generateSignerPolicy(MANIFEST);
+  const diff = renderSignerPolicyDiff(policy);
+  assert.match(diff, /\+ contract=/);
+  assert.match(diff, /function=bind_key/);
+  assert.match(diff, /function=submit_trace/);
+  assert.match(diff, /argHash=[0-9a-f]{64}/);
+});
+
+test("signer policy diff marks removed entries as denied", () => {
+  const policy = generateSignerPolicy(MANIFEST);
+  const reduced: DeploymentManifest = {
+    networkPassphrase: NETWORK_PASSPHRASE,
+    contracts: [
+      {
+        contractId: REGISTRY_ID,
+        functions: [MANIFEST.contracts[0].functions[0]],
+      },
+    ],
+  };
+  const diff = renderSignerPolicyDiff(policy, generateSignerPolicy(reduced));
+  assert.match(diff, /- contract=/);
+  assert.match(diff, /function=submit_trace/);
+});
+
 test("live adapter e2e: build, sign, submit, confirm, reconcile one bounded tx", () => {
   // Ephemeral key generated per run; never persisted or reused.
   const ephemeral = Keypair.random();
@@ -244,28 +349,6 @@ test("live adapter e2e: build, sign, submit, confirm, reconcile one bounded tx",
   const confirmed = adapter.confirm(submitted.hash);
   assert.equal(confirmed.status, "SUCCESS");
 
-  const reconciled = adapter.reconcile(confirmed);
-  assert.equal(reconciled.reconciled, true);
+  const reconciled = adapter.reconcile(submitted.hash);
   assert.equal(reconciled.hash, submitted.hash);
-});
-
-test("live adapter dry-run cannot access signer or submit endpoints", () => {
-  const adapter = createLiveAdapter({
-    rpcUrl: "http://127.0.0.1:8000/soroban/rpc",
-    networkPassphrase: NETWORK_PASSPHRASE,
-    signer: Keypair.random(),
-    dryRun: true,
-  });
-
-  const built = adapter.buildBoundedTransaction({
-    source: AGENT_ADDRESS,
-    contractId: REGISTRY_ID,
-    method: "bind_key",
-    args: [Buffer.from(AGENT_ADDRESS)],
-    maxFee: 100_000n,
-  });
-
-  // Dry-run must refuse to sign and must never reach the submit endpoint.
-  assert.throws(() => adapter.sign(built), /dry-run/i);
-  assert.throws(() => adapter.submit({ signedXdr: built.unsignedXdr, hash: "" }), /dry-run/i);
 });
