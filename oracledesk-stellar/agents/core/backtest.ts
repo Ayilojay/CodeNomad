@@ -221,3 +221,150 @@ export function runWalkForwardBacktest(
 
   return { metrics, equityCurve };
 }
+
+/**
+ * Treasury-wide loss and exposure stress model.
+ *
+ * Single-instance caps do not bound aggregate risk when several agent
+ * deployments trade correlated markets that share liquidity. This model runs a
+ * set of deployments through a scenario in which:
+ * - markets are correlated (a shared `correlation` factor drives a common shock
+ *   on top of each market's idiosyncratic shock),
+ * - liquidity is shared across deployments (aggregate notional is bounded by a
+ *   single `sharedLiquidity` pool, so simultaneous exits compete for depth),
+ * - multiple deployments draw down at the same time (a `simultaneousDrawdown`
+ *   shock is applied to every deployment in the same step).
+ *
+ * It reports the worst-case capital at risk across the scenario and which
+ * controls act on-chain. The model is pure and deterministic.
+ *
+ * On-chain vs off-chain controls:
+ * - On-chain: per-instance position caps, per-step turnover caps, and the
+ *   shared-liquidity cap are enforced by the treasury contracts; the reported
+ *   `capitalAtRisk` is the bound those contracts must respect.
+ * - Off-chain: correlation assumptions, scenario selection, and the stress
+ *   horizon are operator inputs and are NOT enforced on-chain.
+ */
+export interface StressDeployment {
+  /** Stable identifier for the agent deployment. */
+  id: string;
+  /** Market this deployment trades; deployments on the same market share liquidity. */
+  market: string;
+  /** Absolute position as a fraction of the deployment's equity (0..1). */
+  position: number;
+  /** Deployment equity before the scenario. */
+  equity: number;
+}
+
+export interface StressScenario {
+  /** Common shock applied to every market, e.g. -0.2 = 20% drop. */
+  commonShock: number;
+  /** Per-market idiosyncratic shock, keyed by market id. */
+  marketShocks: Record<string, number>;
+  /** Correlation in [0, 1] blending common vs idiosyncratic shocks. */
+  correlation: number;
+  /** Total notional that can be exited across all deployments in one step. */
+  sharedLiquidity: number;
+  /** Extra simultaneous drawdown applied to every deployment, e.g. 0.1 = 10%. */
+  simultaneousDrawdown: number;
+}
+
+export interface StressDeploymentResult {
+  id: string;
+  market: string;
+  /** Blended shock applied to this deployment's market. */
+  shock: number;
+  /** Loss on this deployment's position after the shock. */
+  loss: number;
+  /** Notional that could not be exited due to shared liquidity. */
+  illiquidNotional: number;
+  /** Equity after loss and simultaneous drawdown. */
+  equityAfter: number;
+}
+
+export interface StressResult {
+  deployments: StressDeploymentResult[];
+  /** Worst-case capital at risk: total equity exposed across deployments. */
+  capitalAtRisk: number;
+  /** Total loss across deployments under the scenario. */
+  totalLoss: number;
+  /** Notional that could not be exited due to shared liquidity. */
+  illiquidNotional: number;
+  /** Controls enforced by the treasury contracts. */
+  onChainControls: string[];
+  /** Controls that are operator inputs and not enforced on-chain. */
+  offChainControls: string[];
+}
+
+/**
+ * Run a treasury-wide stress scenario across multiple agent deployments.
+ *
+ * Each deployment's market shock blends the common shock with its market's
+ * idiosyncratic shock by `correlation`. Losses are computed on position
+ * notional, then a simultaneous drawdown is applied to every deployment. Shared
+ * liquidity bounds how much notional can be exited in the same step; the
+ * remainder is reported as illiquid.
+ */
+export function runTreasuryStress(
+  deployments: ReadonlyArray<StressDeployment>,
+  scenario: StressScenario,
+): StressResult {
+  const correlation = clamp(scenario.correlation, 0, 1);
+  const sharedLiquidity = Math.max(0, scenario.sharedLiquidity);
+  const simultaneousDrawdown = clamp(scenario.simultaneousDrawdown, 0, 1);
+
+  const results: StressDeploymentResult[] = [];
+  let totalLoss = 0;
+  let capitalAtRisk = 0;
+  let totalNotional = 0;
+
+  for (const deployment of deployments) {
+    const position = clamp(deployment.position, 0, 1);
+    const equity = Math.max(0, deployment.equity);
+    const notional = position * equity;
+    const idiosyncratic = scenario.marketShocks[deployment.market] ?? 0;
+    const shock = correlation * scenario.commonShock + (1 - correlation) * idiosyncratic;
+    const loss = Math.max(0, -shock) * notional;
+
+    totalLoss += loss;
+    capitalAtRisk += equity;
+    totalNotional += notional;
+
+    results.push({
+      id: deployment.id,
+      market: deployment.market,
+      shock,
+      loss,
+      illiquidNotional: 0,
+      equityAfter: Math.max(0, equity - loss) * (1 - simultaneousDrawdown),
+    });
+  }
+
+  // Shared liquidity: notional that cannot be exited in one step is illiquid.
+  const illiquidTotal = Math.max(0, totalNotional - sharedLiquidity);
+  if (illiquidTotal > 0 && totalNotional > 0) {
+    for (const result of results) {
+      const notional = result.loss > 0 ? result.loss : 0;
+      // Distribute illiquidity proportionally to each deployment's notional.
+      const share = notional / totalNotional;
+      result.illiquidNotional = illiquidTotal * share;
+    }
+  }
+
+  return {
+    deployments: results,
+    capitalAtRisk,
+    totalLoss,
+    illiquidNotional: illiquidTotal,
+    onChainControls: [
+      "per-instance position cap",
+      "per-step turnover cap",
+      "shared-liquidity cap",
+    ],
+    offChainControls: [
+      "correlation assumptions",
+      "scenario selection",
+      "stress horizon",
+    ],
+  };
+}

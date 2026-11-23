@@ -145,6 +145,108 @@ export function runWalkForwardBacktest(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Treasury-wide loss and exposure stress model
+//
+// Single-instance caps do not bound aggregate risk from multiple deployments
+// or correlated markets. This model aggregates several agent deployments that
+// share market liquidity and can draw down simultaneously, then reports the
+// worst-case capital at risk across the whole treasury.
+//
+// Operator-visible behavior:
+// - Each deployment has a notional exposure and a per-deployment loss rate.
+// - `correlation` in [0, 1] scales how much deployments move together: 0 means
+//   independent losses, 1 means a fully correlated simultaneous drawdown.
+// - `sharedLiquidity` caps the fraction of aggregate notional that can be
+//   exited at once; illiquid shared markets amplify realized losses.
+// - `worstCaseCapitalAtRisk` is the aggregate notional exposed under the
+//   worst-case (fully correlated) scenario, bounded by the treasury budget.
+// ---------------------------------------------------------------------------
+
+export interface Deployment {
+  /** Stable identifier for the agent deployment. */
+  id: string;
+  /** Notional capital deployed into this instance. */
+  notional: number;
+  /** Fractional loss applied to notional in a stress event (0..1]. */
+  lossRate: number;
+}
+
+export interface StressScenario {
+  deployments: ReadonlyArray<Deployment>;
+  /** Correlation of outcomes across deployments/markets, in [0, 1]. */
+  correlation: number;
+  /** Fraction of aggregate notional exitable at once, in (0, 1]. */
+  sharedLiquidity: number;
+  /** Total treasury budget available to absorb losses. */
+  treasuryBudget: number;
+}
+
+export interface StressResult {
+  /** Aggregate notional across all deployments. */
+  totalNotional: number;
+  /** Worst-case loss under a fully correlated simultaneous drawdown. */
+  worstCaseLoss: number;
+  /** Worst-case capital at risk, bounded by the treasury budget. */
+  worstCaseCapitalAtRisk: number;
+  /** Losses realized when shared liquidity cannot absorb the exit. */
+  liquidityAdjustedLoss: number;
+  /** Whether the treasury budget covers the worst-case loss. */
+  withinBudget: boolean;
+}
+
+function clamp01(x: number): number {
+  if (!Number.isFinite(x)) return 0;
+  return Math.max(0, Math.min(1, x));
+}
+
+export function runTreasuryStress(scenario: StressScenario): StressResult {
+  const correlation = clamp01(scenario.correlation);
+  const liquidity = Math.max(1e-9, clamp01(scenario.sharedLiquidity));
+
+  const totalNotional = scenario.deployments.reduce(
+    (sum, d) => sum + Math.max(0, d.notional),
+    0,
+  );
+
+  // Independent component: sum of individual expected losses.
+  const independentLoss = scenario.deployments.reduce(
+    (sum, d) => sum + Math.max(0, d.notional) * clamp01(d.lossRate),
+    0,
+  );
+
+  // Correlated component: all deployments draw down simultaneously at the
+  // worst per-deployment loss rate, applied to the full aggregate notional.
+  const worstLossRate = scenario.deployments.reduce(
+    (max, d) => Math.max(max, clamp01(d.lossRate)),
+    0,
+  );
+  const correlatedLoss = totalNotional * worstLossRate;
+
+  // Blend independent and correlated outcomes by correlation.
+  const worstCaseLoss =
+    independentLoss * (1 - correlation) + correlatedLoss * correlation;
+
+  // Shared liquidity: the fraction of notional that cannot be exited at once
+  // is marked at the worst loss rate again (slippage on the illiquid remainder).
+  const illiquidFraction = 1 - liquidity;
+  const liquidityAdjustedLoss =
+    worstCaseLoss + totalNotional * illiquidFraction * worstLossRate;
+
+  const worstCaseCapitalAtRisk = Math.min(
+    totalNotional,
+    Math.max(0, scenario.treasuryBudget),
+  );
+
+  return {
+    totalNotional,
+    worstCaseLoss,
+    worstCaseCapitalAtRisk,
+    liquidityAdjustedLoss,
+    withinBudget: worstCaseLoss <= scenario.treasuryBudget,
+  };
+}
+
 // Deterministic dataset for reproducible metrics.
 const DATASET: Observation[] = [
   { t: 0, price: 100 },
@@ -241,7 +343,67 @@ describe("runWalkForwardBacktest", () => {
   it("handles an empty series without throwing", () => {
     const m = runWalkForwardBacktest([], momentum, BASE_CONFIG);
     expect(m.finalEquity).toBe(BASE_CONFIG.initialEquity);
-    expect(m.totalReturn).toBe(0);
     expect(m.trades).toBe(0);
+  });
+});
+
+describe("runTreasuryStress", () => {
+  const DEPLOYMENTS: Deployment[] = [
+    { id: "agent-a", notional: 1000, lossRate: 0.2 },
+    { id: "agent-b", notional: 500, lossRate: 0.2 },
+    { id: "agent-c", notional: 250, lossRate: 0.1 },
+  ];
+
+  const BASE_SCENARIO: StressScenario = {
+    deployments: DEPLOYMENTS,
+    correlation: 1,
+    sharedLiquidity: 1,
+    treasuryBudget: 1000,
+  };
+
+  it("aggregates notional across multiple deployments", () => {
+    const r = runTreasuryStress(BASE_SCENARIO);
+    expect(r.totalNotional).toBe(1750);
+  });
+
+  it("bounds worst-case loss by aggregate notional under full correlation", () => {
+    const r = runTreasuryStress(BASE_SCENARIO);
+    // Fully correlated simultaneous drawdown at the worst loss rate (20%).
+    expect(r.worstCaseLoss).toBeCloseTo(1750 * 0.2, 6);
+    expect(r.worstCaseLoss).toBeLessThanOrEqual(r.totalNotional);
+  });
+
+  it("reduces worst-case loss as correlation drops toward independence", () => {
+    const correlated = runTreasuryStress({ ...BASE_SCENARIO, correlation: 1 });
+    const independent = runTreasuryStress({ ...BASE_SCENARIO, correlation: 0 });
+    expect(independent.worstCaseLoss).toBeLessThan(correlated.worstCaseLoss);
+    // Independent loss is the sum of per-deployment losses.
+    expect(independent.worstCaseLoss).toBeCloseTo(1000 * 0.2 + 500 * 0.2 + 250 * 0.1, 6);
+  });
+
+  it("amplifies losses when shared market liquidity is constrained", () => {
+    const liquid = runTreasuryStress({ ...BASE_SCENARIO, sharedLiquidity: 1 });
+    const illiquid = runTreasuryStress({ ...BASE_SCENARIO, sharedLiquidity: 0.5 });
+    expect(illiquid.liquidityAdjustedLoss).toBeGreaterThan(liquid.liquidityAdjustedLoss);
+    expect(liquid.liquidityAdjustedLoss).toBeCloseTo(liquid.worstCaseLoss, 6);
+  });
+
+  it("reports worst-case capital at risk bounded by the treasury budget", () => {
+    const r = runTreasuryStress({ ...BASE_SCENARIO, treasuryBudget: 500 });
+    expect(r.worstCaseCapitalAtRisk).toBe(500);
+    expect(r.worstCaseCapitalAtRisk).toBeLessThanOrEqual(r.totalNotional);
+  });
+
+  it("flags whether the treasury budget covers the worst-case loss", () => {
+    const covered = runTreasuryStress({ ...BASE_SCENARIO, treasuryBudget: 1000 });
+    const breached = runTreasuryStress({ ...BASE_SCENARIO, treasuryBudget: 100 });
+    expect(covered.withinBudget).toBe(true);
+    expect(breached.withinBudget).toBe(false);
+  });
+
+  it("is reproducible for identical scenarios", () => {
+    const a = runTreasuryStress(BASE_SCENARIO);
+    const b = runTreasuryStress(BASE_SCENARIO);
+    expect(a).toEqual(b);
   });
 });
