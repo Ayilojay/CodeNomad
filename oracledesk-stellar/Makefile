@@ -125,6 +125,15 @@ deploy-timelock: build
 	TIMELOCK_MANIFEST="$(TIMELOCK_MANIFEST)" \
 	./scripts/deploy-testnet.sh
 
+# Multisig admin-rotation runbook smoke test (issue #47). Exercises the
+# two-step transfer lifecycle (propose → accept → expiry → cancel) against a
+# hermetic localnet for each contract and the timelock, and verifies signer
+# identity for multisig/smart-account addresses. Requires `make build` first;
+# see contracts/treasury/README.md for the operator runbook this validates.
+ADMIN_ROTATION_CONTRACT ?=
+admin-rotation-smoke: build
+	./scripts/admin-rotation-smoke.sh $(if $(ADMIN_ROTATION_CONTRACT),--contract $(ADMIN_ROTATION_CONTRACT),)
+
 seed-market:
 	./scripts/seed-market.sh
 

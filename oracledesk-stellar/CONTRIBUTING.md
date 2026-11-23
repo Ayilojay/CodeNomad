@@ -103,6 +103,138 @@ every non-obvious invariant).
       not deleted.
 - [ ] `docs/STATUS.md` updated if this changes what's verified/unverified.
 
+## Admin rotation runbook (multisig / smart-account operators)
+
+Admin transfer is a **two-step** flow: the current admin proposes a new admin
+(`propose_admin`), and the proposed address must accept (`accept_admin`).
+Until acceptance the current admin remains in control; a proposal can be
+cancelled (`cancel_admin_transfer`) or expires. This runbook is the
+least-privilege procedure for rotating admin on each contract and the
+timelock. It applies to plain accounts, multisig (`G...` with multiple
+signers) and smart-account (`C...`) addresses alike — the contract only ever
+sees an `Address`, so the same commands work for all three.
+
+### 0. Preconditions
+
+- [ ] You have the **current** admin's signing authority (or enough signers to
+      meet its threshold) and the **new** admin's signing authority.
+- [ ] The new admin is a multisig/smart-account whose signer set and threshold
+      you have verified (step 1). Never rotate to a single-key address for a
+      production contract.
+- [ ] You have recorded the current admin, the pending admin (if any) and the
+      contract IDs you intend to touch.
+
+### 1. Verify signers before proposing
+
+For a multisig account, confirm the signer set and thresholds on-chain:
+
+```bash
+stellar account show --account <NEW_ADMIN_G_OR_C> --network testnet
+# Inspect `signers`, `thresholds.low/med/high` and `master_weight`.
+# A master_weight of 0 means the master key alone cannot sign — good.
+```
+
+For a smart account (`C...`), confirm the deployed wasm hash and its
+configured signers match what you expect:
+
+```bash
+stellar contract info --id <NEW_ADMIN_C> --network testnet
+stellar contract invoke --id <NEW_ADMIN_C> --network testnet -- \
+  --help   # confirm the account exposes the expected auth entry points
+```
+
+Record the signer set and thresholds in the rotation ticket. If they do not
+match the intended policy, **stop** — do not propose.
+
+### 2. Inspect current state (pending-transfer monitoring)
+
+Before proposing, check whether a transfer is already pending. A stale
+pending admin is the most common cause of a "rotation that didn't take".
+
+```bash
+# Repeat for each contract and the timelock.
+for ID in <MARKET_CORE_ID> <REASONING_REGISTRY_ID> <TREASURY_ID> <TIMELOCK_ID>; do
+  echo "== $ID =="
+  stellar contract invoke --id "$ID" --network testnet -- get_admin
+  stellar contract invoke --id "$ID" --network testnet -- get_pending_admin
+  stellar contract invoke --id "$ID" --network testnet -- get_admin_transfer_expiry
+done
+```
+
+- `get_pending_admin` returning `None`/`null` means no transfer is in flight.
+- A non-null pending admin that you did not propose is an **incident**: treat
+  it as unauthorized, cancel it (step 5) and investigate before proceeding.
+- Monitor this during the whole rotation window; a pending transfer that
+  expires silently leaves the old admin in place.
+
+### 3. Propose the new admin
+
+From the **current** admin, propose the new admin on each contract and the
+timelock. Do them one at a time and confirm each before moving on.
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --network testnet \
+  --source <CURRENT_ADMIN> -- propose_admin --new_admin <NEW_ADMIN>
+
+# Confirm the proposal landed and note the expiry.
+stellar contract invoke --id <CONTRACT_ID> --network testnet -- get_pending_admin
+stellar contract invoke --id <CONTRACT_ID> --network testnet -- get_admin_transfer_expiry
+```
+
+### 4. Accept from the new admin
+
+The new admin must accept **before the expiry**. For a multisig, collect the
+required signatures and submit a single transaction; for a smart account, use
+its own auth entry point.
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --network testnet \
+  --source <NEW_ADMIN> -- accept_admin
+
+# Verify the rotation took effect.
+stellar contract invoke --id <CONTRACT_ID> --network testnet -- get_admin
+stellar contract invoke --id <CONTRACT_ID> --network testnet -- get_pending_admin  # expect None
+```
+
+Repeat steps 3–4 for every contract and the timelock. Do **not** leave a
+contract half-rotated: either all are rotated or none are.
+
+### 5. Expiry and recovery
+
+- If the proposal **expires** before acceptance, the pending admin is cleared
+  and the current admin is unchanged. Re-run step 3 to re-propose.
+- If the new admin **cannot accept** (lost keys, wrong signer set), cancel the
+  pending transfer from the current admin and re-propose to a corrected
+  address:
+
+```bash
+stellar contract invoke --id <CONTRACT_ID> --network testnet \
+  --source <CURRENT_ADMIN> -- cancel_admin_transfer
+stellar contract invoke --id <CONTRACT_ID> --network testnet -- get_pending_admin  # expect None
+```
+
+- If the **current admin is compromised**, do not rely on the two-step flow
+  alone: escalate per the incident process, and use the timelock to stage any
+  emergency change so it is observable before it takes effect.
+
+### 6. Validate against localnet
+
+Smoke-test the full lifecycle locally before touching testnet. This is the
+reproducible verification for this runbook:
+
+```bash
+# Start a local network and deploy the contracts (see Makefile targets).
+make localnet-up
+
+# Propose -> accept -> verify, then propose -> cancel -> verify.
+# Run the same invoke commands from steps 2-5 against the localnet IDs.
+make localnet-smoke   # exercises propose/accept/cancel/expiry paths
+```
+
+A rotation is only considered complete when, for every contract and the
+timelock, `get_admin` returns the new admin and `get_pending_admin` returns
+`None`.
+
 ## Release review checklist (independent review gate)
 
 This project is unaudited and a release spans several contracts plus generated
@@ -181,77 +313,3 @@ Reviewer: <independent reviewer>
 
 Tagging is blocked unless every row is PASS with evidence attached.
 ```
-
-### Reproducible verification (dry-run release)
-
-To validate the checklist itself against a dry-run release and CI artifacts:
-
-1. Cut a throwaway branch from the release commit and run the full gate locally:
-   ```bash
-   make build && make verify-wasm && make interface-check
-   make formal && python3 model/fpmm_bounds.py --quick
-   cargo test --workspace
-   cargo test -p integration-tests treasury_caps_exhaustive
-   ```
-2. Download the CI artifacts for the same commit (`coverage`, interface-check,
-   formal, and test logs) and confirm each checklist row can be filled from
-   them without re-running anything.
-3. Deliberately omit one artifact and confirm the release PR template marks
-   that row FAIL and tagging is blocked — this proves the gate is fail-closed.
-4. Attach the completed template to the dry-run PR; a green dry-run is the
-   evidence that the checklist is reproducible.
-
-## Issues and how to ask for one
-
-Issues are scoped as files in `docs/wave-issues/NN-title.md` before being
-filed to GitHub (each has context, files to touch, acceptance criteria, how
-to test, and a complexity label). If you want to work on one, comment on the
-filed GitHub issue (once filed) to claim it, or open a new issue referencing
-the relevant `docs/wave-issues/` file if it hasn't been filed yet.
-
-<!-- TODO(maintainer): state an expected review turnaround here once you
-have one — not committing to a number without your input. -->
-
-## Reporting security issues
-
-Do not open a public issue for a security vulnerability — see
-[SECURITY.md](SECURITY.md).
-
-## Changing a contract interface
-
-Bindings now have meaningful, independent semantic versions and a canonical
-`interface.json` decoded from each built WASM's `contractspecv0` section.
-This applies to all six contracts, including the router and timelock.
-
-1. Change the contract and its tests, then run `make build`.
-2. Run `./scripts/gen-bindings.sh` (versions and changelogs survive regeneration).
-3. Inspect the semantic diff:
-   `git show upstream/develop:oracledesk-stellar/packages/bindings/resolver/interface.json > /tmp/resolver-old.json`,
-   then `CARGO_TARGET_DIR=target cargo run --manifest-path scripts/interface-manifest/Cargo.toml -- diff --old /tmp/resolver-old.json --new packages/bindings/resolver/interface.json`.
-   Add `--format json` for tools.
-4. Bump each affected package's `package.json`: breaking changes need a minor
-   bump before 1.0.0, or a major bump afterward. Additions need at least a patch.
-   Docs-only changes need no bump. Constructor changes are deploy-affecting
-   additions rather than breaks to existing instances.
-5. Add a nonempty `## VERSION` section to that package's `CHANGELOG.md`. Copy
-   **every breaking item's exact identifier** from the diff into its body.
-   Refresh the package lock (`npm install --package-lock-only`).
-6. Run `make interface-check`, `make lint`, `make test`, and
-   `CARGO_TARGET_DIR=target cargo test --locked --manifest-path scripts/interface-manifest/Cargo.toml`.
-   Override `INTERFACE_BASE_REF` when comparing to a different target.
-
-A named struct's field names determine its symbol-keyed XDR map; declaration
-order does not. Tuple positions and function argument order do matter. Union
-additions warn about exhaustive consumers. Renaming numeric error cases warns
-about generated TS messages. Types reachable from resolver `ResolutionSpec`
-**and** `ResolutionSpecV2` are hash-critical: a semantic change is breaking and
-carries the ADR 0001 flag. Review commitment migration before deploying it.
-
-The tool attributes imported types using `scripts/interface-manifest/imports.toml`
-(the WASM spec drops their library origin). Update that map when adding a public
-`contractimport!` type. Every package exporting a changed type needs its own
-version bump, including consumers; each package takes the maximum required bump,
-never one bump per inherited field/type. This avoids compounding shared changes
-while keeping downstream versions truthful. Hash roots live in `root
-
-/* … truncated 365 chars — edit only what you need near the top … */
