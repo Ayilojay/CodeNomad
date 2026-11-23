@@ -260,6 +260,38 @@ jobs:
           cd agents
           npm run test:chaos
 
+  deployment-drift:
+    name: Deployment drift detection (agents/core/deployment-drift)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      # Install only the agents package (no Rust/bindings needed; the drift
+      # module imports only config.ts and Node built-ins).
+      - name: Install agents dependencies
+        run: cd agents && npm ci
+
+      # Typecheck the new module in isolation so a stub error in an unrelated
+      # file (risk.ts, spec-store.ts) does not mask a real type error here.
+      - name: Typecheck deployment-drift module
+        run: |
+          cd agents
+          npx tsc --noEmit --allowJs false \
+            --strict --target ES2022 --module NodeNext --moduleResolution NodeNext \
+            --skipLibCheck \
+            core/deployment-drift.ts 2>&1 | \
+            grep -v "^$" && exit 1 || exit 0
+
+      # Run the focused unit tests.  These are deterministic (no network, no
+      # filesystem), so they are suitable as a CI gate.
+      - name: Run deployment-drift tests
+        run: cd agents && npx tsx --test core/deployment-drift.test.ts
+
   lint:
     name: Lint & format (agents, x402, SDK, frontend)
     runs-on: ubuntu-latest
