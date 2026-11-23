@@ -1,10 +1,129 @@
 # CodeNomad Frontend
 
-User-facing web app for CodeNomad. This document covers the wallet connection
-flow, network verification, and the manual verification steps required before
-shipping to testnet or mainnet.
+User-facing web app for CodeNomad. This document covers the market data loading
+flow, wallet connection, network verification, and the manual verification steps
+required before shipping to testnet or mainnet.
 
-## Wallet connection
+## Live market data (#101)
+
+The market list is loaded from the indexer/read API on page load, on network
+switch, and on explicit refresh. No fixture or hardcoded market rows are ever
+shown as live chain state.
+
+### API contract
+
+`GET /markets?network=<network>` must return:
+
+```json
+{
+  "markets": [
+    {
+      "id": "mkt-001",
+      "title": "Will Q2 GDP exceed 2%?",
+      "yesPrice": 0.61,
+      "change": 3.1,
+      "closeTime": "2025-07-01T00:00:00Z",
+      "index": 1
+    }
+  ],
+  "meta": {
+    "ledgerSequence": 55000001,
+    "indexedAt": "2025-05-01T12:00:00Z"
+  }
+}
+```
+
+Any other shape is treated as an error. The `meta` field is optional but
+strongly recommended; its absence is tolerated and silently omitted from the
+freshness display.
+
+### Display states
+
+The market list surfaces four distinct states and never conflates them:
+
+| State | Trigger | Behavior |
+|-------|---------|----------|
+| **loading** | Fetch in flight | Spinner/message; market list cleared |
+| **loaded** | 200 response, fresh metadata | Rows rendered; count shown |
+| **empty** | 200 response, zero markets | "No markets indexed on this network yet." |
+| **stale** | `meta.indexedAt` older than 5 minutes | Rows rendered with a stale warning and retry affordance |
+| **error** | Network failure, non-200, or malformed body | Error message; retry affordance; zero rows rendered |
+
+A stale response still renders the last-known rows so the operator can see
+what was indexed, but the warning makes the age and re-fetch option explicit.
+An error state renders zero rows — there is no silent fallback to any fixture
+or cached data.
+
+### Ledger freshness metadata
+
+When the API returns `meta.ledgerSequence` and `meta.indexedAt`, the UI shows:
+
+- The ledger sequence number.
+- The time the data was indexed (formatted for the browser locale).
+- A "Fresh" or "Stale" badge (stale threshold: 5 minutes).
+
+### Retry
+
+The Refresh button in the section header triggers both an API health check and
+a full market reload. The retry affordance on the stale/error status bar
+triggers only the market reload.
+
+### No fixture data
+
+No hardcoded market rows exist in the HTML or JavaScript. The state machine
+function `processMarketsResponse` and the row builder `buildMarketRowTitle`
+are covered by focused automated tests that assert zero rows are returned from
+any error state.
+
+## Automated tests
+
+The market loading state machine has focused tests covering:
+
+- Successful load: correct row count, state, and message.
+- Singular/plural message.
+- Empty list: `empty` state surfaced.
+- Stale data: `stale` state with age in minutes; rows still present.
+- Network failure: `error` state; zero rows.
+- Non-200 HTTP statuses: `error` state; HTTP code in message.
+- Malformed response body: `error` state; zero rows.
+- Stale threshold boundary: exact boundary is not stale; 1 ms past is stale.
+- No fixture fallback: all error/empty states return zero rows.
+- Ledger freshness metadata: present on success; absent is tolerated.
+
+Run the frontend tests:
+
+```bash
+node --test frontend/markets.test.mjs
+# or via npm:
+cd frontend && npm test
+```
+
+The frontend test job (`Frontend (markets test)`) in CI runs the above command
+against Node 22 on every push and pull request. No network access is required
+— tests use deterministic in-process fixtures.
+
+## Operator verification (localnet / testnet)
+
+Before deploying to testnet, verify the following against a running localnet
+or deterministic fixture server:
+
+1. Start a local API server that serves `/markets?network=local` with a valid
+   response body (shape above).
+2. Load the frontend at `http://localhost:4173` and confirm:
+   - Market rows appear from the API response, not hardcoded values.
+   - Switching to "Local" in the network selector triggers a reload.
+   - Clicking Refresh triggers a reload.
+   - Stopping the API and refreshing shows the error state with the retry
+     button, not any fixture rows.
+   - Returning an empty `markets` array shows the empty state message.
+   - Setting `meta.indexedAt` to 10 minutes ago shows the stale warning with
+     the age in minutes.
+3. Set `localStorage.oracledeskApiUrl` to point at a different API instance
+   if testing against a non-default host.
+
+Do not deploy to testnet until all localnet checks above pass.
+
+
 
 The frontend connects to a supported Stellar wallet via
 [Stellar Wallets Kit](https://github.com/Creit-Tech/Stellar-Wallets-Kit)
