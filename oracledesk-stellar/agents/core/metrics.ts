@@ -24,6 +24,43 @@ export type CircuitState = "closed" | "open" | "half_open";
 
 export type SubmissionResult = "accepted" | "rejected" | "dry_run";
 
+/**
+ * Indexer ingestion health states (issue #95).
+ *
+ * `stale` and `failed` are deliberately distinct: a stale indexer is still
+ * making progress but has fallen behind, while a failed indexer has stopped
+ * ingesting (decode failures / retries exhausted). Neither is ever reported as
+ * `healthy`, so there is no success-shaped fallback.
+ */
+export type IngestionHealth = "healthy" | "stale" | "failed";
+
+export interface IngestionMetricsSnapshot {
+  /** Ledger lag: latest chain ledger minus last ingested ledger (>= 0). */
+  ledgerLag: number;
+  /** Most recent poll duration in milliseconds (>= 0). */
+  pollDurationMs: number;
+  /** Cumulative decode failures. */
+  decodeFailures: number;
+  /** Cumulative ingestion retries. */
+  retries: number;
+  /** Age of the last durable checkpoint in milliseconds (>= 0). */
+  checkpointAgeMs: number;
+  /** Derived health state (exactly one active). */
+  health: Record<IngestionHealth, number>;
+}
+
+export interface IngestionThresholds {
+  /** Ledger lag at or above which ingestion is considered stale. */
+  staleLedgerLag: number;
+  /** Checkpoint age (ms) at or above which ingestion is considered stale. */
+  staleCheckpointAgeMs: number;
+}
+
+export const DEFAULT_INGESTION_THRESHOLDS: IngestionThresholds = {
+  staleLedgerLag: 50,
+  staleCheckpointAgeMs: 120_000,
+};
+
 export interface MetricsSnapshot {
   taskRuns: Record<TaskOutcome, number>;
   taskFailures: Record<FailureReason, number>;
@@ -31,6 +68,7 @@ export interface MetricsSnapshot {
   submissions: Record<SubmissionResult, number>;
   traceBacklog: number;
   schedulerDelayMs: number;
+  ingestion: IngestionMetricsSnapshot;
 }
 
 const TASK_OUTCOMES: readonly TaskOutcome[] = ["success", "failure"];
@@ -47,6 +85,7 @@ const SUBMISSION_RESULTS: readonly SubmissionResult[] = [
   "rejected",
   "dry_run",
 ];
+const INGESTION_HEALTH: readonly IngestionHealth[] = ["healthy", "stale", "failed"];
 
 function zeroed<K extends string>(keys: readonly K[]): Record<K, number> {
   const out = {} as Record<K, number>;
@@ -54,6 +93,10 @@ function zeroed<K extends string>(keys: readonly K[]): Record<K, number> {
     out[key] = 0;
   }
   return out;
+}
+
+function clampNonNegative(value: number): number {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 }
 
 /**
@@ -69,6 +112,14 @@ export class AgentMetrics {
   private submissions = zeroed(SUBMISSION_RESULTS);
   private traceBacklog = 0;
   private schedulerDelayMs = 0;
+
+  private ledgerLag = 0;
+  private pollDurationMs = 0;
+  private decodeFailures = 0;
+  private retries = 0;
+  private checkpointAgeMs = 0;
+  private ingestionFailed = false;
+  private ingestionThresholds: IngestionThresholds = { ...DEFAULT_INGESTION_THRESHOLDS };
 
   /** Record a completed task run and, on failure, its bounded reason. */
   recordTaskRun(outcome: TaskOutcome, reason?: FailureReason): void {
@@ -111,8 +162,83 @@ export class AgentMetrics {
       Number.isFinite(delayMs) && delayMs > 0 ? Math.floor(delayMs) : 0;
   }
 
+  /**
+   * Configure the stale-ingestion thresholds. Non-finite or negative values
+   * fall back to the defaults so health can never be silently disabled.
+   */
+  setIngestionThresholds(thresholds: Partial<IngestionThresholds>): void {
+    const next = { ...this.ingestionThresholds };
+    if (thresholds.staleLedgerLag !== undefined) {
+      next.staleLedgerLag = clampNonNegative(thresholds.staleLedgerLag);
+    }
+    if (thresholds.staleCheckpointAgeMs !== undefined) {
+      next.staleCheckpointAgeMs = clampNonNegative(thresholds.staleCheckpointAgeMs);
+    }
+    this.ingestionThresholds = next;
+  }
+
+  /** Set the current ledger lag (latest chain ledger minus last ingested). */
+  setLedgerLag(lag: number): void {
+    this.ledgerLag = clampNonNegative(lag);
+  }
+
+  /** Set the most recent poll duration in milliseconds (clamped >= 0). */
+  setPollDurationMs(durationMs: number): void {
+    this.pollDurationMs = clampNonNegative(durationMs);
+  }
+
+  /** Set the age of the last durable checkpoint in milliseconds (clamped >= 0). */
+  setCheckpointAgeMs(ageMs: number): void {
+    this.checkpointAgeMs = clampNonNegative(ageMs);
+  }
+
+  /** Record a decode failure (increments the cumulative counter). */
+  recordDecodeFailure(): void {
+    this.decodeFailures += 1;
+  }
+
+  /** Record an ingestion retry (increments the cumulative counter). */
+  recordRetry(): void {
+    this.retries += 1;
+  }
+
+  /**
+   * Mark ingestion as failed (e.g. decode failures or retries exhausted).
+   * A failed indexer is reported as `failed`, never as `healthy`.
+   */
+  markIngestionFailed(): void {
+    this.ingestionFailed = true;
+  }
+
+  /** Clear the failed flag once ingestion recovers. */
+  clearIngestionFailed(): void {
+    this.ingestionFailed = false;
+  }
+
+  /**
+   * Derive the current ingestion health state.
+   *
+   * Precedence: `failed` (explicit failure) > `stale` (lag or checkpoint age
+   * over threshold) > `healthy`. There is no success-shaped fallback: an
+   * unknown/absent signal never masks a failure.
+   */
+  ingestionHealth(): IngestionHealth {
+    if (this.ingestionFailed) {
+      return "failed";
+    }
+    if (
+      this.ledgerLag >= this.ingestionThresholds.staleLedgerLag ||
+      this.checkpointAgeMs >= this.ingestionThresholds.staleCheckpointAgeMs
+    ) {
+      return "stale";
+    }
+    return "healthy";
+  }
+
   /** Return a defensive copy of the current metric values. */
   snapshot(): MetricsSnapshot {
+    const health = zeroed(INGESTION_HEALTH);
+    health[this.ingestionHealth()] = 1;
     return {
       taskRuns: { ...this.taskRuns },
       taskFailures: { ...this.taskFailures },
@@ -120,6 +246,14 @@ export class AgentMetrics {
       submissions: { ...this.submissions },
       traceBacklog: this.traceBacklog,
       schedulerDelayMs: this.schedulerDelayMs,
+      ingestion: {
+        ledgerLag: this.ledgerLag,
+        pollDurationMs: this.pollDurationMs,
+        decodeFailures: this.decodeFailures,
+        retries: this.retries,
+        checkpointAgeMs: this.checkpointAgeMs,
+        health,
+      },
     };
   }
 
@@ -131,6 +265,13 @@ export class AgentMetrics {
     this.submissions = zeroed(SUBMISSION_RESULTS);
     this.traceBacklog = 0;
     this.schedulerDelayMs = 0;
+    this.ledgerLag = 0;
+    this.pollDurationMs = 0;
+    this.decodeFailures = 0;
+    this.retries = 0;
+    this.checkpointAgeMs = 0;
+    this.ingestionFailed = false;
+    this.ingestionThresholds = { ...DEFAULT_INGESTION_THRESHOLDS };
   }
 }
 
@@ -182,6 +323,34 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
   lines.push("# TYPE agent_scheduler_delay_ms gauge");
   lines.push(`agent_scheduler_delay_ms ${snapshot.schedulerDelayMs}`);
 
+  const ingestion = snapshot.ingestion;
+
+  lines.push("# HELP indexer_ledger_lag Ledgers between chain head and last ingested ledger.");
+  lines.push("# TYPE indexer_ledger_lag gauge");
+  lines.push(`indexer_ledger_lag ${ingestion.ledgerLag}`);
+
+  lines.push("# HELP indexer_poll_duration_ms Most recent ingestion poll duration in ms.");
+  lines.push("# TYPE indexer_poll_duration_ms gauge");
+  lines.push(`indexer_poll_duration_ms ${ingestion.pollDurationMs}`);
+
+  lines.push("# HELP indexer_decode_failures_total Cumulative decode failures.");
+  lines.push("# TYPE indexer_decode_failures_total counter");
+  lines.push(`indexer_decode_failures_total ${ingestion.decodeFailures}`);
+
+  lines.push("# HELP indexer_retries_total Cumulative ingestion retries.");
+  lines.push("# TYPE indexer_retries_total counter");
+  lines.push(`indexer_retries_total ${ingestion.retries}`);
+
+  lines.push("# HELP indexer_checkpoint_age_ms Age of the last durable checkpoint in ms.");
+  lines.push("# TYPE indexer_checkpoint_age_ms gauge");
+  lines.push(`indexer_checkpoint_age_ms ${ingestion.checkpointAgeMs}`);
+
+  lines.push("# HELP indexer_health Ingestion health state (1 = active).");
+  lines.push("# TYPE indexer_health gauge");
+  for (const state of INGESTION_HEALTH) {
+    lines.push(`indexer_health{state="${state}"} ${ingestion.health[state]}`);
+  }
+
   return lines.join("\n") + "\n";
 }
 
@@ -232,196 +401,4 @@ export interface CalibrationBucket {
   upper: number;
   /** Number of labeled decisions in this bucket. */
   count: number;
-  /** Mean predicted probability within the bucket (0 when empty). */
-  meanPredicted: number;
-  /** Realized win rate within the bucket (0 when empty). */
-  realizedRate: number;
 }
-
-export interface CalibrationReport {
-  version: number;
-  /** Total archived decisions considered. */
-  totalDecisions: number;
-  /** Decisions with a known outcome (used for scoring). */
-  labeledDecisions: number;
-  /** Decisions whose outcome is not yet known (excluded from scoring). */
-  unavailableDecisions: number;
-  /** Brier score over labeled decisions (lower is better); null if none. */
-  brierScore: number | null;
-  /** Mean expected edge over labeled decisions; null if none. */
-  expectedEdge: number | null;
-  /** Mean realized edge over labeled decisions; null if none. */
-  realizedEdge: number | null;
-  /** Realized minus expected edge; null if unavailable. */
-  realizedVersusExpectedEdge: number | null;
-  /** Calibration buckets over predicted probability. */
-  buckets: CalibrationBucket[];
-  /** Counts of skip reasons (bounded, sorted by reason). */
-  skipReasons: Record<string, number>;
-  /** Counts of exposure outcomes. */
-  exposureOutcomes: Record<ExposureOutcome, number>;
-}
-
-function clampProbability(value: number): number {
-  if (!Number.isFinite(value)) {
-    return 0;
-  }
-  return Math.min(1, Math.max(0, value));
-}
-
-function bucketIndex(probability: number): number {
-  const last = CALIBRATION_BUCKETS.length - 2;
-  for (let i = 0; i < last; i += 1) {
-    if (probability < CALIBRATION_BUCKETS[i + 1]) {
-      return i;
-    }
-  }
-  return last;
-}
-
-/**
- * Build a versioned decision-quality and calibration report from archived
- * decisions. Unavailable outcomes are excluded from scoring and counted
- * separately, never treated as losses.
- */
-export function buildCalibrationReport(
-  decisions: readonly ArchivedDecision[],
-): CalibrationReport {
-  const bucketCount = CALIBRATION_BUCKETS.length - 1;
-  const bucketCounts = new Array<number>(bucketCount).fill(0);
-  const bucketPredicted = new Array<number>(bucketCount).fill(0);
-  const bucketWins = new Array<number>(bucketCount).fill(0);
-
-  const skipReasons: Record<string, number> = {};
-  const exposureOutcomes: Record<ExposureOutcome, number> = {
-    win: 0,
-    loss: 0,
-    flat: 0,
-    unavailable: 0,
-  };
-
-  let labeled = 0;
-  let unavailable = 0;
-  let brierSum = 0;
-  let expectedSum = 0;
-  let realizedSum = 0;
-  let realizedCount = 0;
-
-  for (const decision of decisions) {
-    const probability = clampProbability(decision.predictedProbability);
-
-    if (decision.skipReason) {
-      skipReasons[decision.skipReason] = (skipReasons[decision.skipReason] ?? 0) + 1;
-    }
-
-    if (decision.realizedOutcome === null) {
-      unavailable += 1;
-      exposureOutcomes.unavailable += 1;
-      continue;
-    }
-
-    labeled += 1;
-    const realized = decision.realizedOutcome ? 1 : 0;
-    brierSum += (probability - realized) ** 2;
-    expectedSum += Number.isFinite(decision.expectedEdge) ? decision.expectedEdge : 0;
-
-    if (decision.realizedEdge !== null && Number.isFinite(decision.realizedEdge)) {
-      realizedSum += decision.realizedEdge;
-      realizedCount += 1;
-    }
-
-    if (decision.realizedOutcome) {
-      exposureOutcomes.win += 1;
-    } else {
-      exposureOutcomes.loss += 1;
-    }
-
-    const index = bucketIndex(probability);
-    bucketCounts[index] += 1;
-    bucketPredicted[index] += probability;
-    bucketWins[index] += realized;
-  }
-
-  const buckets: CalibrationBucket[] = [];
-  for (let i = 0; i < bucketCount; i += 1) {
-    const count = bucketCounts[i];
-    buckets.push({
-      lower: CALIBRATION_BUCKETS[i],
-      upper: CALIBRATION_BUCKETS[i + 1],
-      count,
-      meanPredicted: count > 0 ? bucketPredicted[i] / count : 0,
-      realizedRate: count > 0 ? bucketWins[i] / count : 0,
-    });
-  }
-
-  const expectedEdge = labeled > 0 ? expectedSum / labeled : null;
-  const realizedEdge = realizedCount > 0 ? realizedSum / realizedCount : null;
-
-  return {
-    version: CALIBRATION_REPORT_VERSION,
-    totalDecisions: decisions.length,
-    labeledDecisions: labeled,
-    unavailableDecisions: unavailable,
-    brierScore: labeled > 0 ? brierSum / labeled : null,
-    expectedEdge,
-    realizedEdge,
-    realizedVersusExpectedEdge:
-      expectedEdge !== null && realizedEdge !== null
-        ? realizedEdge - expectedEdge
-        : null,
-    buckets,
-    skipReasons,
-    exposureOutcomes,
-  };
-}
-
-/**
- * Walk-forward backtest evaluation for trading strategies (issue #61).
- *
- * Design constraints:
- * - No look-ahead bias: at each step the strategy only sees observations up to
- *   and including the current index; future data is never passed to it.
- * - Fees and position/size caps are modeled on every rebalance.
- * - Missing data is handled by an explicit, documented policy.
- * - A benchmark (buy-and-hold) is evaluated alongside the strategy.
- * - Reports returns, drawdown and calibration alongside the benchmark.
- * - Pure evaluation only: this module has no control-flow authority and never
- *   bypasses the safe dry-run default or on-chain risk controls.
- */
-
-export type MissingDataPolicy = "skip" | "hold" | "flat";
-
-export interface BacktestObservation {
-  /** Monotonic timestamp; observations must be supplied in ascending order. */
-  timestamp: number;
-  /** Reference price for the step; `null` marks a missing observation. */
-  price: number | null;
-}
-
-export interface BacktestConfig {
-  /** Proportional trading fee applied to the traded notional (e.g. 0.001). */
-  feeRate: number;
-  /** Maximum absolute position size as a fraction of equity (e.g. 1.0). */
-  maxPositionFraction: number;
-  /** Policy applied when an observation is missing. */
-  missingDataPolicy: MissingDataPolicy;
-}
-
-export interface BacktestStep {
-  timestamp: number;
-  /** Target position fraction chosen by the strategy (post-cap). */
-  position: number;
-  /** Strategy equity after fees for this step. */
-  equity: number;
-  /** Benchmark (buy-and-hold) equity for this step. */
-  benchmarkEquity: number;
-  /** True when the observation was missing and the policy was applied. */
-  missing: boolean;
-}
-
-export interface BacktestResult {
-  steps: BacktestStep[];
-  /** Total strategy return over the window (fractional). */
-  strategyRetur
-
-/* … truncated 6852 chars — edit only what you need near the top … */
