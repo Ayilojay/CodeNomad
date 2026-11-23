@@ -205,3 +205,6 @@ breaking change and requires a version bump. The `/health/live` and
 
 <!-- handsoff-issue-48 -->
 - #48: [governance] Add governance action simulation before timelock scheduling
+
+<!-- handsoff-issue-27 -->
+- #27: [treasury] Add a read-only exposure and capital dashboard API

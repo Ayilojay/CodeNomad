@@ -144,6 +144,154 @@ export interface AgentRiskState {
     global: AgentUsageWindow;
     agent: AgentUsageWindow;
   };
-  /** Treasury's current token balance before a possible yield withdrawa
+  /** Treasury's current token balance before a possible yield withdrawal. */
+  treasuryBalance: bigint;
+  /** Amount currently deployed into yield strategies. */
+  yieldDeployed: bigint;
+  /** Optional per-market exposure already booked, keyed by market id. */
+  marketExposure?: Record<string, bigint>;
+}
 
-/* … truncated 7739 chars — edit only what you need near the top … */
+export interface AgentRiskPolicy {
+  maxTrade: bigint;
+  maxMarket: bigint;
+  maxDaily: bigint;
+  maxNetExposure: bigint;
+}
+
+export interface AgentUsageWindow {
+  day: bigint;
+  dailyNotional: bigint;
+  netExposure: bigint;
+}
+
+/**
+ * A single deployment of an agent against a market. Multiple deployments may
+ * share the same underlying market liquidity, so aggregate risk must be
+ * evaluated across all of them rather than per-instance.
+ */
+export interface AgentDeployment {
+  id: string;
+  marketId: string;
+  /** Notional currently at risk in this deployment. */
+  notional: bigint;
+  /** Fraction (0..1) of the deployment exposed to the market's shared liquidity. */
+  liquidityShare: number;
+}
+
+/**
+ * A correlated stress scenario: a set of markets that move together, the
+ * drawdown applied to each, and the shared liquidity available to absorb it.
+ */
+export interface CorrelatedStressScenario {
+  id: string;
+  /** Markets assumed to be perfectly correlated in this scenario. */
+  marketIds: string[];
+  /** Fractional drawdown (0..1) applied simultaneously to every market. */
+  drawdown: number;
+  /** Shared liquidity pool (in token units) backing the correlated markets. */
+  sharedLiquidity: bigint;
+}
+
+export interface DeploymentStressResult {
+  deploymentId: string;
+  marketId: string;
+  /** Loss booked to this deployment under the scenario. */
+  loss: bigint;
+  /** Portion of the loss that could not be covered by shared liquidity. */
+  uncoveredLoss: bigint;
+}
+
+export interface TreasuryStressReport {
+  scenarioId: string;
+  /** Worst-case capital at risk across all deployments in the scenario. */
+  capitalAtRisk: bigint;
+  /** Total loss across deployments after shared-liquidity absorption. */
+  totalLoss: bigint;
+  /** Loss that exceeds shared liquidity and must be borne by the treasury. */
+  uncoveredLoss: bigint;
+  /** Per-deployment breakdown for operator inspection. */
+  deployments: DeploymentStressResult[];
+  /**
+   * Controls that act on-chain (enforced by contracts) versus off-chain
+   * (advisory only). Operators must not rely on off-chain controls for safety.
+   */
+  onChainControls: string[];
+  offChainControls: string[];
+}
+
+function clampFraction(value: number): number {
+  if (!Number.isFinite(value)) return 0;
+  if (value < 0) return 0;
+  if (value > 1) return 1;
+  return value;
+}
+
+function toBigIntFraction(amount: bigint, fraction: number): bigint {
+  // Scale to basis points to keep bigint math deterministic.
+  const bps = BigInt(Math.round(clampFraction(fraction) * 10_000));
+  return (amount * bps) / 10_000n;
+}
+
+/**
+ * Evaluate a treasury-wide loss and exposure stress model. Correlated markets
+ * draw down simultaneously; losses are first absorbed by the shared liquidity
+ * pool, and any remainder is reported as uncovered treasury loss. The report
+ * also enumerates which controls act on-chain so operators can reason about
+ * enforceable guarantees.
+ */
+export function evaluateTreasuryStress(
+  scenario: CorrelatedStressScenario,
+  deployments: AgentDeployment[],
+): TreasuryStressReport {
+  const drawdown = clampFraction(scenario.drawdown);
+  const correlated = new Set(scenario.marketIds);
+  const affected = deployments.filter((d) => correlated.has(d.marketId));
+
+  let capitalAtRisk = 0n;
+  let grossLoss = 0n;
+  const results: DeploymentStressResult[] = affected.map((deployment) => {
+    const exposure = deployment.notional > 0n ? deployment.notional : 0n;
+    capitalAtRisk += exposure;
+    const loss = toBigIntFraction(exposure, drawdown);
+    grossLoss += loss;
+    return {
+      deploymentId: deployment.id,
+      marketId: deployment.marketId,
+      loss,
+      uncoveredLoss: 0n,
+    };
+  });
+
+  const liquidity = scenario.sharedLiquidity > 0n ? scenario.sharedLiquidity : 0n;
+  const absorbed = grossLoss < liquidity ? grossLoss : liquidity;
+  const uncoveredLoss = grossLoss - absorbed;
+
+  // Distribute the uncovered remainder proportionally across deployments so
+  // operators can see which deployment drives treasury loss.
+  if (uncoveredLoss > 0n && grossLoss > 0n) {
+    for (const result of results) {
+      result.uncoveredLoss = (result.loss * uncoveredLoss) / grossLoss;
+    }
+  }
+
+  return {
+    scenarioId: scenario.id,
+    capitalAtRisk,
+    totalLoss: grossLoss,
+    uncoveredLoss,
+    deployments: results,
+    onChainControls: [
+      "per-trade cap (maxTrade)",
+      "per-market cap (maxMarket)",
+      "daily notional cap (maxDaily)",
+      "net exposure cap (maxNetExposure)",
+      "treasury balance / yield withdrawal guard",
+    ],
+    offChainControls: [
+      "correlated stress scenario selection",
+      "shared-liquidity assumptions",
+      "operator alerting and dashboards",
+    ],
+  };
+}
