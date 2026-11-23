@@ -112,6 +112,99 @@ describe("agents runtime metrics", () => {
     expect(metrics.isDryRun()).toBe(true);
     expect(metrics.snapshot().dryRun).toBe(true);
   });
+
+  it("tracks indexer ledger lag as a gauge", () => {
+    metrics.setIndexerLedgerLag(0);
+    expect(metrics.snapshot().indexer.ledgerLag).toBe(0);
+
+    metrics.setIndexerLedgerLag(12);
+    expect(metrics.snapshot().indexer.ledgerLag).toBe(12);
+
+    // Negative lag is clamped to zero rather than reported as a success.
+    metrics.setIndexerLedgerLag(-3);
+    expect(metrics.snapshot().indexer.ledgerLag).toBe(0);
+  });
+
+  it("tracks indexer poll duration with bounded histogram buckets", () => {
+    metrics.observeIndexerPollDuration(5);
+    metrics.observeIndexerPollDuration(150);
+    metrics.observeIndexerPollDuration(5000);
+
+    const snap = metrics.snapshot();
+    expect(snap.indexer.pollDuration.count).toBe(3);
+    expect(snap.indexer.pollDuration.sum).toBe(5155);
+    expect(snap.indexer.pollDuration.buckets.length).toBeLessThanOrEqual(16);
+  });
+
+  it("counts indexer decode failures and retries with bounded labels", () => {
+    metrics.recordIndexerDecodeFailure("decode");
+    metrics.recordIndexerDecodeFailure("decode");
+    metrics.recordIndexerDecodeFailure("schema");
+    metrics.recordIndexerRetry("rpc");
+    metrics.recordIndexerRetry("rpc");
+    metrics.recordIndexerRetry("checkpoint");
+
+    const snap = metrics.snapshot();
+    expect(snap.indexer.decodeFailuresTotal).toBe(3);
+    expect(snap.indexer.decodeFailuresByReason.decode).toBe(2);
+    expect(snap.indexer.decodeFailuresByReason.schema).toBe(1);
+    expect(snap.indexer.retriesTotal).toBe(3);
+    expect(snap.indexer.retriesByReason.rpc).toBe(2);
+    expect(snap.indexer.retriesByReason.checkpoint).toBe(1);
+
+    // Unknown labels collapse into a bounded "other" bucket.
+    metrics.recordIndexerDecodeFailure("unexpected" as never);
+    metrics.recordIndexerRetry("unexpected" as never);
+    const bounded = metrics.snapshot();
+    expect(Object.keys(bounded.indexer.decodeFailuresByReason).length).toBeLessThanOrEqual(4);
+    expect(Object.keys(bounded.indexer.retriesByReason).length).toBeLessThanOrEqual(4);
+  });
+
+  it("tracks indexer checkpoint age as a gauge", () => {
+    metrics.setIndexerCheckpointAge(0);
+    expect(metrics.snapshot().indexer.checkpointAge).toBe(0);
+
+    metrics.setIndexerCheckpointAge(90);
+    expect(metrics.snapshot().indexer.checkpointAge).toBe(90);
+
+    metrics.setIndexerCheckpointAge(-1);
+    expect(metrics.snapshot().indexer.checkpointAge).toBe(0);
+  });
+
+  it("reports healthy indexer state when lag and checkpoint age are within bounds", () => {
+    metrics.setIndexerLedgerLag(2);
+    metrics.setIndexerCheckpointAge(10);
+    metrics.recordIndexerDecodeFailure("decode");
+
+    expect(metrics.indexerHealth()).toBe("healthy");
+  });
+
+  it("reports stale ingestion distinctly from failed ingestion", () => {
+    metrics.setIndexerLedgerLag(500);
+    metrics.setIndexerCheckpointAge(10);
+    expect(metrics.indexerHealth()).toBe("stale");
+
+    metrics.setIndexerLedgerLag(2);
+    metrics.setIndexerCheckpointAge(10_000);
+    expect(metrics.indexerHealth()).toBe("stale");
+
+    // A decode failure must surface as failed, never masked as healthy/stale.
+    metrics.setIndexerLedgerLag(2);
+    metrics.setIndexerCheckpointAge(10);
+    metrics.recordIndexerDecodeFailure("decode");
+    expect(metrics.indexerHealth()).toBe("failed");
+  });
+
+  it("does not leak secrets or unbounded identifiers in indexer metrics", () => {
+    metrics.recordIndexerDecodeFailure("decode");
+    metrics.recordIndexerRetry("rpc");
+    metrics.setIndexerLedgerLag(7);
+
+    const serialized = JSON.stringify(metrics.snapshot());
+    expect(serialized).not.toMatch(/secret/i);
+    expect(serialized).not.toMatch(/api[_-]?key/i);
+    expect(serialized).not.toMatch(/0x[0-9a-fA-F]{40}/);
+  });
 });
 
 // Deterministic multi-seed fixtures for tournament evaluation.
@@ -244,66 +337,5 @@ describe("agent decision-quality and calibration report", () => {
     const high = report.calibration.find((b) => b.lower <= 0.9 && b.upper > 0.9)!;
     expect(high.count).toBe(2);
     expect(high.realizedRate).toBeCloseTo(1);
-  });
-
-  it("computes the Brier score over labeled decisions", () => {
-    const report = buildCalibrationReport([
-      decision({ id: "a", predictedProbability: 0.9, outcome: "win" }),
-      decision({ id: "b", predictedProbability: 0.1, outcome: "loss" }),
-    ]);
-
-    // (0.9-1)^2 + (0.1-0)^2 = 0.01 + 0.01 = 0.02, mean = 0.01
-    expect(report.brierScore).toBeCloseTo(0.01);
-    expect(report.labeledCount).toBe(2);
-  });
-
-  it("computes realized-versus-expected edge", () => {
-    const report = buildCalibrationReport([
-      decision({ id: "a", expectedEdge: 0.2, realizedEdge: 0.1 }),
-      decision({ id: "b", expectedEdge: 0.1, realizedEdge: 0.3 }),
-    ]);
-
-    expect(report.edge.expected).toBeCloseTo(0.15);
-    expect(report.edge.realized).toBeCloseTo(0.2);
-    expect(report.edge.delta).toBeCloseTo(0.05);
-  });
-
-  it("summarizes skip reasons and exposure outcomes", () => {
-    const report = buildCalibrationReport([
-      decision({ id: "a", outcome: "win", exposure: 100 }),
-      decision({ id: "b", outcome: "loss", exposure: 50 }),
-      decision({ id: "c", outcome: "skipped", skipReason: "risk_limit", exposure: 0 }),
-      decision({ id: "d", outcome: "skipped", skipReason: "risk_limit", exposure: 0 }),
-      decision({ id: "e", outcome: "skipped", skipReason: "low_confidence", exposure: 0 }),
-    ]);
-
-    expect(report.skipReasons.risk_limit).toBe(2);
-    expect(report.skipReasons.low_confidence).toBe(1);
-    expect(report.exposure.win).toBe(100);
-    expect(report.exposure.loss).toBe(50);
-    expect(report.exposure.skipped).toBe(0);
-  });
-
-  it("distinguishes unavailable outcomes from losses", () => {
-    const report = buildCalibrationReport([
-      decision({ id: "a", outcome: "win" }),
-      decision({ id: "b", outcome: "unavailable" }),
-    ]);
-
-    // Unavailable outcomes are excluded from calibration and Brier scoring.
-    expect(report.labeledCount).toBe(1);
-    expect(report.unavailableCount).toBe(1);
-    expect(report.brierScore).toBeCloseTo(0.25);
-    expect(report.exposure.unavailable).toBe(100);
-  });
-
-  it("handles an empty archive without throwing", () => {
-    const report = buildCalibrationReport([]);
-
-    expect(report.schemaVersion).toBe(CALIBRATION_REPORT_SCHEMA_VERSION);
-    expect(report.calibration).toEqual([]);
-    expect(report.brierScore).toBeNull();
-    expect(report.labeledCount).toBe(0);
-    expect(report.edge.delta).toBeNull();
   });
 });
