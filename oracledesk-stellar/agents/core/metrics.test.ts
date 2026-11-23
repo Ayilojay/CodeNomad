@@ -9,6 +9,11 @@ import {
   type StrategyVariant,
   type SeedRunResult,
 } from "./backtest";
+import {
+  buildCalibrationReport,
+  CALIBRATION_REPORT_SCHEMA_VERSION,
+  type ArchivedDecision,
+} from "./calibration";
 
 describe("agents runtime metrics", () => {
   let metrics: MetricsRegistry;
@@ -201,5 +206,104 @@ describe("strategy tournament evaluation", () => {
 
     expect(report.variants).toHaveLength(1);
     expect(report.ranking).toEqual(["only"]);
+  });
+});
+
+// Small labeled dataset for the decision-quality / calibration report.
+function decision(
+  overrides: Partial<ArchivedDecision> = {},
+): ArchivedDecision {
+  return {
+    id: "d",
+    predictedProbability: 0.5,
+    outcome: "win",
+    expectedEdge: 0.1,
+    realizedEdge: 0.1,
+    exposure: 100,
+    ...overrides,
+  };
+}
+
+describe("agent decision-quality and calibration report", () => {
+  it("buckets predicted probability against realized outcomes", () => {
+    const report = buildCalibrationReport([
+      decision({ id: "a", predictedProbability: 0.1, outcome: "win" }),
+      decision({ id: "b", predictedProbability: 0.1, outcome: "loss" }),
+      decision({ id: "c", predictedProbability: 0.9, outcome: "win" }),
+      decision({ id: "d", predictedProbability: 0.9, outcome: "win" }),
+    ]);
+
+    expect(report.schemaVersion).toBe(CALIBRATION_REPORT_SCHEMA_VERSION);
+    expect(report.calibration).toHaveLength(2);
+
+    const low = report.calibration.find((b) => b.lower <= 0.1 && b.upper > 0.1)!;
+    expect(low.count).toBe(2);
+    expect(low.meanPredicted).toBeCloseTo(0.1);
+    expect(low.realizedRate).toBeCloseTo(0.5);
+
+    const high = report.calibration.find((b) => b.lower <= 0.9 && b.upper > 0.9)!;
+    expect(high.count).toBe(2);
+    expect(high.realizedRate).toBeCloseTo(1);
+  });
+
+  it("computes the Brier score over labeled decisions", () => {
+    const report = buildCalibrationReport([
+      decision({ id: "a", predictedProbability: 0.9, outcome: "win" }),
+      decision({ id: "b", predictedProbability: 0.1, outcome: "loss" }),
+    ]);
+
+    // (0.9-1)^2 + (0.1-0)^2 = 0.01 + 0.01 = 0.02, mean = 0.01
+    expect(report.brierScore).toBeCloseTo(0.01);
+    expect(report.labeledCount).toBe(2);
+  });
+
+  it("computes realized-versus-expected edge", () => {
+    const report = buildCalibrationReport([
+      decision({ id: "a", expectedEdge: 0.2, realizedEdge: 0.1 }),
+      decision({ id: "b", expectedEdge: 0.1, realizedEdge: 0.3 }),
+    ]);
+
+    expect(report.edge.expected).toBeCloseTo(0.15);
+    expect(report.edge.realized).toBeCloseTo(0.2);
+    expect(report.edge.delta).toBeCloseTo(0.05);
+  });
+
+  it("summarizes skip reasons and exposure outcomes", () => {
+    const report = buildCalibrationReport([
+      decision({ id: "a", outcome: "win", exposure: 100 }),
+      decision({ id: "b", outcome: "loss", exposure: 50 }),
+      decision({ id: "c", outcome: "skipped", skipReason: "risk_limit", exposure: 0 }),
+      decision({ id: "d", outcome: "skipped", skipReason: "risk_limit", exposure: 0 }),
+      decision({ id: "e", outcome: "skipped", skipReason: "low_confidence", exposure: 0 }),
+    ]);
+
+    expect(report.skipReasons.risk_limit).toBe(2);
+    expect(report.skipReasons.low_confidence).toBe(1);
+    expect(report.exposure.win).toBe(100);
+    expect(report.exposure.loss).toBe(50);
+    expect(report.exposure.skipped).toBe(0);
+  });
+
+  it("distinguishes unavailable outcomes from losses", () => {
+    const report = buildCalibrationReport([
+      decision({ id: "a", outcome: "win" }),
+      decision({ id: "b", outcome: "unavailable" }),
+    ]);
+
+    // Unavailable outcomes are excluded from calibration and Brier scoring.
+    expect(report.labeledCount).toBe(1);
+    expect(report.unavailableCount).toBe(1);
+    expect(report.brierScore).toBeCloseTo(0.25);
+    expect(report.exposure.unavailable).toBe(100);
+  });
+
+  it("handles an empty archive without throwing", () => {
+    const report = buildCalibrationReport([]);
+
+    expect(report.schemaVersion).toBe(CALIBRATION_REPORT_SCHEMA_VERSION);
+    expect(report.calibration).toEqual([]);
+    expect(report.brierScore).toBeNull();
+    expect(report.labeledCount).toBe(0);
+    expect(report.edge.delta).toBeNull();
   });
 });

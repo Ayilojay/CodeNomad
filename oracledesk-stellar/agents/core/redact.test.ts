@@ -83,3 +83,29 @@ test("redacts credentials embedded in provider observation payloads", () => {
   assert.ok(serialized.includes("provider-alpha"), "source id should remain");
   assert.ok(serialized.includes("0xabc123"), "evidence hash should remain");
 });
+
+// Payer-facing payment error taxonomy (#83): payer-visible error payloads must
+// be redacted so internal identifiers, stack traces, and upstream payloads
+// never leak while retryability and recovery guidance stay intact.
+test("redacts sensitive internals from payer-facing payment error payloads", () => {
+  const secretSeed = `S${"E".repeat(55)}`;
+  const payerError = {
+    schemaVersion: "x402.payment-error.v1",
+    code: "uncertain_settlement",
+    retryable: false,
+    recovery: "Do not resubmit; reconcile settlement before retrying.",
+    internal: {
+      stack: "Error: boom\n    at settle (/srv/agents/core/settle.ts:42:7)",
+      requestId: "req-internal-123",
+      upstream: { authorization: "Bearer upstream-token", signer: secretSeed },
+    },
+  };
+  const serialized = JSON.stringify(redact(payerError));
+  assert.ok(!serialized.includes("settle.ts"), "stack trace leaked");
+  assert.ok(!serialized.includes("req-internal-123"), "internal id leaked");
+  assert.ok(!serialized.includes("upstream-token"), "upstream token leaked");
+  assert.ok(!serialized.includes(secretSeed), "secret seed leaked");
+  assert.ok(serialized.includes("x402.payment-error.v1"), "schema version should remain");
+  assert.ok(serialized.includes("uncertain_settlement"), "error code should remain");
+  assert.ok(serialized.includes("Do not resubmit"), "recovery guidance should remain");
+});

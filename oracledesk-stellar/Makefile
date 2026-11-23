@@ -74,8 +74,13 @@ model-test:
 	python3 model/system_model.py --selftest
 	cargo test -p integration-tests --test system_model
 
-e2e-local:
-	./scripts/e2e-local.sh
+# End-to-end validation of the live agent adapter against a hermetic localnet
+# (issue #66): build → sign → submit → confirm → reconcile one bounded
+# transaction with an ephemeral key, plus assertions that the safe dry-run
+# default cannot reach signer or submit endpoints. Requires `make setup` and
+# `make build` first; see agents/README.md for the documented flow.
+e2e-local: build
+	cd agents && npm run test:e2e-local
 
 fmt:
 	cargo fmt
