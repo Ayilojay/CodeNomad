@@ -207,3 +207,91 @@ export function normalizeObservations(
   }
   return accepted;
 }
+
+/**
+ * x402 payer-facing payment error taxonomy.
+ *
+ * Stable, versioned, machine-readable shape returned to payers. Each code
+ * carries a fixed retryability flag and recovery guidance so clients can act
+ * deterministically without parsing free-form messages.
+ *
+ * Guarantees:
+ * - `PAYMENT_ERROR_SCHEMA_VERSION` is bumped on any breaking shape change.
+ * - `uncertain_settlement` is NEVER retryable and never success-shaped: the
+ *   payer must reconcile on-chain state before re-attempting payment.
+ * - Sensitive internals (stack traces, internal identifiers, secrets, raw
+ *   upstream payloads) are redacted from the payer-facing output.
+ */
+export const PAYMENT_ERROR_SCHEMA_VERSION = "1.0.0" as const;
+
+export type PaymentErrorCode =
+  | "invalid_payment"
+  | "dependency_unavailable"
+  | "missing_trace"
+  | "uncertain_settlement";
+
+export interface PaymentErrorDefinition {
+  code: PaymentErrorCode;
+  retryable: boolean;
+  recovery: string;
+}
+
+export const PAYMENT_ERROR_TAXONOMY: Readonly<
+  Record<PaymentErrorCode, PaymentErrorDefinition>
+> = Object.freeze({
+  invalid_payment: {
+    code: "invalid_payment",
+    retryable: false,
+    recovery:
+      "Payment proof failed verification. Rebuild the payment from the current 402 challenge and do not reuse the rejected proof.",
+  },
+  dependency_unavailable: {
+    code: "dependency_unavailable",
+    retryable: true,
+    recovery:
+      "A required dependency is temporarily unavailable. Retry with backoff after the advertised retry-after window.",
+  },
+  missing_trace: {
+    code: "missing_trace",
+    retryable: true,
+    recovery:
+      "The referenced trace could not be located. Re-submit the request with a valid trace reference.",
+  },
+  uncertain_settlement: {
+    code: "uncertain_settlement",
+    retryable: false,
+    recovery:
+      "Settlement state is unknown. Do not retry blindly; reconcile the on-chain transaction before attempting payment again.",
+  },
+});
+
+export interface PayerPaymentError {
+  schemaVersion: typeof PAYMENT_ERROR_SCHEMA_VERSION;
+  code: PaymentErrorCode;
+  retryable: boolean;
+  recovery: string;
+  /** Optional redacted human-readable detail; never contains internals. */
+  detail?: string;
+}
+
+/**
+ * Build a stable, redacted payer-facing payment error from a taxonomy code.
+ * Any supplied detail is redacted so secrets, keys and raw upstream payloads
+ * never reach the payer.
+ */
+export function toPayerPaymentError(
+  code: PaymentErrorCode,
+  detail?: string,
+): PayerPaymentError {
+  const definition = PAYMENT_ERROR_TAXONOMY[code];
+  const result: PayerPaymentError = {
+    schemaVersion: PAYMENT_ERROR_SCHEMA_VERSION,
+    code: definition.code,
+    retryable: definition.retryable,
+    recovery: definition.recovery,
+  };
+  if (typeof detail === "string" && detail.trim() !== "") {
+    result.detail = redactString(detail);
+  }
+  return result;
+}
