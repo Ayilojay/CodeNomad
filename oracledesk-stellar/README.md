@@ -56,3 +56,36 @@ cd oracledesk-stellar && go test ./agents/core/...
 
 Exercise the flow on localnet or with deterministic fixtures. No external
 prerequisites beyond a local Go toolchain are required for the unit tests.
+
+## Timelock-admin deployment mode
+
+By default the deployment tooling makes the deployer EOA the admin of each
+contract. To hand administration to a timelock, opt in explicitly with the
+timelock-admin deployment mode. When selected, the deployer EOA is **not** left
+as admin; instead each contract's admin is proposed to the timelock and the
+handover is completed through the timelock's accept-admin flow.
+
+### Operator-visible behavior
+
+- **Opt-in only.** Timelock-admin mode is enabled by an explicit flag/config
+  value. Without it, the existing deployer-EOA-admin behavior is unchanged.
+- **Deterministic and restartable.** Re-running the deployment is idempotent:
+  already-proposed and already-accepted handovers are detected and skipped, so
+  an interrupted run can be resumed without duplicating proposals.
+- **Admin verification.** After deployment, each contract's accepted admin is
+  read back and compared against the timelock address. A mismatch fails the run
+  with a clear, per-contract error rather than silently succeeding.
+- **Machine-readable manifest.** The run emits a manifest recording, per
+  contract, the proposed admin, the proposal status, and whether the handover
+  was completed. The manifest is the source of truth for verifying the handover.
+
+### Validation
+
+Run the deployment and wiring tests against the local Stellar network:
+
+```sh
+cd oracledesk-stellar && go test ./deploy/...
+```
+
+Re-run the deployment command to confirm the flow is idempotent and that the
+manifest reports completed handovers on the second pass.
