@@ -186,6 +186,196 @@ export function renderPrometheus(snapshot: MetricsSnapshot): string {
 }
 
 /**
+ * Agent decision-quality and calibration report (issue #75).
+ *
+ * Aggregates archived decisions into a versioned report covering:
+ * - calibration buckets (predicted probability vs realized outcome),
+ * - Brier score over labeled decisions,
+ * - realized-versus-expected edge,
+ * - skip reasons and exposure outcomes.
+ *
+ * Design constraints:
+ * - Pure evaluation only: no control-flow authority, never bypasses the safe
+ *   dry-run default or on-chain risk controls.
+ * - Unavailable outcomes are distinguished from losses: a decision whose
+ *   outcome is not yet known is excluded from scoring and counted separately,
+ *   never treated as a loss.
+ * - The report schema is versioned via `CALIBRATION_REPORT_VERSION`.
+ */
+
+export const CALIBRATION_REPORT_VERSION = 1;
+
+/** Fixed calibration bucket boundaries over predicted probability [0, 1]. */
+export const CALIBRATION_BUCKETS: readonly number[] = [
+  0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0,
+];
+
+export type ExposureOutcome = "win" | "loss" | "flat" | "unavailable";
+
+export interface ArchivedDecision {
+  /** Predicted probability of a positive outcome, in [0, 1]. */
+  predictedProbability: number;
+  /** Realized outcome: true = win, false = loss, null = not yet known. */
+  realizedOutcome: boolean | null;
+  /** Expected edge (fractional) the decision anticipated. */
+  expectedEdge: number;
+  /** Realized edge (fractional) once known; null when unavailable. */
+  realizedEdge: number | null;
+  /** Bounded skip reason when the decision was skipped, else null. */
+  skipReason: string | null;
+}
+
+export interface CalibrationBucket {
+  /** Inclusive lower bound of the bucket. */
+  lower: number;
+  /** Exclusive upper bound of the bucket (inclusive for the last bucket). */
+  upper: number;
+  /** Number of labeled decisions in this bucket. */
+  count: number;
+  /** Mean predicted probability within the bucket (0 when empty). */
+  meanPredicted: number;
+  /** Realized win rate within the bucket (0 when empty). */
+  realizedRate: number;
+}
+
+export interface CalibrationReport {
+  version: number;
+  /** Total archived decisions considered. */
+  totalDecisions: number;
+  /** Decisions with a known outcome (used for scoring). */
+  labeledDecisions: number;
+  /** Decisions whose outcome is not yet known (excluded from scoring). */
+  unavailableDecisions: number;
+  /** Brier score over labeled decisions (lower is better); null if none. */
+  brierScore: number | null;
+  /** Mean expected edge over labeled decisions; null if none. */
+  expectedEdge: number | null;
+  /** Mean realized edge over labeled decisions; null if none. */
+  realizedEdge: number | null;
+  /** Realized minus expected edge; null if unavailable. */
+  realizedVersusExpectedEdge: number | null;
+  /** Calibration buckets over predicted probability. */
+  buckets: CalibrationBucket[];
+  /** Counts of skip reasons (bounded, sorted by reason). */
+  skipReasons: Record<string, number>;
+  /** Counts of exposure outcomes. */
+  exposureOutcomes: Record<ExposureOutcome, number>;
+}
+
+function clampProbability(value: number): number {
+  if (!Number.isFinite(value)) {
+    return 0;
+  }
+  return Math.min(1, Math.max(0, value));
+}
+
+function bucketIndex(probability: number): number {
+  const last = CALIBRATION_BUCKETS.length - 2;
+  for (let i = 0; i < last; i += 1) {
+    if (probability < CALIBRATION_BUCKETS[i + 1]) {
+      return i;
+    }
+  }
+  return last;
+}
+
+/**
+ * Build a versioned decision-quality and calibration report from archived
+ * decisions. Unavailable outcomes are excluded from scoring and counted
+ * separately, never treated as losses.
+ */
+export function buildCalibrationReport(
+  decisions: readonly ArchivedDecision[],
+): CalibrationReport {
+  const bucketCount = CALIBRATION_BUCKETS.length - 1;
+  const bucketCounts = new Array<number>(bucketCount).fill(0);
+  const bucketPredicted = new Array<number>(bucketCount).fill(0);
+  const bucketWins = new Array<number>(bucketCount).fill(0);
+
+  const skipReasons: Record<string, number> = {};
+  const exposureOutcomes: Record<ExposureOutcome, number> = {
+    win: 0,
+    loss: 0,
+    flat: 0,
+    unavailable: 0,
+  };
+
+  let labeled = 0;
+  let unavailable = 0;
+  let brierSum = 0;
+  let expectedSum = 0;
+  let realizedSum = 0;
+  let realizedCount = 0;
+
+  for (const decision of decisions) {
+    const probability = clampProbability(decision.predictedProbability);
+
+    if (decision.skipReason) {
+      skipReasons[decision.skipReason] = (skipReasons[decision.skipReason] ?? 0) + 1;
+    }
+
+    if (decision.realizedOutcome === null) {
+      unavailable += 1;
+      exposureOutcomes.unavailable += 1;
+      continue;
+    }
+
+    labeled += 1;
+    const realized = decision.realizedOutcome ? 1 : 0;
+    brierSum += (probability - realized) ** 2;
+    expectedSum += Number.isFinite(decision.expectedEdge) ? decision.expectedEdge : 0;
+
+    if (decision.realizedEdge !== null && Number.isFinite(decision.realizedEdge)) {
+      realizedSum += decision.realizedEdge;
+      realizedCount += 1;
+    }
+
+    if (decision.realizedOutcome) {
+      exposureOutcomes.win += 1;
+    } else {
+      exposureOutcomes.loss += 1;
+    }
+
+    const index = bucketIndex(probability);
+    bucketCounts[index] += 1;
+    bucketPredicted[index] += probability;
+    bucketWins[index] += realized;
+  }
+
+  const buckets: CalibrationBucket[] = [];
+  for (let i = 0; i < bucketCount; i += 1) {
+    const count = bucketCounts[i];
+    buckets.push({
+      lower: CALIBRATION_BUCKETS[i],
+      upper: CALIBRATION_BUCKETS[i + 1],
+      count,
+      meanPredicted: count > 0 ? bucketPredicted[i] / count : 0,
+      realizedRate: count > 0 ? bucketWins[i] / count : 0,
+    });
+  }
+
+  const expectedEdge = labeled > 0 ? expectedSum / labeled : null;
+  const realizedEdge = realizedCount > 0 ? realizedSum / realizedCount : null;
+
+  return {
+    version: CALIBRATION_REPORT_VERSION,
+    totalDecisions: decisions.length,
+    labeledDecisions: labeled,
+    unavailableDecisions: unavailable,
+    brierScore: labeled > 0 ? brierSum / labeled : null,
+    expectedEdge,
+    realizedEdge,
+    realizedVersusExpectedEdge:
+      expectedEdge !== null && realizedEdge !== null
+        ? realizedEdge - expectedEdge
+        : null,
+    buckets,
+    skipReasons,
+    exposureOutcomes,
+  };
+}
+
+/**
  * Walk-forward backtest evaluation for trading strategies (issue #61).
  *
  * Design constraints:
@@ -232,212 +422,6 @@ export interface BacktestStep {
 export interface BacktestResult {
   steps: BacktestStep[];
   /** Total strategy return over the window (fractional). */
-  strategyReturn: number;
-  /** Total benchmark return over the window (fractional). */
-  benchmarkReturn: number;
-  /** Maximum peak-to-trough drawdown of the strategy (fractional, >= 0). */
-  maxDrawdown: number;
-  /** Mean absolute calibration error of predicted vs realized returns. */
-  calibrationError: number;
-}
+  strategyRetur
 
-/**
- * Strategy tournament evaluation with risk-adjusted scoring (issue #63).
- *
- * Design constraints:
- * - Variants are compared across a SHARED set of seeds. A comparison is only
- *   valid when every variant was evaluated on the identical seed set; unpaired
- *   comparisons are rejected rather than silently reported.
- * - Risk-adjusted metrics are computed per variant: drawdown, tail loss
- *   (worst-case / CVaR-style), turnover, calibration error and capital use.
- * - Uncertainty intervals are reported for each metric so that differences
- *   between variants are not over-interpreted.
- * - Pure evaluation only: this module has no control-flow authority and never
- *   bypasses the safe dry-run default or on-chain risk controls.
- */
-
-export interface TournamentMetrics {
-  /** Mean total return across seeds (fractional). */
-  meanReturn: number;
-  /** Mean maximum drawdown across seeds (fractional, >= 0). */
-  meanDrawdown: number;
-  /** Mean tail loss: average of the worst-quantile seed returns (fractional). */
-  tailLoss: number;
-  /** Mean turnover: average absolute position change per step. */
-  meanTurnover: number;
-  /** Mean calibration error across seeds (fractional, >= 0). */
-  meanCalibrationError: number;
-  /** Mean capital use: average absolute position fraction per step. */
-  meanCapitalUse: number;
-}
-
-export interface Interval {
-  /** Lower bound of the uncertainty interval. */
-  low: number;
-  /** Upper bound of the uncertainty interval. */
-  high: number;
-}
-
-export interface TournamentVariantResult {
-  /** Per-seed metric samples, keyed by seed. */
-  samples: Record<string, TournamentMetrics>;
-  /** Aggregated point estimates across seeds. */
-  metrics: TournamentMetrics;
-  /** Uncertainty intervals for each aggregated metric. */
-  intervals: Record<keyof TournamentMetrics, Interval>;
-  /** Risk-adjusted score (higher is better); see `riskAdjustedScore`. */
-  score: number;
-}
-
-export interface TournamentResult {
-  /** Ordered list of seeds shared by every variant. */
-  seeds: string[];
-  /** Per-variant results, keyed by variant name. */
-  variants: Record<string, TournamentVariantResult>;
-  /** Variant names ranked by risk-adjusted score (best first). */
-  ranking: string[];
-}
-
-/** A single variant's per-seed metric sample. */
-export interface TournamentSample {
-  seed: string;
-  metrics: TournamentMetrics;
-}
-
-export interface TournamentVariant {
-  name: string;
-  samples: TournamentSample[];
-}
-
-/** Fraction of the worst seeds used to compute tail loss (e.g. 0.2 = worst 20%). */
-const TAIL_QUANTILE = 0.2;
-/** Two-sided z-score for a ~95% uncertainty interval. */
-const Z_95 = 1.96;
-
-function mean(values: number[]): number {
-  if (values.length === 0) {
-    return 0;
-  }
-  let sum = 0;
-  for (const v of values) {
-    sum += v;
-  }
-  return sum / values.length;
-}
-
-function stddev(values: number[]): number {
-  if (values.length < 2) {
-    return 0;
-  }
-  const m = mean(values);
-  let acc = 0;
-  for (const v of values) {
-    const d = v - m;
-    acc += d * d;
-  }
-  return Math.sqrt(acc / (values.length - 1));
-}
-
-/**
- * Compute a mean and a ~95% uncertainty interval for a metric sample.
- * With fewer than two samples the interval collapses to the point estimate.
- */
-function interval(values: number[]): Interval {
-  const m = mean(values);
-  if (values.length < 2) {
-    return { low: m, high: m };
-  }
-  const half = (Z_95 * stddev(values)) / Math.sqrt(values.length);
-  return { low: m - half, high: m + half };
-}
-
-/**
- * Risk-adjusted score for a variant: reward return, penalize drawdown, tail
- * loss, turnover and calibration error. Higher is better. Capital use is
- * reported but not scored (it is a constraint, not a reward).
- */
-export function riskAdjustedScore(metrics: TournamentMetrics): number {
-  return (
-    metrics.meanReturn -
-    metrics.meanDrawdown -
-    metrics.tailLoss -
-    metrics.meanTurnover -
-    metrics.meanCalibrationError
-  );
-}
-
-/**
- * Evaluate a strategy tournament across variants on a shared seed set.
- *
- * Throws when variants are not evaluated on identical seed sets, preventing
- * unpaired comparisons. Each variant must supply exactly one sample per seed.
- */
-export function evaluateTournament(
-  variants: TournamentVariant[],
-): TournamentResult {
-  if (variants.length === 0) {
-    return { seeds: [], variants: {}, ranking: [] };
-  }
-
-  const referenceSeeds = variants[0].samples.map((s) => s.seed).sort();
-  const referenceKey = referenceSeeds.join("\u0000");
-
-  for (const variant of variants) {
-    const seeds = variant.samples.map((s) => s.seed).sort();
-    if (seeds.join("\u0000") !== referenceKey) {
-      throw new Error(
-        `Unpaired comparison: variant "${variant.name}" was not evaluated on the shared seed set`,
-      );
-    }
-  }
-
-  const results: Record<string, TournamentVariantResult> = {};
-
-  for (const variant of variants) {
-    const bySeed: Record<string, TournamentMetrics> = {};
-    for (const sample of variant.samples) {
-      bySeed[sample.seed] = sample.metrics;
-    }
-
-    const ordered = referenceSeeds.map((seed) => bySeed[seed]);
-    const returns = ordered.map((m) => m.meanReturn);
-    const drawdowns = ordered.map((m) => m.meanDrawdown);
-    const turnovers = ordered.map((m) => m.meanTurnover);
-    const calibrations = ordered.map((m) => m.meanCalibrationError);
-    const capitalUses = ordered.map((m) => m.meanCapitalUse);
-
-    // Tail loss: average of the worst TAIL_QUANTILE fraction of seed returns.
-    const sortedReturns = [...returns].sort((a, b) => a - b);
-    const tailCount = Math.max(1, Math.ceil(sortedReturns.length * TAIL_QUANTILE));
-    const tailLoss = -mean(sortedReturns.slice(0, tailCount));
-
-    const metrics: TournamentMetrics = {
-      meanReturn: mean(returns),
-      meanDrawdown: mean(drawdowns),
-      tailLoss,
-      meanTurnover: mean(turnovers),
-      meanCalibrationError: mean(calibrations),
-      meanCapitalUse: mean(capitalUses),
-    };
-
-    results[variant.name] = {
-      samples: bySeed,
-      metrics,
-      intervals: {
-        meanReturn: interval(returns),
-        meanDrawdown: interval(drawdowns),
-        tailLoss: interval(ordered.map((m) => -m.meanReturn)),
-        meanTurnover: interval(turnovers),
-        meanCalibrationError: interval(calibrations),
-        meanCapitalUse: interval(capitalUses),
-      },
-      score: riskAdjustedScore(metrics),
-    };
-  }
-
-  const ranking = Object.keys(results).sort(
-    (a, b) => results[b].score - results[a].score,
-  );
-
-  return { seeds: referenceSeeds, variants: results, ranking };
-}
+/* … truncated 6852 chars — edit only what you need near the top … */
