@@ -362,12 +362,239 @@ if (traceExport) {
 renderTraceViewer();
 // ------------------------------------------------------------------------
 
-document.querySelectorAll(".market-row").forEach((row) => row.addEventListener("click", () => {
-  document.querySelectorAll(".market-row").forEach((item) => item.classList.remove("selected"));
-  row.classList.add("selected");
-  document.querySelector("#selected-market").textContent = row.dataset.market;
-  loadLifecycle(row.dataset.market);
-}));
+// --- Live market loading (#101) -----------------------------------------
+// All market rows come from the indexer/read API. Fixture rows are never
+// rendered as live data. The function surfaces four explicit states:
+//   loading  — request in flight
+//   loaded   — rows rendered from indexer response
+//   empty    — indexer returned an empty list
+//   stale    — indexer responded but ledger freshness metadata is stale
+//   error    — network or parse failure, with a retry affordance
+// Never falls back to hardcoded data after any failure state.
+
+const MARKET_LIST_STATES = {
+  loading: "loading",
+  loaded: "loaded",
+  empty: "empty",
+  stale: "stale",
+  error: "error"
+};
+
+// Age threshold (ms) beyond which we treat the indexed data as stale.
+const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
+
+const marketList = document.querySelector("#market-list");
+const marketListStatus = document.querySelector("#market-list-status");
+const marketListMessage = document.querySelector("#market-list-message");
+const marketListRetry = document.querySelector("#market-list-retry");
+const ledgerFreshness = document.querySelector("#ledger-freshness");
+const ledgerSequenceEl = document.querySelector("#ledger-sequence");
+const ledgerIndexedAtEl = document.querySelector("#ledger-indexed-at");
+const ledgerStalenessEl = document.querySelector("#ledger-staleness");
+
+function setMarketListState(state, message) {
+  if (marketListStatus) {
+    marketListStatus.dataset.state = state;
+  }
+  if (marketListMessage) {
+    marketListMessage.textContent = message || "";
+  }
+  if (marketListRetry) {
+    marketListRetry.hidden = state !== MARKET_LIST_STATES.error && state !== MARKET_LIST_STATES.stale;
+  }
+}
+
+function iconForMarket(market) {
+  const change = typeof market.change === "number" ? market.change : 0;
+  if (change > 0) return { symbol: "↑", cssClass: "coral" };
+  if (change < 0) return { symbol: "↓", cssClass: "green" };
+  return { symbol: "=", cssClass: "gold" };
+}
+
+function formatTimeToClose(closeTime) {
+  if (closeTime == null) return "Unknown close time";
+  const ms = new Date(closeTime).getTime() - Date.now();
+  if (Number.isNaN(ms)) return "Unknown close time";
+  if (ms <= 0) return "Closed";
+  const totalSec = Math.floor(ms / 1000);
+  const days = Math.floor(totalSec / 86400);
+  const hours = Math.floor((totalSec % 86400) / 3600);
+  return `Closes in ${days}d ${String(hours).padStart(2, "0")}h`;
+}
+
+function formatPriceCents(price) {
+  if (price == null || !Number.isFinite(price)) return "—";
+  return `${Math.round(price * 100)}¢`;
+}
+
+function formatChangePct(change) {
+  if (change == null || !Number.isFinite(change)) return "";
+  const sign = change >= 0 ? "+" : "−";
+  return `${sign}${Math.abs(change).toFixed(1)}%`;
+}
+
+function buildMarketRow(market) {
+  const { symbol, cssClass } = iconForMarket(market);
+  const timeLabel = formatTimeToClose(market.closeTime);
+  const indexLabel = market.index != null ? `#${String(market.index).padStart(4, "0")}` : "";
+  const priceCents = formatPriceCents(market.yesPrice);
+  const changePct = formatChangePct(market.change);
+  const changeClass = market.change >= 0 ? "positive" : "negative";
+
+  const button = document.createElement("button");
+  button.className = "market-row";
+  button.type = "button";
+  button.dataset.market = market.id;
+  button.dataset.marketTitle = market.title;
+  button.setAttribute("aria-pressed", "false");
+  button.setAttribute(
+    "aria-label",
+    `${market.title}${timeLabel ? ", " + timeLabel : ""}${indexLabel ? ", market " + indexLabel : ""}${priceCents !== "—" ? ", YES price " + priceCents : ""}`
+  );
+
+  const icon = document.createElement("span");
+  icon.className = `market-icon ${cssClass}`;
+  icon.setAttribute("aria-hidden", "true");
+  icon.textContent = symbol;
+
+  const copy = document.createElement("span");
+  copy.className = "market-copy";
+  copy.innerHTML = `<strong>${escapeHtml(market.title)}</strong><small>${escapeHtml(timeLabel)}${indexLabel ? " · " + escapeHtml(indexLabel) : ""}</small>`;
+
+  const priceEl = document.createElement("span");
+  priceEl.className = "market-price";
+  priceEl.innerHTML = `<strong>${escapeHtml(priceCents)}</strong><small>YES${changePct ? ` <span class="${changeClass}">${escapeHtml(changePct)}</span>` : ""}</small>`;
+
+  button.append(icon, copy, priceEl);
+
+  button.addEventListener("click", () => {
+    document.querySelectorAll(".market-row").forEach((item) => {
+      item.classList.remove("selected");
+      item.setAttribute("aria-pressed", "false");
+    });
+    button.classList.add("selected");
+    button.setAttribute("aria-pressed", "true");
+    const selectedMarketEl = document.querySelector("#selected-market");
+    if (selectedMarketEl) selectedMarketEl.textContent = market.title;
+    const chartChangeEl = document.querySelector("#chart-change");
+    if (chartChangeEl) {
+      chartChangeEl.textContent = changePct;
+      chartChangeEl.className = `chart-change ${market.change >= 0 ? "positive" : "negative"}`;
+    }
+    loadLifecycle(market.id);
+  });
+
+  return button;
+}
+
+function escapeHtml(str) {
+  return String(str).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+function renderLedgerFreshness(meta) {
+  if (!ledgerFreshness) return;
+  if (!meta) {
+    ledgerFreshness.hidden = true;
+    return;
+  }
+  ledgerFreshness.hidden = false;
+  if (ledgerSequenceEl) ledgerSequenceEl.textContent = meta.ledgerSequence != null ? String(meta.ledgerSequence) : "—";
+  if (ledgerIndexedAtEl) {
+    const ts = meta.indexedAt ? new Intl.DateTimeFormat([], { timeStyle: "medium" }).format(new Date(meta.indexedAt)) : "—";
+    ledgerIndexedAtEl.textContent = ts;
+  }
+  if (ledgerStalenessEl) {
+    const ageMs = meta.indexedAt ? Date.now() - new Date(meta.indexedAt).getTime() : Infinity;
+    if (ageMs > STALE_THRESHOLD_MS) {
+      ledgerStalenessEl.textContent = "Stale — data may not reflect current chain state";
+      ledgerStalenessEl.dataset.state = "stale";
+    } else {
+      ledgerStalenessEl.textContent = "Fresh";
+      ledgerStalenessEl.dataset.state = "fresh";
+    }
+  }
+}
+
+function renderMarketRows(markets) {
+  if (!marketList) return;
+  marketList.replaceChildren();
+  for (const market of markets) {
+    marketList.append(buildMarketRow(market));
+  }
+  // Auto-select the first row so the chart panel always has a market.
+  const first = marketList.querySelector(".market-row");
+  if (first) first.click();
+}
+
+async function loadMarkets({ retry = false } = {}) {
+  const { key: network, config } = getSelectedNetwork();
+  if (!config || !isValidManifest(config.manifest)) {
+    setMarketListState(MARKET_LIST_STATES.error, "Selected network has no validated deployment manifest. Market data unavailable.");
+    return;
+  }
+
+  setMarketListState(MARKET_LIST_STATES.loading, retry ? "Retrying market load…" : "Loading markets…");
+  if (marketList) marketList.replaceChildren();
+
+  let response;
+  try {
+    response = await fetch(`${apiBase}/markets?network=${encodeURIComponent(network)}`, {
+      headers: { accept: "application/json" },
+      signal: AbortSignal.timeout(8000)
+    });
+  } catch {
+    setMarketListState(MARKET_LIST_STATES.error, "Market indexer unavailable. Retry when the API is reachable.");
+    return;
+  }
+
+  if (!response.ok) {
+    setMarketListState(MARKET_LIST_STATES.error, `Market indexer returned an error (HTTP ${response.status}). Retry to reload.`);
+    return;
+  }
+
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    setMarketListState(MARKET_LIST_STATES.error, "Market response could not be parsed. No market data displayed.");
+    return;
+  }
+
+  // The API must return { markets: [...], meta: { ledgerSequence, indexedAt } }.
+  // Any other shape is an error; we never infer or fill missing fields.
+  if (!body || !Array.isArray(body.markets)) {
+    setMarketListState(MARKET_LIST_STATES.error, "Market response has unexpected shape. No market data displayed.");
+    return;
+  }
+
+  const { markets, meta } = body;
+  renderLedgerFreshness(meta || null);
+
+  // Stale check: if freshness metadata is present and stale, surface a warning
+  // but still render the rows so the operator can see what was last indexed.
+  const ageMs = meta?.indexedAt ? Date.now() - new Date(meta.indexedAt).getTime() : 0;
+  const isStale = ageMs > STALE_THRESHOLD_MS;
+
+  if (markets.length === 0) {
+    setMarketListState(MARKET_LIST_STATES.empty, "No markets indexed on this network yet.");
+    return;
+  }
+
+  renderMarketRows(markets);
+
+  if (isStale) {
+    setMarketListState(
+      MARKET_LIST_STATES.stale,
+      `Market data is stale (indexed ${Math.floor(ageMs / 60000)} min ago). Retry to reload.`
+    );
+  } else {
+    setMarketListState(MARKET_LIST_STATES.loaded, `${markets.length} market${markets.length === 1 ? "" : "s"} loaded.`);
+  }
+}
+
+if (marketListRetry) {
+  marketListRetry.addEventListener("click", () => loadMarkets({ retry: true }));
+}
 
 walletButton.addEventListener("click", () => {
   if (walletState.connected) {
@@ -376,11 +603,15 @@ walletButton.addEventListener("click", () => {
     connectWallet();
   }
 });
-document.querySelector("#refresh-button").addEventListener("click", checkApi);
+document.querySelector("#refresh-button").addEventListener("click", () => {
+  checkApi();
+  loadMarkets({ retry: true });
+});
 
 if (networkSelect) {
   networkSelect.addEventListener("change", (event) => {
     applyNetwork(event.currentTarget.value);
+    loadMarkets();
   });
 }
 
@@ -583,3 +814,4 @@ updateClock();
 setInterval(updateClock, 1000);
 checkApi();
 applyNetwork(getSelectedNetwork().key);
+loadMarkets();

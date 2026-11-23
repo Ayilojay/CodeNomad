@@ -6,6 +6,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.mjs",
+    "test": "node --test markets.test.mjs",
     "lint": "eslint .",
     "format": "prettier --check .",
     "format:write": "prettier --write ."
