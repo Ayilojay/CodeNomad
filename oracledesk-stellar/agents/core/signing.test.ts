@@ -5,6 +5,7 @@ import {
   actionToAttestationBytes,
   buildKeyBindMessage,
   buildTraceAttestationMessage,
+  createMultisigEnvelope,
   signKeyBind,
   signTraceAttestation,
   verifyKeyBind,
@@ -212,4 +213,59 @@ test("multisig envelope rejects altered payload envelopes", () => {
     false,
   );
   assert.equal(envelope.verifyPayload(Buffer.from("transfer:100")), true);
+});
+
+test("live adapter e2e: build, sign, submit, confirm, reconcile one bounded tx", () => {
+  // Ephemeral key generated per run; never persisted or reused.
+  const ephemeral = Keypair.random();
+  const adapter = createLiveAdapter({
+    rpcUrl: "http://127.0.0.1:8000/soroban/rpc",
+    networkPassphrase: NETWORK_PASSPHRASE,
+    signer: ephemeral,
+    dryRun: false,
+  });
+
+  const built = adapter.buildBoundedTransaction({
+    source: ephemeral.publicKey(),
+    contractId: REGISTRY_ID,
+    method: "bind_key",
+    args: [Buffer.from(ephemeral.publicKey())],
+    maxFee: 100_000n,
+  });
+  assert.ok(built.unsignedXdr.length > 0);
+
+  const signed = adapter.sign(built);
+  assert.ok(signed.signedXdr.length > 0);
+  assert.notEqual(signed.signedXdr, built.unsignedXdr);
+
+  const submitted = adapter.submit(signed);
+  assert.ok(submitted.hash.length > 0);
+
+  const confirmed = adapter.confirm(submitted.hash);
+  assert.equal(confirmed.status, "SUCCESS");
+
+  const reconciled = adapter.reconcile(confirmed);
+  assert.equal(reconciled.reconciled, true);
+  assert.equal(reconciled.hash, submitted.hash);
+});
+
+test("live adapter dry-run cannot access signer or submit endpoints", () => {
+  const adapter = createLiveAdapter({
+    rpcUrl: "http://127.0.0.1:8000/soroban/rpc",
+    networkPassphrase: NETWORK_PASSPHRASE,
+    signer: Keypair.random(),
+    dryRun: true,
+  });
+
+  const built = adapter.buildBoundedTransaction({
+    source: AGENT_ADDRESS,
+    contractId: REGISTRY_ID,
+    method: "bind_key",
+    args: [Buffer.from(AGENT_ADDRESS)],
+    maxFee: 100_000n,
+  });
+
+  // Dry-run must refuse to sign and must never reach the submit endpoint.
+  assert.throws(() => adapter.sign(built), /dry-run/i);
+  assert.throws(() => adapter.submit({ signedXdr: built.unsignedXdr, hash: "" }), /dry-run/i);
 });
