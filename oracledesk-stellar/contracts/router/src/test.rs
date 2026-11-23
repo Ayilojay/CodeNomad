@@ -165,7 +165,7 @@ fn create_and_reveal_price_is_atomic_and_revealed() {
         &spec,
     );
     // Price rules keep the default Unconfigured state but the rule is stored;
-    // re-revealing the same market must now fail as already configured.
+    // re-revealing the same market must fail as already configured.
     let err = f.router.try_reveal_spec(&market_id, &spec);
     assert!(err.is_err(), "a second reveal must be rejected");
     let market = f.market_core.get_market(&market_id);
@@ -224,6 +224,303 @@ fn malformed_rule_reverts_with_no_market() {
     );
     assert_eq!(err, Err(Ok(Error::InvalidConfig)));
     assert_eq!(f.market_core.market_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Unsupported rule variants
+// ---------------------------------------------------------------------------
+
+#[test]
+fn unsupported_rule_weighted_keys_reverts_with_no_market() {
+    let f = fixture();
+    let weighted_signer = resolver::WeightedKey {
+        pubkey: BytesN::from_array(&f.env, &[1u8; 32]),
+        weight: 1,
+    };
+    let rule = ResolutionSpec::WeightedKeys(resolver::WeightedKeyConfig {
+        signers: vec![&f.env, weighted_signer],
+        weight_threshold: 1,
+        dispute_window: 100,
+    });
+    let spec = envelope(&f.env, &f.market_core.address, rule);
+
+    let err = f.router.try_create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+    assert_eq!(err, Err(Ok(Error::UnsupportedRule)));
+    assert_eq!(f.market_core.market_count(), 0);
+}
+
+#[test]
+fn unsupported_rule_signers_disputable_reverts_with_no_market() {
+    let f = fixture();
+    let rule = ResolutionSpec::SignersDisputable(resolver::DisputableSignerConfig {
+        signers: vec![&f.env, f.signer.clone()],
+        threshold: 1,
+        dispute_window: 100,
+        dispute_bond: 100_000_000,
+        escalation: resolver::Escalation::Guardian,
+        escalation_timeout: 86400,
+    });
+    let spec = envelope(&f.env, &f.market_core.address, rule);
+
+    let err = f.router.try_create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+    assert_eq!(err, Err(Ok(Error::UnsupportedRule)));
+    assert_eq!(f.market_core.market_count(), 0);
+}
+
+#[test]
+fn unsupported_rule_committee_reverts_with_no_market() {
+    let f = fixture();
+    let rule = ResolutionSpec::Committee(resolver::CommitteeRef {
+        committee_id: 1,
+        min_epoch: 0,
+        max_rotation_delta: 10,
+        dispute_window: 100,
+    });
+    let spec = envelope(&f.env, &f.market_core.address, rule);
+
+    let err = f.router.try_create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+    assert_eq!(err, Err(Ok(Error::UnsupportedRule)));
+    assert_eq!(f.market_core.market_count(), 0);
+}
+
+#[test]
+fn unsupported_rule_hybrid_reverts_with_no_market() {
+    let f = fixture();
+    let reflector = Address::generate(&f.env);
+    let rule = ResolutionSpec::Hybrid(resolver::HybridConfig {
+        price: price_config(&f.env, &reflector),
+        fallback: signer_config(&f.env, &f.signer),
+        fallback_after: 1_000_000,
+    });
+    let spec = envelope(&f.env, &f.market_core.address, rule);
+
+    let err = f.router.try_create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+    assert_eq!(err, Err(Ok(Error::UnsupportedRule)));
+    assert_eq!(f.market_core.market_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Slippage rejection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn slippage_rejection_reverts_with_no_position() {
+    let f = fixture();
+    let spec = envelope(
+        &f.env,
+        &f.market_core.address,
+        ResolutionSpec::Signers(signer_config(&f.env, &f.signer)),
+    );
+    let market_id = f.router.create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+
+    // The registry must know the trader as an agent.
+    let admin = f.market_core.get_config().admin;
+    f.registry.register_agent(&admin);
+    // fund trader
+    let token = StellarAssetClient::new(&f.env, &f.market_core.get_config().collateral);
+    token.mint(&admin, &(100 * 10_000_000_i128));
+
+    // min_shares_out exceeds what the pool can deliver (only 100M seed
+    // liquidity, requesting 1 share out with 0 min_shares_out would work,
+    // but a very high min_shares_out triggers SlippageExceeded).
+    let err = f.router.try_buy_and_publish_trace(
+        &admin,
+        &market_id,
+        &Outcome::Yes,
+        &(10 * 10_000_000_i128),
+        &(i128::MAX),
+        &String::from_str(&f.env, "buy"),
+        &BytesN::from_array(&f.env, &[1u8; 32]),
+        &String::from_str(&f.env, "ipfs://trace"),
+    );
+    assert_eq!(err, Err(Ok(Error::SlippageExceeded)));
+    // No position was created and no collateral was moved.
+    let pos = f.market_core.get_position(&market_id, &admin);
+    assert_eq!(pos.yes, 0);
+    assert_eq!(pos.no, 0);
+    assert_eq!(token.balance(&admin), 100 * 10_000_000_i128);
+}
+
+// ---------------------------------------------------------------------------
+// Trace publication failures (InvalidTrace)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn empty_action_reverts_with_invalid_trace() {
+    let f = fixture();
+    let spec = envelope(
+        &f.env,
+        &f.market_core.address,
+        ResolutionSpec::Signers(signer_config(&f.env, &f.signer)),
+    );
+    let market_id = f.router.create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+
+    // The registry must know the trader as an agent.
+    let admin = f.market_core.get_config().admin;
+    f.registry.register_agent(&admin);
+    // fund trader
+    let token = StellarAssetClient::new(&f.env, &f.market_core.get_config().collateral);
+    token.mint(&admin, &(100 * 10_000_000_i128));
+
+    let err = f.router.try_buy_and_publish_trace(
+        &admin,
+        &market_id,
+        &Outcome::Yes,
+        &(10 * 10_000_000_i128),
+        &0i128,
+        &String::from_str(&f.env, ""),
+        &BytesN::from_array(&f.env, &[1u8; 32]),
+        &String::from_str(&f.env, "ipfs://trace"),
+    );
+    assert_eq!(err, Err(Ok(Error::InvalidTrace)));
+    // No position was created (buy never ran).
+    let pos = f.market_core.get_position(&market_id, &admin);
+    assert_eq!(pos.yes, 0);
+}
+
+#[test]
+fn empty_ipfs_cid_reverts_with_invalid_trace() {
+    let f = fixture();
+    let spec = envelope(
+        &f.env,
+        &f.market_core.address,
+        ResolutionSpec::Signers(signer_config(&f.env, &f.signer)),
+    );
+    let market_id = f.router.create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+
+    // The registry must know the trader as an agent.
+    let admin = f.market_core.get_config().admin;
+    f.registry.register_agent(&admin);
+    // fund trader
+    let token = StellarAssetClient::new(&f.env, &f.market_core.get_config().collateral);
+    token.mint(&admin, &(100 * 10_000_000_i128));
+
+    let err = f.router.try_buy_and_publish_trace(
+        &admin,
+        &market_id,
+        &Outcome::Yes,
+        &(10 * 10_000_000_i128),
+        &0i128,
+        &String::from_str(&f.env, "buy"),
+        &BytesN::from_array(&f.env, &[1u8; 32]),
+        &String::from_str(&f.env, ""),
+    );
+    assert_eq!(err, Err(Ok(Error::InvalidTrace)));
+    // No position was created (buy never ran).
+    let pos = f.market_core.get_position(&market_id, &admin);
+    assert_eq!(pos.yes, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Rollback of nested effects
+// ---------------------------------------------------------------------------
+
+#[test]
+fn registry_publish_failure_rolls_back_buy() {
+    let f = fixture();
+    let spec = envelope(
+        &f.env,
+        &f.market_core.address,
+        ResolutionSpec::Signers(signer_config(&f.env, &f.signer)),
+    );
+    let market_id = f.router.create_and_reveal_signers(
+        &f.creator,
+        &BytesN::from_array(&f.env, &[7u8; 32]),
+        &String::from_str(&f.env, "ipfs://q"),
+        &Category::Crypto,
+        &2_000,
+        &(100 * 10_000_000_i128),
+        &5000u32,
+        &spec,
+    );
+
+    // Registry is configured but the trader is NOT registered as an agent.
+    // publish_trace will fail with AgentNotRegistered, which must roll back
+    // the buy so that no position or collateral movement is left behind.
+    let admin = f.market_core.get_config().admin;
+    // fund trader (but do NOT register as agent)
+    let token = StellarAssetClient::new(&f.env, &f.market_core.get_config().collateral);
+    token.mint(&admin, &(100 * 10_000_000_i128));
+
+    let err = f.router.try_buy_and_publish_trace(
+        &admin,
+        &market_id,
+        &Outcome::Yes,
+        &(10 * 10_000_000_i128),
+        &0i128,
+        &String::from_str(&f.env, "buy"),
+        &BytesN::from_array(&f.env, &[1u8; 32]),
+        &String::from_str(&f.env, "ipfs://trace"),
+    );
+    assert!(err.is_err(), "publish_trace must fail when agent is not registered");
+    // The buy was rolled back: no position exists and collateral is untouched.
+    let pos = f.market_core.get_position(&market_id, &admin);
+    assert_eq!(pos.yes, 0);
+    assert_eq!(pos.no, 0);
+    assert_eq!(token.balance(&admin), 100 * 10_000_000_i128);
 }
 
 #[test]
