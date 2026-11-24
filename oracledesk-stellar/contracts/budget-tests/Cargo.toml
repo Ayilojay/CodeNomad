@@ -21,6 +21,10 @@ serde_json = "1"
 resolver = { path = "../resolver" }
 treasury = { path = "../treasury" }
 market-core = { path = "../market-core" }
+# Router types are used to drive cross-contract end-to-end paths (treasury ->
+# resolver -> router) against the shipped wasm; execution still goes through
+# the imported wasm clients.
+router = { path = "../router" }
 
 [profile.test]
 opt-level = 1

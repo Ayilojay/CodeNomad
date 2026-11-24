@@ -30,6 +30,9 @@ pub mod registry_wasm {
         file = "../../target/wasm32v1-none/release/reasoning_registry.wasm"
     );
 }
+pub mod router_wasm {
+    soroban_sdk::contractimport!(file = "../../target/wasm32v1-none/release/router.wasm");
+}
 
 #[cfg(test)]
 mod tests;
@@ -86,6 +89,11 @@ pub struct Baseline {
     pub meta: Meta,
     pub tolerance: Tolerance,
     pub scenarios: BTreeMap<String, Metrics>,
+    /// Reviewed hard limits for cross-contract (nested) call paths. Unlike
+    /// `scenarios` these are absolute ceilings, not toolchain-relative
+    /// tolerances: exceeding any field is a hard regression.
+    #[serde(default)]
+    pub cross_contract_limits: BTreeMap<String, Metrics>,
 }
 
 impl Baseline {
@@ -98,7 +106,37 @@ impl Baseline {
             },
             tolerance: Tolerance::default(),
             scenarios: BTreeMap::new(),
+            cross_contract_limits: BTreeMap::new(),
         }
+    }
+}
+
+impl Metrics {
+    /// Returns the names of every field in `self` that exceeds `limit`.
+    pub fn exceeded(&self, limit: &Metrics) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if self.cpu_insns > limit.cpu_insns {
+            out.push("cpu_insns");
+        }
+        if self.mem_bytes > limit.mem_bytes {
+            out.push("mem_bytes");
+        }
+        if self.read_entries > limit.read_entries {
+            out.push("read_entries");
+        }
+        if self.write_entries > limit.write_entries {
+            out.push("write_entries");
+        }
+        if self.read_bytes > limit.read_bytes {
+            out.push("read_bytes");
+        }
+        if self.write_bytes > limit.write_bytes {
+            out.push("write_bytes");
+        }
+        if self.events_bytes > limit.events_bytes {
+            out.push("events_bytes");
+        }
+        out
     }
 }
 
@@ -164,6 +202,7 @@ pub fn wasm_bytes() -> BTreeMap<String, u64> {
         ("resolver.wasm", "resolver.wasm"),
         ("treasury.wasm", "treasury.wasm"),
         ("reasoning_registry.wasm", "reasoning_registry.wasm"),
+        ("router.wasm", "router.wasm"),
     ]
     .into_iter()
     .map(|(label, file)| {
@@ -186,4 +225,52 @@ pub fn write_baseline(b: &Baseline) {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(path, serde_json::to_string_pretty(b).unwrap() + "\n").unwrap();
+}
+
+/// Measure a cross-contract call path and assert it stays within the reviewed
+/// limits stored under `cross_contract_limits[name]`.
+///
+/// `setup` performs all unmetered preparation (registering the shipped wasm
+/// contracts, seeding storage, minting). `invoke` must perform exactly one
+/// top-level entrypoint call that fans out across the treasury, resolver and
+/// router contracts; the nested authorization and storage costs are captured
+/// by the single `measure` call.
+///
+/// Returns the measured metrics so callers can record them when regenerating
+/// the baseline with `BUDGET_UPDATE=1`. Panics (failing the test) when any
+/// reviewed limit is exceeded.
+pub fn measure_cross_contract<S, I>(
+    env: &soroban_sdk::Env,
+    name: &str,
+    setup: S,
+    invoke: I,
+) -> Metrics
+where
+    S: FnOnce(),
+    I: FnOnce(),
+{
+    setup();
+    let metrics = measure(env, invoke);
+
+    let baseline = load_baseline().unwrap_or_else(Baseline::empty);
+    match baseline.cross_contract_limits.get(name) {
+        Some(limit) => {
+            let exceeded = metrics.exceeded(limit);
+            assert!(
+                exceeded.is_empty(),
+                "cross-contract budget regression for `{name}`: exceeded {exceeded:?}\n\
+                 measured: {metrics:?}\nlimit:    {limit:?}"
+            );
+        }
+        None => {
+            assert!(
+                std::env::var_os("BUDGET_UPDATE").is_some(),
+                "no reviewed cross-contract limits for `{name}` in {}; \
+                 run `make budget-update` to record them (measured: {metrics:?})",
+                baseline_path().display()
+            );
+        }
+    }
+
+    metrics
 }
