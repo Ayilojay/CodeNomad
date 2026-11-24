@@ -420,6 +420,100 @@ pub fn parse_hybrid(env: &Env, args: &[String]) -> Result<ResolutionSpec, String
     }))
 }
 
+/// The resolution spec versions this tool can commit to. Each version has a
+/// distinct, canonical preimage (see `docs/adr/0001-resolution-commitment.md`
+/// and `docs/adr/0004-spec-versioning.md`):
+///
+/// * [`SpecVersion::Legacy`] (v1): `sha256(XDR(ResolutionSpec))` via
+///   `resolver::legacy_spec_hash`.
+/// * [`SpecVersion::V2`]: `sha256("oracledesk:resolution-spec" ||
+///   XDR(ResolutionSpecV2))` via `resolver::spec_v2_hash`, binding the
+///   network id, market core and salt.
+///
+/// The scaled (`price-scaled`) and TWAP (`price-twap`) rules commit through
+/// their own domain-tagged preimages and are not `ResolutionSpec` versions;
+/// they are rejected by [`SpecVersion::select`] rather than silently mapped
+/// onto one of the above.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SpecVersion {
+    /// v1: the original `sha256(XDR(ResolutionSpec))` commitment.
+    Legacy,
+    /// v2: the salted, network- and market-bound envelope.
+    V2,
+}
+
+impl SpecVersion {
+    /// Picks the spec version from the CLI flags: `--v2` selects
+    /// [`SpecVersion::V2`], its absence selects [`SpecVersion::Legacy`].
+    /// `--v2` is all-or-nothing (see `take_v2_flags`), so this is the single
+    /// point that decides which canonical encoding a commitment uses.
+    pub fn select(v2: Option<&V2Params>) -> Self {
+        match v2 {
+            Some(_) => SpecVersion::V2,
+            None => SpecVersion::Legacy,
+        }
+    }
+
+    /// Human-readable name, used in migration errors.
+    pub fn name(self) -> &'static str {
+        match self {
+            SpecVersion::Legacy => "v1",
+            SpecVersion::V2 => "v2",
+        }
+    }
+}
+
+/// Why a requested conversion between spec versions is not permitted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConversionError {
+    /// The source and target versions are the same; there is nothing to
+    /// convert and re-hashing would be a no-op masquerading as a migration.
+    SameVersion,
+    /// v1 -> v2 is not a pure re-encoding: v2 additionally binds a network
+    /// id, market core and salt, none of which a v1 commitment carries. Any
+    /// such conversion would have to invent those bindings, so it is lossy
+    /// and ambiguous and must be done by re-registering the spec explicitly.
+    LegacyToV2NeedsEnvelope,
+    /// v2 -> v1 discards the network/market/salt bindings, which is lossy.
+    V2ToLegacyDropsEnvelope,
+}
+
+impl ConversionError {
+    pub fn message(self) -> &'static str {
+        match self {
+            ConversionError::SameVersion => "source and target spec versions are identical",
+            ConversionError::LegacyToV2NeedsEnvelope => {
+                "v1 -> v2 is not a lossless conversion: v2 binds a network id, market core and \
+                 salt that a v1 commitment does not carry; re-register the spec under v2 with an \
+                 explicit --v2 envelope instead"
+            }
+            ConversionError::V2ToLegacyDropsEnvelope => {
+                "v2 -> v1 is lossy: it would discard the network id, market core and salt \
+                 bindings; v1 commitments must be produced from the bare spec"
+            }
+        }
+    }
+}
+
+/// The only permitted conversion between spec versions: identity. Every
+/// cross-version conversion is rejected because it is either lossy (v2 -> v1
+/// drops the envelope) or ambiguous (v1 -> v2 would have to invent the
+/// envelope). This is the migration policy the resolver relies on: a spec
+/// committed under an older version keeps verifying under that version, and
+/// moving to a newer version is an explicit re-registration, never a silent
+/// re-hash.
+pub fn convert_version(from: SpecVersion, to: SpecVersion) -> Result<SpecVersion, ConversionError> {
+    if from == to {
+        Ok(to)
+    } else {
+        match (from, to) {
+            (SpecVersion::Legacy, SpecVersion::V2) => Err(ConversionError::LegacyToV2NeedsEnvelope),
+            (SpecVersion::V2, SpecVersion::Legacy) => Err(ConversionError::V2ToLegacyDropsEnvelope),
+            _ => Err(ConversionError::SameVersion),
+        }
+    }
+}
+
 /// A parsed top-level rule. `Rule` is a legacy / V2-representable
 /// `ResolutionSpec`; `Scaled` is issue #26's decimal-explicit mode and
 /// `Twap` issue #27's averaged mode, each committing through its own
@@ -476,18 +570,21 @@ fn commitment(env: &Env, rule: ParsedRule, v2: Option<V2Params>) -> Result<[u8; 
         }
         ParsedRule::Rule(rule) => rule,
     };
-    let hash = match v2 {
-        None => legacy_spec_hash(env, &rule),
-        Some(params) => spec_v2_hash(
-            env,
-            &ResolutionSpecV2 {
-                version: 2,
-                network_id: BytesN::from_array(env, &params.network_id),
-                market_core: parse_address(env, &params.market_core)?,
-                salt: BytesN::from_array(env, &params.salt),
-                rule,
-            },
-        ),
+    let hash = match SpecVersion::select(v2.as_ref()) {
+        SpecVersion::Legacy => legacy_spec_hash(env, &rule),
+        SpecVersion::V2 => {
+            let params = v2.expect("SpecVersion::V2 implies a --v2 envelope");
+            spec_v2_hash(
+                env,
+                &ResolutionSpecV2 {
+                    version: 2,
+                    network_id: BytesN::from_array(env, &params.network_id),
+                    market_core: parse_address(env, &params.market_core)?,
+                    salt: BytesN::from_array(env, &params.salt),
+                    rule,
+                },
+            )
+        }
     };
     Ok(hash.to_array())
 }
@@ -977,6 +1074,91 @@ mod tests {
         for bad in ["", "x", "0.2.0", "-0.20", "1e3", "0..1", &too_many] {
             assert!(parse_decimal_amount(bad).is_err(), "{bad}");
         }
+    }
+
+    /// Migration policy: only identity conversions are permitted; every
+    /// cross-version conversion is rejected as lossy or ambiguous.
+    #[test]
+    fn version_conversion_policy_rejects_lossy_and_ambiguous() {
+        use SpecVersion::{Legacy, V2};
+        assert_eq!(convert_version(Legacy, Legacy), Ok(Legacy));
+        assert_eq!(convert_version(V2, V2), Ok(V2));
+        assert_eq!(
+            convert_version(Legacy, V2),
+            Err(ConversionError::LegacyToV2NeedsEnvelope)
+        );
+        assert_eq!(
+            convert_version(V2, Legacy),
+            Err(ConversionError::V2ToLegacyDropsEnvelope)
+        );
+        // Errors are documented, not empty.
+        assert!(!ConversionError::LegacyToV2NeedsEnvelope.message().is_empty());
+        assert!(!ConversionError::V2ToLegacyDropsEnvelope.message().is_empty());
+        assert_eq!(Legacy.name(), "v1");
+        assert_eq!(V2.name(), "v2");
+    }
+
+    /// Version selection is driven solely by the `--v2` envelope flags.
+    #[test]
+    fn version_selection_follows_flags() {
+        let env = Env::default();
+        let (none, _) = take_v2_flags(&env, &args(&["signers", "1", "5", G1])).unwrap();
+        assert_eq!(SpecVersion::select(none.as_ref()), SpecVersion::Legacy);
+        let (some, _) = take_v2_flags(
+            &env,
+            &args(&[
+                "--v2",
+                "--salt",
+                SALT,
+                "--network-passphrase",
+                TESTNET,
+                "--market-core",
+                C2,
+                "signers",
+                "1",
+                "5",
+                G1,
+            ]),
+        )
+        .unwrap();
+        assert_eq!(SpecVersion::select(some.as_ref()), SpecVersion::V2);
+    }
+
+    /// Golden vectors under each supported version: the same rule hashes to
+    /// the pinned v1 digest without `--v2` and the pinned v2 digest with it,
+    /// and the two are distinct (the v2 envelope is a different preimage).
+    #[test]
+    fn golden_vectors_per_version() {
+        let legacy = hash_of(&["signers", "1", "5", G1]);
+        assert_eq!(
+            legacy,
+            "b935a3beeebdbf7b9defc916410f19a1740a3920623230152e41a812b6f141c4"
+        );
+        let v2 = hash_of(&v2_args(SALT, TESTNET, C2));
+        assert_eq!(v2, V2_GOLDEN);
+        assert_ne!(legacy, v2);
+    }
+
+    /// A commitment produced under an older spec version still verifies
+    /// under that same version: the v1 golden vector round-trips through
+    /// `verify` without any `--v2` flags.
+    #[test]
+    fn older_version_commitments_still_verify() {
+        let legacy = "b935a3beeebdbf7b9defc916410f19a1740a3920623230152e41a812b6f141c4";
+        assert_eq!(
+            hash_of(&["verify", legacy, "signers", "1", "5", G1]),
+            "match"
+        );
+        // The same rule under v2 does not match the v1 commitment: versions
+        // are not interchangeable, which is exactly why conversion is
+        // rejected.
+        let mut v2_verify = v2_args(SALT, TESTNET, C2);
+        v2_verify.insert(0, "verify");
+        v2_verify.insert(1, legacy);
+        assert!(matches!(
+            run(&args(&v2_verify)),
+            Err(CliError::Mismatch { .. })
+        ));
     }
 
     #[test]
