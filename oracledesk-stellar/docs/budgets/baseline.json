@@ -7,6 +7,7 @@
       "market_core.wasm": 41905,
       "reasoning_registry.wasm": 14701,
       "resolver.wasm": 67516,
+      "router.wasm": 58240,
       "treasury.wasm": 86484
     }
   },
@@ -163,6 +164,60 @@
       "read_bytes": 0,
       "write_bytes": 0,
       "events_bytes": 0
+    },
+    "router.route_treasury_resolver.representative": {
+      "cpu_insns": 3184520,
+      "mem_bytes": 2418760,
+      "read_entries": 24,
+      "write_entries": 11,
+      "read_bytes": 184,
+      "write_bytes": 4120,
+      "events_bytes": 1860
+    },
+    "router.route_treasury_resolver.max_size": {
+      "cpu_insns": 4127365,
+      "mem_bytes": 2684312,
+      "read_entries": 29,
+      "write_entries": 13,
+      "read_bytes": 276,
+      "write_bytes": 6184,
+      "events_bytes": 2480
+    },
+    "treasury.deposit_resolver_settle.representative": {
+      "cpu_insns": 2146308,
+      "mem_bytes": 1987452,
+      "read_entries": 18,
+      "write_entries": 8,
+      "read_bytes": 92,
+      "write_bytes": 2960,
+      "events_bytes": 1240
+    },
+    "treasury.deposit_resolver_settle.max_size": {
+      "cpu_insns": 2871940,
+      "mem_bytes": 2210684,
+      "read_entries": 22,
+      "write_entries": 10,
+      "read_bytes": 184,
+      "write_bytes": 4528,
+      "events_bytes": 1720
+    },
+    "resolver.authorize_treasury_release.representative": {
+      "cpu_insns": 1876420,
+      "mem_bytes": 1762340,
+      "read_entries": 15,
+      "write_entries": 7,
+      "read_bytes": 92,
+      "write_bytes": 2384,
+      "events_bytes": 1080
+    },
+    "resolver.authorize_treasury_release.max_size": {
+      "cpu_insns": 2498316,
+      "mem_bytes": 1945876,
+      "read_entries": 19,
+      "write_entries": 9,
+      "read_bytes": 184,
+      "write_bytes": 3712,
+      "events_bytes": 1520
     }
   }
 }

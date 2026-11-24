@@ -243,6 +243,36 @@ pub struct MarketExposure {
     pub open: bool,
 }
 
+/// Largest page `open_exposures` will return in one call. Bounds the
+/// per-invocation work (one persistent read per entry plus the index read)
+/// so the view can never be used to force unbounded iteration.
+pub const MAX_EXPOSURE_PAGE: u32 = 20;
+
+/// One row of the paginated open-exposure inventory returned by
+/// `open_exposures`. `market_id` is strictly ascending across a page and
+/// across pages, so a cursor is stable even as markets settle.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExposureEntry {
+    pub market_id: u64,
+    /// Lifetime capital sent into the market (see `MarketExposure.amount`).
+    pub amount: i128,
+    /// `true` when the market is still counted as open by the treasury.
+    /// Settled/archived markets are never returned by `open_exposures`, so
+    /// this is always `true` for rows of that view; it is kept explicit so
+    /// the row shape can be reused by future inventory views.
+    pub open: bool,
+}
+
+/// One page of `open_exposures`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ExposurePage {
+    pub entries: Vec<ExposureEntry>,
+    /// Cursor to pass to the next call, or `None` when the page is the last.
+    pub next_cursor: Option<u64>,
+}
+
 /// Summary of the sliding daily window, returned by `daily_usage`.
 /// `day_start` is the start of the oldest hour still counted and `amount`
 /// the usage summed over the whole window (see [`UsageWindow`]).
@@ -6746,6 +6776,148 @@ mod test {
             );
         }
         assert!(f.treasury.nav() > 0);
+    }
+
+    // ----- paginated open-exposure inventory (#26) --------------------------
+
+    #[test]
+    fn open_exposures_empty_returns_no_cursor() {
+        let f = fixture();
+        let page = f.treasury.open_exposures(&None, &10);
+        assert_eq!(page.entries.len(), 0);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn open_exposures_rejects_zero_or_oversized_limit() {
+        let f = fixture();
+        assert_eq!(
+            f.treasury.try_open_exposures(&None, &0),
+            Err(Ok(Error::InvalidPageLimit))
+        );
+        assert_eq!(
+            f.treasury
+                .try_open_exposures(&None, &(MAX_EXPOSURE_PAGE + 1)),
+            Err(Ok(Error::InvalidPageLimit))
+        );
+        // The maximum is accepted.
+        f.treasury.open_exposures(&None, &MAX_EXPOSURE_PAGE);
+    }
+
+    #[test]
+    fn open_exposures_paginates_in_ascending_market_id_order() {
+        let f = fixture();
+        fill_open_markets(&f, 5);
+        let total = f.treasury.open_market_count();
+        assert_eq!(total, 6);
+
+        let mut seen: std::vec::Vec<u64> = std::vec::Vec::new();
+        let mut cursor: Option<u64> = None;
+        let mut pages = 0;
+        loop {
+            let page = f.treasury.open_exposures(&cursor, &2);
+            assert!(page.entries.len() <= 2);
+            let mut prev: Option<u64> = None;
+            for entry in page.entries.iter() {
+                assert!(entry.open);
+                assert!(entry.amount > 0);
+                if let Some(p) = prev {
+                    assert!(entry.market_id > p, "page must be ascending");
+                }
+                prev = Some(entry.market_id);
+                seen.push(entry.market_id);
+            }
+            pages += 1;
+            match page.next_cursor {
+                Some(next) => {
+                    assert!(next > cursor.unwrap_or(0));
+                    cursor = Some(next);
+                }
+                None => break,
+            }
+        }
+        assert_eq!(pages, 3);
+        assert_eq!(seen.len(), total as usize);
+        let mut sorted = seen.clone();
+        sorted.sort();
+        assert_eq!(seen, sorted);
+        assert_eq!(seen.first().copied(), Some(f.market_id));
+    }
+
+    #[test]
+    fn open_exposures_last_page_exactly_full_has_no_cursor() {
+        let f = fixture();
+        fill_open_markets(&f, 3);
+        // 4 open markets, page size 2 -> two full pages, second has no cursor.
+        let first = f.treasury.open_exposures(&None, &2);
+        assert_eq!(first.entries.len(), 2);
+        let cursor = first.next_cursor.unwrap();
+        let second = f.treasury.open_exposures(&Some(cursor), &2);
+        assert_eq!(second.entries.len(), 2);
+        assert_eq!(second.next_cursor, None);
+    }
+
+    #[test]
+    fn open_exposures_cursor_past_end_returns_empty_page() {
+        let f = fixture();
+        fill_open_markets(&f, 2);
+        let page = f.treasury.open_exposures(&Some(u64::MAX), &10);
+        assert_eq!(page.entries.len(), 0);
+        assert_eq!(page.next_cursor, None);
+    }
+
+    #[test]
+    fn open_exposures_excludes_settled_markets() {
+        let f = fixture();
+        fill_open_markets(&f, 2);
+        let before = f.treasury.open_market_count();
+        let target = f.treasury.open_market_at(&0).unwrap().market_id;
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&target, &Outcome::No);
+        f.treasury.redeem(&f.agent, &target);
+        assert_eq!(f.treasury.open_market_count(), before - 1);
+
+        let page = f.treasury.open_exposures(&None, &MAX_EXPOSURE_PAGE);
+        assert_eq!(page.entries.len(), (before - 1) as usize);
+        for entry in page.entries.iter() {
+            assert_ne!(entry.market_id, target);
+        }
+    }
+
+    #[test]
+    fn open_exposures_excludes_archived_markets() {
+        let f = fixture();
+        fill_open_markets(&f, 2);
+        let target = f.treasury.open_market_at(&1).unwrap().market_id;
+        f.env.as_contract(&f.treasury_id, || {
+            f.env
+                .storage()
+                .persistent()
+                .set(&DataKey::Market(target), &MarketExposure { amount: 0, open: false });
+        });
+        let page = f.treasury.open_exposures(&None, &MAX_EXPOSURE_PAGE);
+        for entry in page.entries.iter() {
+            assert_ne!(entry.market_id, target);
+        }
+    }
+
+    #[test]
+    fn open_exposures_skips_migrated_market_without_exposure_record() {
+        let f = fixture();
+        fill_open_markets(&f, 2);
+        let target = f.treasury.open_market_at(&0).unwrap().market_id;
+        // Simulate a market migrated from a prior deployment: it is still in
+        // the index but has no `MarketExposure` record in this contract.
+        f.env.as_contract(&f.treasury_id, || {
+            f.env
+                .storage()
+                .persistent()
+                .remove(&DataKey::Market(target));
+        });
+        let page = f.treasury.open_exposures(&None, &MAX_EXPOSURE_PAGE);
+        for entry in page.entries.iter() {
+            assert_ne!(entry.market_id, target);
+        }
     }
 
     #[test]

@@ -1279,6 +1279,45 @@
         ]
       }
     },
+    "open_exposure_page": {
+      "kind": "function_v0",
+      "spec": {
+        "doc": "Paginated, cursor-based view over the open-exposure inventory: every market the treasury currently holds a position in, in a stable order (ascending `(core, market_id)`). `cursor` is the opaque value from the previous page's `next_cursor` (`None` starts at the beginning); `limit` is clamped to `[1, MAX_EXPOSURE_PAGE]`, so a single call never iterates more than `MAX_EXPOSURE_PAGE` entries. `next_cursor` is `None` once the last page has been returned. Migrated markets are reported under the core that holds them (see `execute_config`); settled and archived markets are excluded from the inventory, so a market disappears from the pages once it is settled or closed. Read-only and side-effect free.",
+        "inputs": [
+          {
+            "doc": "Opaque cursor from the previous page's `next_cursor`; `None` starts at the beginning.",
+            "name": "cursor",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "ExposureCursor"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Maximum entries to return; clamped to `[1, MAX_EXPOSURE_PAGE]`.",
+            "name": "limit",
+            "type_": "u32"
+          }
+        ],
+        "name": "open_exposure_page",
+        "outputs": [
+          {
+            "result": {
+              "error_type": "error",
+              "ok_type": {
+                "udt": {
+                  "name": "ExposurePage"
+                }
+              }
+            }
+          }
+        ]
+      }
+    },
     "open_market_at": {
       "kind": "function_v0",
       "spec": {
@@ -2166,6 +2205,87 @@
         ],
         "lib": "",
         "name": "DisputableSignerConfig"
+      }
+    },
+    "ExposureCursor": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "Position of the last entry returned by `open_exposure_page`; pass it back as `cursor` to fetch the next page. Ordering is ascending `(core, market_id)`.",
+        "fields": [
+          {
+            "doc": "",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          }
+        ],
+        "lib": "",
+        "name": "ExposureCursor"
+      }
+    },
+    "ExposureEntry": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One open position in the `open_exposure_page` inventory.",
+        "fields": [
+          {
+            "doc": "The market-core holding the position (the current core, or a legacy core for migrated markets).",
+            "name": "core",
+            "type_": "address"
+          },
+          {
+            "doc": "",
+            "name": "market_id",
+            "type_": "u64"
+          },
+          {
+            "doc": "`max(0, collateral_in - collateral_out)` for this market, as counted by `net_exposure`.",
+            "name": "net",
+            "type_": "i128"
+          }
+        ],
+        "lib": "",
+        "name": "ExposureEntry"
+      }
+    },
+    "ExposurePage": {
+      "kind": "udt_struct_v0",
+      "spec": {
+        "doc": "One page of the open-exposure inventory returned by `open_exposure_page`.",
+        "fields": [
+          {
+            "doc": "At most `limit` entries, in ascending `(core, market_id)` order.",
+            "name": "entries",
+            "type_": {
+              "vec": {
+                "element_type": {
+                  "udt": {
+                    "name": "ExposureEntry"
+                  }
+                }
+              }
+            }
+          },
+          {
+            "doc": "Cursor to pass as `cursor` for the next page; `None` when this is the last page.",
+            "name": "next_cursor",
+            "type_": {
+              "option": {
+                "value_type": {
+                  "udt": {
+                    "name": "ExposureCursor"
+                  }
+                }
+              }
+            }
+          }
+        ],
+        "lib": "",
+        "name": "ExposurePage"
       }
     },
     "DrawdownStatus": {
@@ -3085,6 +3205,11 @@
             "doc": "",
             "name": "InvalidDrawdownConfig",
             "value": 47
+          },
+          {
+            "doc": "`open_exposure_page` was given a cursor that is not present in the inventory (e.g. its market was settled or archived since the previous page).",
+            "name": "InvalidExposureCursor",
+            "value": 59
           },
           {
             "doc": "",

@@ -1,6 +1,7 @@
 use crate::{
     baseline_path, compile_time_rustc, load_baseline, market_core_wasm, measure, registry_wasm,
-    stellar_cli_version, wasm_bytes, write_baseline, Baseline, Meta, Metrics, Tolerance,
+    resolver_wasm, router_wasm, stellar_cli_version, treasury_wasm, wasm_bytes, write_baseline,
+    Baseline, Meta, Metrics, Tolerance,
 };
 use soroban_sdk::{
     contract, contractimpl, contracttype,
@@ -339,6 +340,221 @@ fn reg_get_trace() -> Metrics {
 }
 
 // ---------------------------------------------------------------------------
+// End-to-end cross-contract scenarios (treasury, resolver, router)
+// ---------------------------------------------------------------------------
+
+/// Shared wiring for the end-to-end paths: a market-core instance plus the
+/// treasury, resolver and router contracts, all deployed from the shipped WASM.
+struct E2eFixture {
+    env: Env,
+    core: market_core_wasm::Client<'static>,
+    treasury: treasury_wasm::Client<'static>,
+    resolver: resolver_wasm::Client<'static>,
+    router: router_wasm::Client<'static>,
+    token: TokenClient<'static>,
+    admin: Address,
+    agent: Address,
+    trader: Address,
+}
+
+fn e2e_fixture() -> E2eFixture {
+    let env = Env::default();
+    env.mock_all_auths();
+    env.cost_estimate().disable_resource_limits();
+    env.ledger().set_timestamp(BASE_TS);
+    env.ledger().set_sequence_number(1);
+
+    let admin = Address::generate(&env);
+    let agent = Address::generate(&env);
+    let trader = Address::generate(&env);
+
+    let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+    let token = collateral.address();
+    let sac = StellarAssetClient::new(&env, &token);
+    sac.mint(&agent, &(10_000 * UNIT));
+    sac.mint(&trader, &(10_000 * UNIT));
+
+    let core_id = env.register(
+        market_core_wasm::WASM,
+        (
+            admin.clone(),
+            token.clone(),
+            Address::generate(&env),
+            Address::generate(&env),
+            100u32,
+            10_000u32,
+        ),
+    );
+    let core = market_core_wasm::Client::new(&env, &core_id);
+
+    let treasury_id = env.register(treasury_wasm::WASM, (admin.clone(), token.clone()));
+    let treasury = treasury_wasm::Client::new(&env, &treasury_id);
+
+    let resolver_id = env.register(
+        resolver_wasm::WASM,
+        (admin.clone(), core_id.clone(), registry_id(&env, &admin)),
+    );
+    let resolver = resolver_wasm::Client::new(&env, &resolver_id);
+
+    let router_id = env.register(
+        router_wasm::WASM,
+        (
+            admin.clone(),
+            core_id.clone(),
+            treasury_id.clone(),
+            resolver_id.clone(),
+        ),
+    );
+    let router = router_wasm::Client::new(&env, &router_id);
+
+    E2eFixture {
+        env,
+        core,
+        treasury,
+        resolver,
+        router,
+        token: TokenClient::new(&env, &token),
+        admin,
+        agent,
+        trader,
+    }
+}
+
+fn registry_id(env: &Env, admin: &Address) -> Address {
+    env.register(registry_wasm::WASM, (admin.clone(),))
+}
+
+fn e2e_create_market(fx: &E2eFixture, uri: &str) -> u64 {
+    fx.core.create_market(
+        &fx.agent,
+        &BytesN::from_array(&fx.env, &[1u8; 32]),
+        &BytesN::from_array(&fx.env, &[2u8; 32]),
+        &String::from_str(&fx.env, uri),
+        &market_core_wasm::Category::Crypto,
+        &(BASE_TS + 60_000),
+        &MIN_SEED,
+        &5_000u32,
+    )
+}
+
+/// Representative path: agent creates a market through the resolver, which
+/// forwards to market-core and publishes a trace to the registry.
+fn e2e_agent_create_market_and_reveal() -> Metrics {
+    let fx = e2e_fixture();
+    let env = fx.env.clone();
+    let uri = String::from_str(&env, "ipfs://e2e");
+    measure(&env, || {
+        fx.resolver.agent_create_market(
+            &fx.agent,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &uri,
+            &market_core_wasm::Category::Crypto,
+            &(BASE_TS + 60_000),
+            &MIN_SEED,
+            &5_000u32,
+        )
+    })
+}
+
+/// Maximum-size path: resolver-mediated market creation with a 1 KiB URI.
+fn e2e_agent_create_market_max_uri() -> Metrics {
+    let fx = e2e_fixture();
+    let env = fx.env.clone();
+    let uri = String::from_str(&env, &"u".repeat(1_024));
+    measure(&env, || {
+        fx.resolver.agent_create_market(
+            &fx.agent,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &uri,
+            &market_core_wasm::Category::Crypto,
+            &(BASE_TS + 60_000),
+            &MIN_SEED,
+            &5_000u32,
+        )
+    })
+}
+
+/// Representative path: treasury-mediated buy with nested token auth.
+fn e2e_treasury_agent_buy() -> Metrics {
+    let fx = e2e_fixture();
+    let market_id = e2e_create_market(&fx, "ipfs://e2e");
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.treasury.agent_buy(
+            &fx.agent,
+            &market_id,
+            &market_core_wasm::Outcome::Yes,
+            &(10 * UNIT),
+            &0i128,
+        )
+    })
+}
+
+/// Representative path: treasury-mediated sell with nested token auth.
+fn e2e_treasury_agent_sell() -> Metrics {
+    let fx = e2e_fixture();
+    let market_id = e2e_create_market(&fx, "ipfs://e2e");
+    fx.treasury.agent_buy(
+        &fx.agent,
+        &market_id,
+        &market_core_wasm::Outcome::Yes,
+        &(10 * UNIT),
+        &0i128,
+    );
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.treasury.agent_sell(
+            &fx.agent,
+            &market_id,
+            &market_core_wasm::Outcome::Yes,
+            &(2 * UNIT),
+            &i128::MAX,
+        )
+    })
+}
+
+/// Representative path: router dispatch to a buy through treasury.
+fn e2e_router_dispatch_buy() -> Metrics {
+    let fx = e2e_fixture();
+    let market_id = e2e_create_market(&fx, "ipfs://e2e");
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.router.dispatch_buy(
+            &fx.agent,
+            &market_id,
+            &market_core_wasm::Outcome::Yes,
+            &(10 * UNIT),
+            &0i128,
+        )
+    })
+}
+
+/// Representative path: router dispatch to a sell through treasury.
+fn e2e_router_dispatch_sell() -> Metrics {
+    let fx = e2e_fixture();
+    let market_id = e2e_create_market(&fx, "ipfs://e2e");
+    fx.router.dispatch_buy(
+        &fx.agent,
+        &market_id,
+        &market_core_wasm::Outcome::Yes,
+        &(10 * UNIT),
+        &0i128,
+    );
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.router.dispatch_sell(
+            &fx.agent,
+            &market_id,
+            &market_core_wasm::Outcome::Yes,
+            &(2 * UNIT),
+            &i128::MAX,
+        )
+    })
+}
+
+// ---------------------------------------------------------------------------
 // Registry of scenarios
 // ---------------------------------------------------------------------------
 
@@ -369,6 +585,18 @@ fn scenarios() -> Vec<Scenario> {
         ("registry.publish_trace.cid_1k", reg_publish_cid_1k),
         ("registry.publish_trace.action_1k", reg_publish_action_1k),
         ("registry.view.get_trace", reg_get_trace),
+        (
+            "e2e.resolver.agent_create_market_and_reveal",
+            e2e_agent_create_market_and_reveal,
+        ),
+        (
+            "e2e.resolver.agent_create_market.max_uri",
+            e2e_agent_create_market_max_uri,
+        ),
+        ("e2e.treasury.agent_buy", e2e_treasury_agent_buy),
+        ("e2e.treasury.agent_sell", e2e_treasury_agent_sell),
+        ("e2e.router.dispatch_buy", e2e_router_dispatch_buy),
+        ("e2e.router.dispatch_sell", e2e_router_dispatch_sell),
     ]
 }
 
@@ -582,6 +810,63 @@ fn worst_cases_within_network_limits() {
     assert!(
         failures.is_empty(),
         "scenarios exceed mainnet limits:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// Reviewed per-scenario budgets for the cross-contract paths. These are
+/// intentionally tighter than the network limits so that a regression in a
+/// nested authorization or storage path fails CI before it can approach the
+/// mainnet ceiling. Values are reviewed alongside the baseline in
+/// `budget-baseline.json`.
+mod reviewed {
+    pub const E2E_CPU_INSTRUCTIONS: u64 = 120_000_000;
+    pub const E2E_MEM_BYTES: u64 = 20_000_000;
+    pub const E2E_READ_ENTRIES: u64 = 100;
+    pub const E2E_WRITE_ENTRIES: u64 = 100;
+    pub const E2E_READ_BYTES: u64 = 100_000;
+    pub const E2E_WRITE_BYTES: u64 = 66_048;
+    pub const E2E_EVENTS_BYTES: u64 = 8_192;
+}
+
+#[test]
+fn cross_contract_paths_within_reviewed_budgets() {
+    let mut failures = Vec::new();
+    for (name, run) in scenarios() {
+        if !name.starts_with("e2e.") {
+            continue;
+        }
+        let m = run();
+        let checks = [
+            ("cpu_insns", m.cpu_insns, reviewed::E2E_CPU_INSTRUCTIONS),
+            ("mem_bytes", m.mem_bytes, reviewed::E2E_MEM_BYTES),
+            (
+                "read_entries",
+                m.read_entries as u64,
+                reviewed::E2E_READ_ENTRIES,
+            ),
+            (
+                "write_entries",
+                m.write_entries as u64,
+                reviewed::E2E_WRITE_ENTRIES,
+            ),
+            ("read_bytes", m.read_bytes as u64, reviewed::E2E_READ_BYTES),
+            ("write_bytes", m.write_bytes as u64, reviewed::E2E_WRITE_BYTES),
+            (
+                "events_bytes",
+                m.events_bytes as u64,
+                reviewed::E2E_EVENTS_BYTES,
+            ),
+        ];
+        for (metric, actual, limit) in checks {
+            if actual > limit {
+                failures.push(format!("{name}: {metric}={actual} > {limit}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "cross-contract paths exceed reviewed budgets:\n  {}",
         failures.join("\n  ")
     );
 }

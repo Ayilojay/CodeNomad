@@ -166,6 +166,16 @@ export interface OpenMarket {
 
 
 /**
+ * One page of the open-exposure inventory returned by
+ * `open_exposure_page`. `next_cursor` is 0 when the walk is complete.
+ */
+export interface OpenExposurePage {
+  entries: Array<OpenMarket>;
+  next_cursor: u64;
+}
+
+
+/**
  * Legacy single-agent configuration. Still the shape returned by the
  * deprecated `get_config` view; live state is [`GlobalConfig`] plus the
  * agent registry.
@@ -834,6 +844,17 @@ export interface Client {
   open_market_count: (options?: MethodOptions) => Promise<AssembledTransaction<u32>>
 
   /**
+   * Construct and simulate a open_exposure_page transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
+   * Paginated, cursor-based view over the open-exposure inventory.
+   * `cursor` is the index to start at (0 for the first page); `limit` is
+   * clamped to `[1, MAX_OPEN_EXPOSURE_PAGE]`. Entries are returned in the
+   * stable order of the open-market index. `next_cursor` is 0 once the
+   * walk is complete. Settled, archived and migrated markets are excluded
+   * from the index, so they never appear here.
+   */
+  open_exposure_page: ({cursor, limit}: {cursor: u64, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<OpenExposurePage>>>
+
+  /**
    * Construct and simulate a recall_from_yield transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
    */
   recall_from_yield: ({amount}: {amount: i128}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -1214,6 +1235,7 @@ export class Client extends ContractClient {
         available_capital: this.txFromJSON<Result<i128>>,
         capital_breakdown: this.txFromJSON<Result<CapitalBreakdown>>,
         open_market_count: this.txFromJSON<u32>,
+        open_exposure_page: this.txFromJSON<Result<OpenExposurePage>>,
         recall_from_yield: this.txFromJSON<Result<void>>,
         daily_usage_detail: this.txFromJSON<Result<UsageWindow>>,
         emergency_withdraw: this.txFromJSON<Result<i128>>,

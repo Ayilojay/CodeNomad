@@ -41,6 +41,40 @@ jobs:
           path: target/wasm32-unknown-unknown/release/*.wasm
           if-no-files-found: error
 
+  budget-tests:
+    # Cross-contract resource-budget gate (see budget-tests/README.md).
+    # Measures representative and maximum-size end-to-end paths (treasury,
+    # resolver, router) against the shipped WASM and fails CI when CPU,
+    # memory or ledger I/O exceed the reviewed limits.
+    runs-on: ubuntu-latest
+    needs: build-and-test
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-budget-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Download shipped WASM artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: contract-wasm
+          path: target/wasm32-unknown-unknown/release
+
+      - name: Run resource-budget tests
+        # --test-threads=1 keeps metering deterministic across test cases.
+        run: cargo test -p budget-tests --locked -- --test-threads=1
+
   release-gate:
     # Independent review gate for contract releases (see RELEASE_CHECKLIST.md).
     # A release tag is only permitted when every checklist item has evidence.
