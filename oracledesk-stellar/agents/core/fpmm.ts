@@ -226,6 +226,28 @@ export function collateralOutForShares(
   return mulDivFloor(gross, BPS - feeBps, BPS);
 }
 
+/**
+ * Returns true when the average buy price (collateralIn / sharesOut, in bps)
+ * does not exceed `limitPriceBps`. Mirrors the on-chain check in
+ * `agent_buy_v2`: a `limitPriceBps` of 0 is never satisfiable (the price is
+ * always at least 1 bps), consistent with the contract's "no-limit" flag
+ * being `limit_price_bps == 0` for sells only.
+ */
+export function buyWithinLimit(collateralIn: bigint, sharesOut: bigint, limitPriceBps: bigint): boolean {
+  if (limitPriceBps <= 0n || sharesOut <= 0n) return false;
+  // average price in bps = collateralIn * BPS / sharesOut
+  return collateralIn * BPS <= sharesOut * limitPriceBps;
+}
+
+/**
+ * Returns true when the average sell price (collateralOut / sharesIn, in bps)
+ * is at least `limitPriceBps`. A `limitPriceBps` of 0 is always satisfied.
+ */
+export function sellWithinLimit(collateralOut: bigint, sharesIn: bigint, limitPriceBps: bigint): boolean {
+  if (limitPriceBps <= 0n || sharesIn <= 0n) return true;
+  return collateralOut * BPS >= sharesIn * limitPriceBps;
+}
+
 /** Search budget for collateralForShares; the bracket needs far fewer steps. */
 const COLLATERAL_SEARCH_STEPS = 256;
 

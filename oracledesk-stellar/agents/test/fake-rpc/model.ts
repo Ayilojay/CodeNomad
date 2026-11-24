@@ -20,6 +20,10 @@ export interface ModelMarket {
   open: boolean;
   creator: string;
   questionHash: string;
+  /** `Resolved(Yes)`, `Resolved(No)`, `Void`, or undefined when still open. */
+  resolution?: "Resolved(Yes)" | "Resolved(No)" | "Void";
+  /** Whether the treasury's settlement call has completed for this market. */
+  settled?: boolean;
 }
 
 export interface ModelTrace {
@@ -60,7 +64,7 @@ export type CallOutcome =
   | { ok: false; error: string };
 
 /** Functions that never write state or need authorization. */
-const READS = new Set(["quote_buy", "quote_sell", "market_count", "get_market", "get_config", "trace_count", "get_trace", "state"]);
+const READS = new Set(["quote_buy", "quote_sell", "market_count", "get_market", "get_config", "trace_count", "get_trace", "state", "open_exposure_page"]);
 
 export function isWrite(fn: string): boolean {
   return !READS.has(fn);
@@ -98,6 +102,14 @@ export function seedMarket(
   return market;
 }
 
+/** Marks a market as resolved or voided, as the resolver/oracle would. */
+export function resolveMarket(state: ModelState, marketId: bigint, resolution: NonNullable<ModelMarket["resolution"]>): void {
+  const m = state.markets.find((x) => x.id === marketId);
+  if (!m) throw new Error(`resolveMarket: market ${marketId} not found`);
+  m.open = false;
+  m.resolution = resolution;
+}
+
 type Args = Record<string, unknown>;
 type Outcome = { tag: "Yes" | "No" };
 
@@ -116,6 +128,38 @@ export function invoke(state: ModelState, contract: ContractName, fn: string, a:
     switch (`${contract}.${fn}`) {
       case "market_core.market_count":
         return { ok: true, value: BigInt(state.markets.length), events: [] };
+
+      case "market_core.get_market": {
+        const m = market(state, a.market_id);
+        if (!m) return fail("MarketNotFound");
+        // Build a status value that mirrors what market-core returns.
+        let status: unknown;
+        if (!m.resolution) {
+          status = { tag: "Open", values: undefined };
+        } else if (m.resolution === "Resolved(Yes)") {
+          status = { tag: "Resolved", values: [{ tag: "Yes", values: undefined }] };
+        } else if (m.resolution === "Resolved(No)") {
+          status = { tag: "Resolved", values: [{ tag: "No", values: undefined }] };
+        } else {
+          status = { tag: "Void", values: undefined };
+        }
+        return {
+          ok: true,
+          value: {
+            creator: m.creator,
+            question_hash: Buffer.from(m.questionHash, "hex"),
+            resolution_hash: Buffer.alloc(32),
+            close_time: m.closeTime,
+            status,
+            reserve_yes: m.reserveYes,
+            reserve_no: m.reserveNo,
+            fee_bps: m.feeBps,
+            lp_claimed: false,
+            meta_uri: "",
+          },
+          events: [],
+        };
+      }
 
       case "market_core.quote_buy": {
         const m = market(state, a.market_id);
@@ -170,6 +214,56 @@ export function invoke(state: ModelState, contract: ContractName, fn: string, a:
         });
         state.treasuryBalance -= seed;
         return { ok: true, value: m.id, events: [{ contract: "treasury", topic: "market_created", data: { market_id: m.id } }] };
+      }
+
+      case "treasury.settle_market": {
+        const m = market(state, a.market_id);
+        if (!m) return fail("MarketCoreMarketNotFound");
+        if (!m.resolution) return fail("MarketNotFinal");
+        if (m.settled) {
+          return {
+            ok: true,
+            value: { redeemed: 0n, lp_claimed: 0n, already_settled: true },
+            events: [],
+          };
+        }
+        // Redeem shares the treasury holds.
+        const yesKey = `${m.id}:Yes`;
+        const noKey = `${m.id}:No`;
+        const yesShares = state.positions[yesKey] ?? 0n;
+        const noShares = state.positions[noKey] ?? 0n;
+        let redeemed = 0n;
+        if (m.resolution === "Resolved(Yes)") redeemed = yesShares;
+        else if (m.resolution === "Resolved(No)") redeemed = noShares;
+        else if (m.resolution === "Void") redeemed = (yesShares + noShares) / 2n;
+        delete state.positions[yesKey];
+        delete state.positions[noKey];
+        state.treasuryBalance += redeemed;
+        // LP remainder: if treasury created the market, claim its half of minimum reserve.
+        const lpClaimed = m.creator === ctx.treasuryAddress ? m.reserveYes < m.reserveNo ? m.reserveYes : m.reserveNo : 0n;
+        state.treasuryBalance += lpClaimed;
+        m.settled = true;
+        return {
+          ok: true,
+          value: { redeemed, lp_claimed: lpClaimed, already_settled: false },
+          events: [{ contract: "treasury", topic: "market_settled", data: { market_id: m.id, redeemed, lp_claimed: lpClaimed } }],
+        };
+      }
+
+      case "treasury.open_exposure_page": {
+        // Read-only: returns open (unsettled) markets starting at cursor index.
+        const cursor = BigInt(a.cursor as bigint);
+        const limit = Math.min(Number(a.limit ?? 20), 20);
+        const open = state.markets.filter((m) => !m.settled);
+        const start = open.findIndex((m) => m.id >= cursor);
+        const slice = start === -1 ? [] : open.slice(start, start + limit);
+        const next = start === -1 ? [] : open.slice(start + limit);
+        const nextCursor = next.length > 0 ? next[0].id : 0n;
+        return {
+          ok: true,
+          value: { entries: slice.map((m) => ({ market_id: m.id })), next_cursor: nextCursor },
+          events: [],
+        };
       }
 
       case "reasoning_registry.publish_trace": {

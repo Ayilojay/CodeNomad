@@ -53,6 +53,10 @@ function probes(agent: string): Record<ContractName, ProbeCall[]> {
           initial_yes_bps: 5000,
         },
       },
+      {
+        fn: "settle_market",
+        args: { caller: agent, market_id: 0n },
+      },
     ],
     reasoning_registry: [
       {
