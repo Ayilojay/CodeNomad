@@ -104,6 +104,8 @@ pub struct World {
     pub price_market: u64,
     /// Signer-mode market committed to `signer_a`/`signer_b` with threshold 2.
     pub signer_market: u64,
+    /// Hybrid-mode market combining the price and signer components above.
+    pub hybrid_market: u64,
 }
 
 impl World {
@@ -238,6 +240,23 @@ impl World {
         env.set_auths(&[]);
         resolver.register_signer_spec(&signer_market, &import_signer_spec(&signer_spec));
 
+        let hybrid_spec = hybrid_spec(&env, &oracle_id, &signer_a, &signer_b);
+        let hybrid_hash = resolver_native::legacy_spec_hash(
+            &env,
+            &resolver_native::ResolutionSpec::Hybrid(hybrid_spec.clone()),
+        );
+        let hybrid_market = create_market(
+            &env,
+            &core,
+            &collateral,
+            &creator,
+            hybrid_hash,
+            MARKET_CLOSE,
+            5_000,
+        );
+        env.set_auths(&[]);
+        resolver.register_hybrid_spec(&hybrid_market, &import_hybrid_spec(&hybrid_spec));
+
         env.set_auths(&[]);
         Self {
             env,
@@ -261,6 +280,7 @@ impl World {
             oracle_id,
             price_market,
             signer_market,
+            hybrid_market,
         }
     }
 
@@ -313,55 +333,99 @@ impl World {
     }
 
     pub fn resolve_signer_market(&self) {
-        self.set_time(MARKET_CLOSE + 1);
+        self.attest_signer_market(&self.signer_market, resolver::AttestedOutcome::Yes);
+        self.finalize_signer_market(&self.signer_market);
+    }
+
+    /// Create a signer-mode market committed to `signer_a`/`signer_b` with
+    /// threshold 2. Used by fixtures that need a fresh market (e.g. invalid
+    /// or void flows) without disturbing the shared `signer_market`.
+    pub fn create_signer_market(&self, close_time: u64, yes_bps: u32) -> u64 {
+        let spec = signer_spec(&self.env, &self.signer_a, &self.signer_b);
+        let hash = resolver_native::legacy_spec_hash(
+            &self.env,
+            &resolver_native::ResolutionSpec::Signers(spec.clone()),
+        );
+        let id = self.create_market_with_hash(hash, close_time, yes_bps);
         self.env.set_auths(&[]);
-        // Two targeted signer mocks, one per attestation.
-        let a_invoke = MockAuthInvoke {
+        self.resolver
+            .register_signer_spec(&id, &import_signer_spec(&spec));
+        self.env.set_auths(&[]);
+        id
+    }
+
+    /// Create a hybrid-mode market registering a spec with both a price
+    /// component (the mock oracle) and a signer component (`signer_a`/
+    /// `signer_b`, threshold 2).
+    pub fn create_hybrid_market(&self, close_time: u64, yes_bps: u32) -> u64 {
+        let spec = hybrid_spec(&self.env, &self.oracle_id, &self.signer_a, &self.signer_b);
+        let hash = resolver_native::legacy_spec_hash(
+            &self.env,
+            &resolver_native::ResolutionSpec::Hybrid(spec.clone()),
+        );
+        let id = self.create_market_with_hash(hash, close_time, yes_bps);
+        self.env.set_auths(&[]);
+        self.resolver
+            .register_hybrid_spec(&id, &import_hybrid_spec(&spec));
+        self.env.set_auths(&[]);
+        id
+    }
+
+    /// Submit one targeted attestation for `market` from `signer`.
+    pub fn attest(&self, market: u64, signer: &Address, outcome: resolver::AttestedOutcome) {
+        self.env.set_auths(&[]);
+        let invoke = MockAuthInvoke {
             contract: &self.resolver_id,
             fn_name: "attest",
-            args: (
-                self.signer_market,
-                self.signer_a.clone(),
-                resolver::AttestedOutcome::Yes,
-            )
-                .into_val(&self.env),
+            args: (market, signer.clone(), outcome.clone()).into_val(&self.env),
             sub_invokes: &[],
         };
         self.resolver
             .mock_auths(&[MockAuth {
-                address: &self.signer_a,
-                invoke: &a_invoke,
+                address: signer,
+                invoke: &invoke,
             }])
-            .attest(
-                &self.signer_market,
-                &self.signer_a,
-                &resolver::AttestedOutcome::Yes,
-            );
-        let b_invoke = MockAuthInvoke {
-            contract: &self.resolver_id,
-            fn_name: "attest",
-            args: (
-                self.signer_market,
-                self.signer_b.clone(),
-                resolver::AttestedOutcome::Yes,
-            )
-                .into_val(&self.env),
-            sub_invokes: &[],
-        };
-        self.resolver
-            .mock_auths(&[MockAuth {
-                address: &self.signer_b,
-                invoke: &b_invoke,
-            }])
-            .attest(
-                &self.signer_market,
-                &self.signer_b,
-                &resolver::AttestedOutcome::Yes,
-            );
+            .attest(&market, signer, &outcome);
+        self.env.set_auths(&[]);
+    }
+
+    /// Attest `market` from both configured signers with `outcome`.
+    pub fn attest_signer_market(&self, market: &u64, outcome: resolver::AttestedOutcome) {
+        self.set_time(MARKET_CLOSE + 1);
+        self.attest(market, &self.signer_a, outcome.clone());
+        self.attest(market, &self.signer_b, outcome);
+    }
+
+    /// Advance past the dispute window and finalize a signer market.
+    pub fn finalize_signer_market(&self, market: &u64) {
         self.set_time(MARKET_CLOSE + 1 + 101);
         self.env.set_auths(&[]);
-        self.resolver.finalize_signers(&self.signer_market);
+        self.resolver.finalize_signers(market);
         self.env.set_auths(&[]);
+    }
+
+    /// Drive the guardian fallback for `market` with `reason` at the grace
+    /// timestamp the resolver expects for that reason. Returns the timestamp
+    /// used so fixtures can record it deterministically.
+    pub fn guardian_void_market(&self, market: u64, reason: resolver::GuardianReason) -> u64 {
+        let grace = self.resolver.guardian_grace();
+        let at = MARKET_CLOSE + grace + 1;
+        self.set_time(at);
+        self.env.set_auths(&[]);
+        let invoke = MockAuthInvoke {
+            contract: &self.resolver_id,
+            fn_name: "guardian_void",
+            args: (market, self.admin.clone(), reason.clone()).into_val(&self.env),
+            sub_invokes: &[],
+        };
+        self.resolver
+            .mock_auths(&[MockAuth {
+                address: &self.admin,
+                invoke: &invoke,
+            }])
+            .guardian_void(&market, &self.admin, &reason);
+        self.env.set_auths(&[]);
+        at
     }
 }
 
@@ -470,6 +534,25 @@ fn import_signer_spec(spec: &resolver_native::SignerConfig) -> resolver::SignerC
         signers: spec.signers.clone(),
         threshold: spec.threshold,
         dispute_window: spec.dispute_window,
+    }
+}
+
+fn hybrid_spec(
+    env: &Env,
+    oracle: &Address,
+    a: &Address,
+    b: &Address,
+) -> resolver_native::HybridConfig {
+    resolver_native::HybridConfig {
+        price: price_spec(env, oracle),
+        signers: signer_spec(env, a, b),
+    }
+}
+
+fn import_hybrid_spec(spec: &resolver_native::HybridConfig) -> resolver::HybridConfig {
+    resolver::HybridConfig {
+        price: import_price_spec(&spec.price),
+        signers: import_signer_spec(&spec.signers),
     }
 }
 

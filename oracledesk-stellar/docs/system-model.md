@@ -81,11 +81,82 @@ routes 100% of fees to the protocol), settlement, treasury agent-buy balance
 and position movement, treasury price-band/impact/market-cap checks, resolver
 signer quorum → finalize → resolve, and registry trace counters.
 
-Out of scope on purpose: multi-market interactions, price-mode resolution
-(covered by `auth_matrix` and the local E2E), disputes/committees/hybrid
-feeds, withdrawals/yield, storage TTL, and error *codes*. The model predicts
-success/failure, not the numeric error; the auth matrix pins the error paths
-that matter for authorization, and unit tests pin the rest.
+Resolution *lifecycle* coverage is provided separately by the replay fixtures
+in `model/resolution_fixtures/*.json` (see below): price, signer, hybrid,
+invalid and void flows, plus the guardian/fallback path. These fixtures are
+sanitized, deterministic event sequences captured from real contract events;
+they are replayed through the model and through a decoder that must reconstruct
+the same final state.
+
+Out of scope on purpose: multi-market interactions, disputes/committees beyond
+the guardian/fallback fixture, withdrawals/yield, storage TTL, and error
+*codes*. The model predicts success/failure, not the numeric error; the auth
+matrix pins the error paths that matter for authorization, and unit tests pin
+the rest.
+
+## Resolution lifecycle replay fixtures
+
+Each fixture in `model/resolution_fixtures/` is a JSON document with:
+
+```json
+{
+  "schema_version": 1,
+  "name": "signer_quorum",
+  "mode": "signer",
+  "events": [ { "kind": "signer_attestation", "time": 1000, "signer": "s1", "outcome": "yes" }, ... ],
+  "expected_final_state": { "resolver_state": "Finalized", "market_status": "resolved_yes" }
+}
+```
+
+Events are ordered by `time` (ties broken by their position in the file) and
+carry only sanitized identifiers (`s1`, `s2`, ...), never real keys or
+addresses. Amounts and times are integers, so replay is byte-for-byte
+deterministic.
+
+| Fixture | Mode | Event sequence | Expected final state |
+| --- | --- | --- | --- |
+| `price_feed.json` | price | `price_updated` (feed within band) → `resolution_proposed` → `finalize_price` | `Finalized`, `resolved_yes` |
+| `signer_quorum.json` | signer | `signer_attestation` × quorum (agreeing) → `finalize_signers` | `Finalized`, `resolved_yes` |
+| `hybrid_feed.json` | hybrid | `price_updated` → `signer_attestation` × quorum → `finalize_hybrid` | `Finalized`, `resolved_no` |
+| `invalid_outcome.json` | signer | `signer_attestation` × quorum for `invalid` → `finalize_signers` | `Finalized`, `void` |
+| `void_flow.json` | price | `resolution_proposed` → `void_market` | `Voided`, `void` |
+| `guardian_fallback.json` | signer | quorum missed → `guardian_override` → `finalize_signers` | `Finalized`, `resolved_yes` |
+
+The decoder (`decode_resolution_events` in `tests/system_model.rs`) folds the
+event list into a final state and enforces two invariants:
+
+- **Missing events**: a finalize/void event without the prerequisite
+  attestations, price update, or guardian override is rejected with a
+  `MissingEvent` error naming the absent kind.
+- **Out-of-order events**: an event whose `time` precedes the previous event's
+  `time`, or a finalize that arrives before its prerequisites, is rejected with
+  an `OutOfOrder` error.
+
+The test `resolution_fixtures_replay` asserts that the decoder's final state
+equals `expected_final_state` and that the model, replayed over the same
+events, agrees. Negative cases (a fixture with a dropped prerequisite and one
+with swapped timestamps) assert the decoder flags them.
+
+### Compatibility guarantees
+
+- The trace schema version stays **1**; resolution fixtures are a separate,
+  additive document type and do not change `model/trace-schema.json`.
+- Existing `model/regressions/*.json` traces still replay unchanged; the
+  fixture replay is a new test, not a modification of existing ones.
+- No deployed contract interface changes: fixtures are derived from the
+  existing event set and the decoder is test-only.
+
+### Adding a resolution fixture
+
+1. capture the sanitized event sequence from a real run (replace keys/addresses
+   with `s1`, `s2`, ...; keep integer times and amounts);
+2. add `model/resolution_fixtures/<name>.json` with `schema_version: 1`, the
+   `mode`, the ordered `events`, and the `expected_final_state` the contracts
+   produced;
+3. if the flow introduces a new event `kind`, extend the decoder in
+   `tests/system_model.rs` and add a negative case for its missing/out-of-order
+   handling;
+4. run `cargo test -p integration-tests --test system_model`.
 
 ## Adding an operation
 

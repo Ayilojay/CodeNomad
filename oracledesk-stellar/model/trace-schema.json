@@ -17,6 +17,10 @@
       "type": "array",
       "description": "Optional committed snapshots; when present the model and the wasm harness must both reproduce them exactly.",
       "items": { "$ref": "#/$defs/snapshot" }
+    },
+    "resolution_fixture": {
+      "$ref": "#/$defs/resolution_fixture",
+      "description": "Optional sanitized, deterministic resolution-lifecycle event replay. Additive to schema_version 1: existing traces without this property remain valid and unchanged."
     }
   },
   "$defs": {
@@ -161,6 +165,88 @@
       "properties": {
         "yes": { "type": "integer", "minimum": 0 },
         "no": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "resolution_mode": {
+      "description": "Resolution mode exercised by a fixture: price, signer, hybrid, invalid or void.",
+      "enum": ["price", "signer", "hybrid", "invalid", "void"]
+    },
+    "resolution_path": {
+      "description": "Guardian/fallback path taken to reach the resolution: primary, guardian, fallback or none.",
+      "enum": ["primary", "guardian", "fallback", "none"]
+    },
+    "resolution_event_kind": {
+      "description": "Event kinds emitted across the resolution lifecycle. price/signer/hybrid/invalid/void are mode markers; guardian/fallback are path markers; the remainder are lifecycle transitions.",
+      "enum": [
+        "price",
+        "signer",
+        "hybrid",
+        "invalid",
+        "void",
+        "guardian",
+        "fallback",
+        "configured",
+        "signers_pending",
+        "finalized",
+        "expired",
+        "disputed",
+        "resolved",
+        "redeemed",
+        "remainder_claimed"
+      ]
+    },
+    "resolution_event": {
+      "type": "object",
+      "required": ["seq", "kind", "time"],
+      "additionalProperties": false,
+      "properties": {
+        "seq": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Monotonic sequence number; the decoder must flag gaps and out-of-order events."
+        },
+        "kind": { "$ref": "#/$defs/resolution_event_kind" },
+        "time": { "$ref": "#/$defs/time" },
+        "outcome": { "$ref": "#/$defs/outcome" },
+        "actor": { "$ref": "#/$defs/actor" },
+        "amount": { "type": "integer", "minimum": 0 },
+        "resolver_state": {
+          "enum": ["Unconfigured", "SignersPending", "Finalized", "Expired", "Disputed", "Other"]
+        }
+      }
+    },
+    "resolution_events": {
+      "type": "array",
+      "minItems": 1,
+      "description": "Ordered resolution-lifecycle events. Sanitized: no addresses, hashes or signatures; only deterministic scalar fields.",
+      "items": { "$ref": "#/$defs/resolution_event" }
+    },
+    "resolution_fixture": {
+      "type": "object",
+      "required": ["name", "mode", "path", "events", "expected"],
+      "additionalProperties": false,
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Stable fixture identifier, e.g. price_primary or signer_guardian."
+        },
+        "mode": { "$ref": "#/$defs/resolution_mode" },
+        "path": { "$ref": "#/$defs/resolution_path" },
+        "events": { "$ref": "#/$defs/resolution_events" },
+        "expected": {
+          "type": "object",
+          "required": ["resolver_state", "market_status"],
+          "additionalProperties": false,
+          "description": "Final state the decoder must reconstruct from events.",
+          "properties": {
+            "resolver_state": {
+              "enum": ["Unconfigured", "SignersPending", "Finalized", "Expired", "Disputed", "Other"]
+            },
+            "market_status": { "enum": ["open", "resolved_yes", "resolved_no", "void"] },
+            "outcome": { "$ref": "#/$defs/outcome" }
+          }
+        }
       }
     }
   }
