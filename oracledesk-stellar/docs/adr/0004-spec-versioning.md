@@ -86,13 +86,92 @@ directory is gitignored because an unrevealed salt must not be published.
 
 ### Migration policy
 
-* Legacy specs stay accepted indefinitely on existing deployments, so
-  existing testnet commitments keep resolving.
-* New tooling emits V2 only.
-* Any change to a field of `PriceConfig`, `SignerConfig`, `OracleAsset`,
-  `PriceDirection` or `ResolutionSpec` must add a **new variant or version**,
-  never edit an existing one, and must update the golden vectors in the same
-  pull request.
+#### Canonical encoding per version
+
+Each supported spec version has exactly one canonical preimage. There is no
+alternative encoding, no whitespace/ordering freedom, and no "equivalent"
+serialization that is also accepted.
+
+| Version | Entrypoint | Preimage | Hash |
+| --- | --- | --- | --- |
+| Legacy (unversioned) | `register_spec` | `XDR(ResolutionSpec)` as an `ScVal` (starts `00 00 00 10`) | `sha256(XDR(ResolutionSpec))` |
+| `2` | `register_spec_v2` | `"oracledesk:resolution-spec" \|\| XDR(ResolutionSpecV2)` | `sha256(preimage)` |
+
+`ResolutionSpecV2.version` is the version tag and is part of the preimage, so
+the version is committed to and cannot be reinterpreted after the fact. The
+legacy encoding carries no tag; its version is implied by the entrypoint that
+consumed it.
+
+#### Version selection
+
+* The version is chosen by the **creator at commit time**, by picking the
+  entrypoint: `register_spec` commits a legacy hash, `register_spec_v2` commits
+  a V2 hash. The resolver never guesses a version from the bytes.
+* A commitment is verified only against the entrypoint that produced it. A V2
+  envelope submitted to `register_spec`, or a bare `ResolutionSpec` submitted
+  to `register_spec_v2`, fails the commitment equality check (and, for the
+  latter, the `version == 2` check first) — it is not silently reinterpreted.
+* New tooling (`scripts/spec-hash`, `scripts/seed-market.sh`) emits V2 only.
+  Legacy entrypoints remain for already-committed markets.
+
+#### Allowed conversions
+
+Only conversions that are **lossless and unambiguous** are allowed, and they
+are performed off-chain by tooling, never on-chain:
+
+* **Legacy spec -> V2 envelope** is allowed when the caller supplies the
+  missing envelope fields (`network_id`, `market_core`, `salt`) explicitly.
+  This is a *re-commitment*, not a reinterpretation: it produces a **new**
+  commitment and requires a new market (or a fresh commit) — the old legacy
+  commitment is unaffected and still verifies on its own.
+* **V2 envelope -> legacy spec** is allowed only by dropping the envelope
+  fields, and only as an explicit, caller-visible operation. It likewise
+  produces a different commitment; it never causes a V2 commitment to verify
+  as a legacy one.
+
+#### Rejected conversions
+
+The following are rejected, on-chain and in `scripts/spec-hash`:
+
+* **Ambiguous version inference.** Deriving the version from the preimage
+  bytes instead of the entrypoint. The two preimage sets are disjoint (see
+  *Domain separation*), so a byte string is never valid under both versions.
+* **Lossy downgrade.** Presenting a V2 commitment as a legacy one (dropping
+  `version`, `network_id`, `market_core` or `salt`) to make it verify against
+  a legacy hash. The hashes differ, so this fails commitment equality.
+* **Lossy upgrade.** Wrapping a legacy commitment in a V2 envelope without a
+  caller-supplied salt/domain, or reusing a zero salt, to "promote" it. This
+  fails `InvalidConfig` (zero salt) or produces a different hash that does not
+  match the original commitment.
+* **Cross-version replay.** Submitting a commitment to an entrypoint of a
+  different version, or replaying a V2 envelope on another network or against
+  another market-core (`DomainMismatch`).
+
+#### Compatibility guarantee
+
+Commitments produced under older spec versions **still verify indefinitely**.
+The legacy encoding is frozen by the golden vectors in `contracts/resolver`
+(`mod golden`) and `scripts/spec-hash` (`golden_legacy_vectors`); the legacy
+entrypoints keep their behaviour and error precedence exactly. Adding a new
+version must never change the bytes hashed for an existing version.
+
+#### Golden vectors proving the rules
+
+`scripts/spec-hash` pins vectors that make the rules above executable:
+
+* `golden_legacy_vectors` — the six legacy hashes, re-derived from hand-built
+  XDR with no Soroban code, proving old commitments still verify.
+* `v2_and_legacy_hash_spaces_disjoint` — checks the `00 00 00 10` vs `orac`
+  prefixes and the hashes over random specs, proving version inference from
+  bytes is ambiguous and therefore rejected.
+* Cross-version vectors assert that a legacy spec re-committed as a V2
+  envelope (and vice versa) yields a *different* hash, proving lossy
+  conversions fail rather than silently verifying.
+
+Any change to a field of `PriceConfig`, `SignerConfig`, `OracleAsset`,
+`PriceDirection` or `ResolutionSpec` must add a **new variant or version**,
+never edit an existing one, and must update the golden vectors in the same
+pull request.
 
 ## Consequences
 
