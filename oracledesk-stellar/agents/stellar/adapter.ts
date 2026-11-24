@@ -576,6 +576,52 @@ export class StellarAdapter {
   }
 
   /**
+   * Calls `settle_market` on the treasury for `marketId`. Permissionless:
+   * any address may call it. The contract is idempotent — a second call on
+   * the same market returns `already_settled: true` and 0 for both amounts.
+   */
+  async settleMarket(marketId: bigint): Promise<AdapterResult<{ redeemed: bigint; lpClaimed: bigint; alreadySettled: boolean }>> {
+    const call = { caller: this.agent, market_id: marketId };
+    return this.run("treasury", "@oracledesk/bindings-treasury", "settle_market", call, (client) =>
+      client.settle_market(call),
+    ).then((r) => {
+      if (r.dryRun) return r as DryRunResult;
+      const v = r.value as { redeemed: bigint; lp_claimed: bigint; already_settled: boolean };
+      return {
+        dryRun: false as const,
+        value: { redeemed: BigInt(v.redeemed), lpClaimed: BigInt(v.lp_claimed), alreadySettled: Boolean(v.already_settled) },
+      };
+    });
+  }
+
+  /**
+   * Reads one page of the treasury's open-exposure inventory. `cursor` is 0
+   * for the first page; use the returned `nextCursor` to fetch the next one.
+   * Returns `{ marketIds, nextCursor }` where `nextCursor` is 0 when the
+   * walk is complete.
+   *
+   * Read-only simulation: works in both dry-run and live mode.
+   */
+  async openExposurePage(cursor: bigint, limit = 20): Promise<{ marketIds: bigint[]; nextCursor: bigint }> {
+    const client = await this.client<any>("treasury", "@oracledesk/bindings-treasury");
+    const tx = await client.open_exposure_page({ cursor, limit });
+    const result = tx.result as {
+      isErr?: () => boolean;
+      unwrap?: () => { entries: { market_id: bigint }[]; next_cursor: bigint };
+      unwrapErr?: () => unknown;
+    };
+    if (typeof result?.isErr === "function" && result.isErr()) {
+      const e = result.unwrapErr?.();
+      throw new Error(`open_exposure_page failed: ${JSON.stringify(e)}`);
+    }
+    const page = typeof result?.unwrap === "function" ? result.unwrap() : (result as unknown as { entries: { market_id: bigint }[]; next_cursor: bigint });
+    return {
+      marketIds: (page.entries ?? []).map((e) => BigInt(e.market_id)),
+      nextCursor: BigInt(page.next_cursor ?? 0),
+    };
+  }
+
+  /**
    * Reads a market's price state. Unlike the write wrappers above, a read
    * always queries the network — through the bindings' simulation, which
    * never signs or submits — so it works identically in dry-run and live
