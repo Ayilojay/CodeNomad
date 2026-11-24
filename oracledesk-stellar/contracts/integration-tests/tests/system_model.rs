@@ -19,6 +19,9 @@ use std::process::Command;
 
 use integration_tests::world::{World, MARKET_CLOSE, USDC};
 use integration_tests::{market_core, resolver};
+use integration_tests::resolution_fixtures::{
+    self, DecodeError, EventKind, ResolutionFixture, ResolutionMode,
+};
 use market_core::Outcome as CoreOutcome;
 use proptest::prelude::*;
 use resolver::AttestedOutcome;
@@ -736,4 +739,150 @@ fn model_selftest_runs() {
         "model selftest failed: {}",
         std::string::String::from_utf8_lossy(&output.stderr)
     );
+}
+
+// ----- resolution lifecycle replay fixtures --------------------------------
+
+/// Executes a fixture's op sequence against the wasm contracts and returns the
+/// final snapshot (the contract-observed final state).
+fn execute_fixture(fixture: &ResolutionFixture) -> serde_json::Value {
+    let mut harness = Harness::new();
+    for step in &fixture.steps {
+        harness.execute(step);
+    }
+    harness.snapshot()
+}
+
+/// Replays a fixture through the Python model and returns its final snapshot.
+fn replay_fixture_through_model(fixture: &ResolutionFixture) -> serde_json::Value {
+    let trace = TraceFile {
+        schema_version: SCHEMA_VERSION,
+        steps: fixture.steps.clone(),
+        snapshots: None,
+    };
+    let model = run_model(&trace, &format!("fixture-{}", fixture.name));
+    model
+        .get("snapshots")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.last())
+        .cloned()
+        .expect("model must emit at least one snapshot")
+}
+
+/// Asserts the decoder reconstructs the same final state the contracts
+/// produced for the fixture's event sequence.
+fn assert_decoder_matches_contract(fixture: &ResolutionFixture) {
+    let contract_final = execute_fixture(fixture);
+    let decoded = resolution_fixtures::decode(&fixture.events)
+        .unwrap_or_else(|e| panic!("{}: decoder rejected valid events: {e:?}", fixture.name));
+    let expected = resolution_fixtures::final_state_from_snapshot(&contract_final);
+    assert_eq!(
+        decoded.final_state, expected,
+        "{}: decoder final state disagrees with contracts\ncontract: {}\ndecoded:  {}",
+        fixture.name,
+        serde_json::to_string_pretty(&expected).unwrap(),
+        serde_json::to_string_pretty(&decoded.final_state).unwrap(),
+    );
+    assert_eq!(
+        decoded.mode, fixture.mode,
+        "{}: decoder inferred wrong resolution mode",
+        fixture.name
+    );
+    // The Python model must agree with the contracts on the same sequence.
+    let model_final = replay_fixture_through_model(fixture);
+    assert_eq!(
+        model_final, contract_final,
+        "{}: python model final snapshot disagrees with contracts",
+        fixture.name
+    );
+}
+
+#[test]
+fn resolution_fixtures_cover_all_modes() {
+    let fixtures = resolution_fixtures::all();
+    let mut seen = std::collections::BTreeSet::new();
+    for fixture in &fixtures {
+        seen.insert(format!("{:?}", fixture.mode));
+    }
+    for mode in [
+        ResolutionMode::Price,
+        ResolutionMode::Signer,
+        ResolutionMode::Hybrid,
+        ResolutionMode::Invalid,
+        ResolutionMode::Void,
+        ResolutionMode::GuardianFallback,
+    ] {
+        assert!(
+            seen.contains(&format!("{mode:?}")),
+            "no fixture covers resolution mode {mode:?}"
+        );
+    }
+}
+
+#[test]
+fn resolution_fixtures_replay_against_contracts() {
+    for fixture in resolution_fixtures::all() {
+        assert_decoder_matches_contract(&fixture);
+    }
+}
+
+#[test]
+fn decoder_rejects_missing_event() {
+    for fixture in resolution_fixtures::all() {
+        // Drop the terminal resolution event; the decoder must notice the
+        // sequence never reaches a terminal state.
+        let mut events = fixture.events.clone();
+        let terminal_idx = events
+            .iter()
+            .rposition(|e| e.kind.is_terminal())
+            .expect("fixture must contain a terminal event");
+        events.remove(terminal_idx);
+        match resolution_fixtures::decode(&events) {
+            Err(DecodeError::MissingEvent { .. }) => {}
+            other => panic!(
+                "{}: expected MissingEvent after dropping terminal event, got {other:?}",
+                fixture.name
+            ),
+        }
+    }
+}
+
+#[test]
+fn decoder_rejects_out_of_order_events() {
+    for fixture in resolution_fixtures::all() {
+        let mut events = fixture.events.clone();
+        // Find the first adjacent pair with strictly increasing sequence
+        // numbers and swap them.
+        let mut swapped = false;
+        for i in 1..events.len() {
+            if events[i].seq > events[i - 1].seq {
+                events.swap(i, i - 1);
+                swapped = true;
+                break;
+            }
+        }
+        assert!(swapped, "{}: fixture needs >=2 ordered events", fixture.name);
+        match resolution_fixtures::decode(&events) {
+            Err(DecodeError::OutOfOrder { .. }) => {}
+            other => panic!(
+                "{}: expected OutOfOrder after swapping events, got {other:?}",
+                fixture.name
+            ),
+        }
+    }
+}
+
+#[test]
+fn decoder_rejects_unknown_event_kind() {
+    // Sanity: an event whose kind is not part of the lifecycle is rejected.
+    let fixture = resolution_fixtures::all()
+        .into_iter()
+        .next()
+        .expect("at least one fixture");
+    let mut events = fixture.events.clone();
+    events[0].kind = EventKind::Unknown;
+    match resolution_fixtures::decode(&events) {
+        Err(DecodeError::UnknownEvent { .. }) => {}
+        other => panic!("expected UnknownEvent, got {other:?}"),
+    }
 }

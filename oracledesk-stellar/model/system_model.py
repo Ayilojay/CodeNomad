@@ -64,6 +64,34 @@ from fpmm_model import (
 )
 
 SCHEMA_VERSION = 1
+# Resolution-lifecycle replay schema. Kept separate from SCHEMA_VERSION so the
+# existing ``--replay`` trace format stays byte-for-byte compatible.
+RESOLUTION_SCHEMA_VERSION = 1
+
+# Resolution modes the resolver contract supports. ``price`` resolves from an
+# oracle price, ``signer`` from guardian signer approvals, ``hybrid`` requires
+# both, and ``invalid``/``void`` are the fallback paths.
+RESOLUTION_MODES = ("price", "signer", "hybrid", "invalid", "void")
+
+# Canonical ordering of resolution-lifecycle events. The decoder requires the
+# events to arrive in this order (with ``guardian_override`` allowed only after
+# ``signers_pending``); anything else is reported as out-of-order.
+RESOLUTION_EVENT_ORDER = (
+    "market_created",
+    "signers_pending",
+    "price_observed",
+    "signer_approved",
+    "guardian_override",
+    "resolved",
+    "finalized",
+)
+
+# Events that may legitimately repeat (one per signer approval).
+RESOLUTION_REPEATABLE = frozenset({"signer_approved"})
+
+# Minimum signer approvals required to finalize a signer/hybrid resolution.
+RESOLUTION_SIGNER_THRESHOLD = 2
+=======
 
 USDC = 10_000_000
 SEED = 100 * USDC
@@ -420,6 +448,130 @@ class SystemModel:
 # ---------------------------------------------------------------------------
 
 
+@dataclass
+class ResolutionState:
+    """Reconstructed resolver state from a resolution-lifecycle event stream."""
+
+    mode: Optional[str] = None
+    status: str = "Unconfigured"
+    outcome: Optional[str] = None
+    price_observed: Optional[int] = None
+    signer_approvals: int = 0
+    guardian_override: bool = False
+    finalized: bool = False
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "status": self.status,
+            "outcome": self.outcome,
+            "price_observed": self.price_observed,
+            "signer_approvals": self.signer_approvals,
+            "guardian_override": self.guardian_override,
+            "finalized": self.finalized,
+        }
+
+
+def _resolution_rank(event: str) -> int:
+    return RESOLUTION_EVENT_ORDER.index(event)
+
+
+def replay_resolution(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Replay a resolution-lifecycle event sequence.
+
+    Mirrors the Rust decoder in ``integration-tests``: it reconstructs the
+    final resolver state and reports any missing or out-of-order events. The
+    returned dict has ``schema_version``, ``state`` (final snapshot),
+    ``steps`` (per-event ok/error), ``missing`` (required events never seen)
+    and ``out_of_order`` (events that arrived too early or after finalize).
+    """
+    state = ResolutionState()
+    steps: List[Dict[str, Any]] = []
+    out_of_order: List[Dict[str, Any]] = []
+    seen: List[str] = []
+    last_rank = -1
+    finalized_seen = False
+
+    for index, event in enumerate(events):
+        kind = event.get("event")
+        result: Dict[str, Any] = {"index": index, "event": kind, "ok": True}
+        if kind not in RESOLUTION_EVENT_ORDER:
+            result["ok"] = False
+            result["error"] = "unknown_event"
+            steps.append(result)
+            continue
+
+        rank = _resolution_rank(kind)
+        # Out-of-order: strictly decreasing rank, or any event after finalize,
+        # or a repeat of a non-repeatable event.
+        is_repeat = kind in seen and kind not in RESOLUTION_REPEATABLE
+        if finalized_seen or rank < last_rank or is_repeat:
+            result["ok"] = False
+            result["error"] = "out_of_order"
+            out_of_order.append({"index": index, "event": kind})
+            steps.append(result)
+            continue
+
+        if kind == "market_created":
+            state.mode = event.get("mode")
+            if state.mode not in RESOLUTION_MODES:
+                result["ok"] = False
+                result["error"] = "invalid_mode"
+                steps.append(result)
+                continue
+            state.status = "Open"
+        elif kind == "signers_pending":
+            state.status = "SignersPending"
+        elif kind == "price_observed":
+            state.price_observed = int(event["price"])
+        elif kind == "signer_approved":
+            state.signer_approvals += 1
+        elif kind == "guardian_override":
+            state.guardian_override = True
+        elif kind == "resolved":
+            outcome = event.get("outcome")
+            if outcome not in ("yes", "no", "void"):
+                result["ok"] = False
+                result["error"] = "invalid_outcome"
+                steps.append(result)
+                continue
+            state.outcome = outcome
+            state.status = "Resolved"
+        elif kind == "finalized":
+            state.finalized = True
+            state.status = "Finalized"
+            finalized_seen = True
+
+        seen.append(kind)
+        last_rank = max(last_rank, rank)
+        steps.append(result)
+
+    # Determine which required events are missing for the declared mode.
+    missing: List[str] = []
+    if state.mode is None:
+        missing.append("market_created")
+    else:
+        if "signers_pending" not in seen:
+            missing.append("signers_pending")
+        if state.mode in ("price", "hybrid") and "price_observed" not in seen:
+            missing.append("price_observed")
+        if state.mode in ("signer", "hybrid"):
+            if state.signer_approvals < RESOLUTION_SIGNER_THRESHOLD and not state.guardian_override:
+                missing.append("signer_approved")
+        if "resolved" not in seen:
+            missing.append("resolved")
+        if "finalized" not in seen:
+            missing.append("finalized")
+
+    return {
+        "schema_version": RESOLUTION_SCHEMA_VERSION,
+        "state": state.snapshot(),
+        "steps": steps,
+        "missing": missing,
+        "out_of_order": out_of_order,
+    }
+
+
 def replay(trace: Dict[str, Any]) -> Dict[str, Any]:
     version = trace.get("schema_version")
     if version != SCHEMA_VERSION:
@@ -525,6 +677,59 @@ def _selftest() -> None:
                 total,
             )
 
+    # Resolution-lifecycle replay: one fixture per mode plus the guardian and
+    # fallback paths. Each must reconstruct the same final state the Rust
+    # decoder produces and flag no missing/out-of-order events.
+    def _res_events(mode: str, outcome: str, *, guardian: bool = False) -> List[Dict[str, Any]]:
+        events: List[Dict[str, Any]] = [
+            {"event": "market_created", "mode": mode},
+            {"event": "signers_pending"},
+        ]
+        if mode in ("price", "hybrid"):
+            events.append({"event": "price_observed", "price": 6_200})
+        if mode in ("signer", "hybrid"):
+            if guardian:
+                events.append({"event": "guardian_override"})
+            else:
+                events.append({"event": "signer_approved", "signer": "s1"})
+                events.append({"event": "signer_approved", "signer": "s2"})
+        events.append({"event": "resolved", "outcome": outcome})
+        events.append({"event": "finalized"})
+        return events
+
+    fixtures = {
+        "price": _res_events("price", "yes"),
+        "signer": _res_events("signer", "no"),
+        "hybrid": _res_events("hybrid", "yes"),
+        "invalid": _res_events("invalid", "void"),
+        "void": _res_events("void", "void"),
+        "guardian": _res_events("signer", "yes", guardian=True),
+    }
+    for name, events in fixtures.items():
+        out = replay_resolution(events)
+        assert out["missing"] == [], (name, out["missing"])
+        assert out["out_of_order"] == [], (name, out["out_of_order"])
+        assert all(s["ok"] for s in out["steps"]), (name, out["steps"])
+        assert out["state"]["finalized"] is True, name
+        assert out["state"]["status"] == "Finalized", name
+        assert out["state"]["outcome"] in ("yes", "no", "void"), name
+
+    # Missing events are reported, not silently accepted.
+    truncated = _res_events("signer", "yes")[:-1]  # drop finalized
+    out = replay_resolution(truncated)
+    assert "finalized" in out["missing"], out["missing"]
+    assert out["state"]["finalized"] is False
+
+    # Out-of-order events are flagged and do not corrupt the final state.
+    shuffled = [
+        {"event": "market_created", "mode": "price"},
+        {"event": "resolved", "outcome": "yes"},
+        {"event": "signers_pending"},
+    ]
+    out = replay_resolution(shuffled)
+    assert out["out_of_order"], out
+    assert out["state"]["status"] == "Resolved"
+
     print("system_model.py selftest OK")
 
 
@@ -539,6 +744,17 @@ def main(argv: List[str]) -> int:
         with open(argv[2], "r", encoding="utf-8") as fh:
             trace = json.load(fh)
         print(json.dumps(replay(trace), sort_keys=True))
+        return 0
+    if argv[1] == "--replay-resolution" and len(argv) == 3:
+        with open(argv[2], "r", encoding="utf-8") as fh:
+            doc = json.load(fh)
+        version = doc.get("schema_version")
+        if version != RESOLUTION_SCHEMA_VERSION:
+            raise SystemExit(
+                f"unsupported resolution schema_version {version!r} "
+                f"(expected {RESOLUTION_SCHEMA_VERSION})"
+            )
+        print(json.dumps(replay_resolution(doc["events"]), sort_keys=True))
         return 0
     print(__doc__)
     return 2
