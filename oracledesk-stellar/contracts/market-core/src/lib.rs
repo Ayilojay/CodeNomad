@@ -2306,6 +2306,26 @@ impl MarketCore {
         }
     }
 
+    /// Checks market accounting invariants for auditability (#4).
+    ///
+    /// Verifies:
+    /// 1. `reserve_yes + outstanding_yes == sets_minted`
+    /// 2. `reserve_no + outstanding_no == sets_minted`
+    pub fn verify_market_accounting_invariants(env: Env, market_id: u64) -> Result<bool, Error> {
+        let m = Self::load_market(&env, market_id).ok_or(Error::MarketNotFound)?;
+        let settle = Self::load_settle_state(&env, market_id);
+
+        if settle.paid_out == 0 && !m.lp_claimed {
+            if m.reserve_yes + settle.outstanding_yes != m.sets_minted {
+                return Ok(false);
+            }
+            if m.reserve_no + settle.outstanding_no != m.sets_minted {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn load_fee_terms(env: &Env, id: u64) -> Option<FeeTerms> {
         let key = DataKey::FeeTerms(id);
         let terms = env.storage().persistent().get(&key);

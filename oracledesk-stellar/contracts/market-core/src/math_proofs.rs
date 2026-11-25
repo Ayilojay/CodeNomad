@@ -92,6 +92,44 @@ fn proof_mul_div_rejects_invalid_inputs() {
 
 #[kani::proof]
 #[kani::unwind(1)]
+fn proof_fpmm_rounding_adversarial_reserve_boundaries() {
+    let r_bought: i128 = kani::any();
+    let r_other: i128 = kani::any();
+    let collateral_in: i128 = kani::any();
+    let fee_bps: u32 = kani::any();
+
+    // Adversarial boundaries: test edge and boundary configurations (#5)
+    assume!(r_bought == 1 || r_bought == MAX_SETS || (r_bought > 0 && r_bought <= MAX_SETS));
+    assume!(r_other == 1 || r_other == MAX_SETS || (r_other > 0 && r_other <= MAX_SETS));
+    assume!(collateral_in > 0 && collateral_in <= MAX_SETS);
+    assume_contract_fee(fee_bps);
+
+    if let Ok((shares_out, fee)) = calc_buy(r_bought, r_other, collateral_in, fee_bps) {
+        assert!(shares_out > 0);
+        assert!(fee >= 0);
+        assert!(shares_out <= r_bought + collateral_in);
+    }
+}
+
+#[kani::proof]
+#[kani::unwind(1)]
+fn proof_mul_div_adversarial_boundaries() {
+    let a: i128 = kani::any();
+    let b: i128 = kani::any();
+    let c: i128 = kani::any();
+    assume!(a == 0 || a == 1 || a == MAX_SETS);
+    assume!(b == 0 || b == 1 || b == MAX_SETS);
+    assume!(c == 1 || c == 2 * MAX_SETS);
+
+    let q_floor = mul_div_floor(a, b, c).expect("product fits within i128");
+    let q_ceil = mul_div_ceil(a, b, c).expect("product fits within i128");
+
+    assert!(q_ceil >= q_floor);
+    assert!(q_ceil - q_floor <= 1);
+}
+
+#[kani::proof]
+#[kani::unwind(1)]
 fn proof_calc_buy_no_panic_and_positive_shares() {
     let r_bought: i128 = kani::any();
     let r_other: i128 = kani::any();
