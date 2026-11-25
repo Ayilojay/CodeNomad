@@ -219,12 +219,97 @@ pub fn load_baseline() -> Option<Baseline> {
     serde_json::from_str(&text).ok()
 }
 
+/// Worst-case bounded inputs used by the benchmark scenarios. These mirror the
+/// contract-side limits so the benchmarks exercise the maximum accepted input
+/// rather than an arbitrary representative one.
+pub mod worst_case {
+    /// Maximum number of orders accepted by a single batch entrypoint.
+    pub const MAX_BATCH_ORDERS: u32 = 32;
+    /// Maximum number of trades accepted by a single `MAX_SETS` settlement.
+    pub const MAX_SETS_TRADES: u32 = 16;
+    /// Maximum URI length accepted by the reasoning registry.
+    pub const MAX_URI_LEN: u32 = 256;
+    /// Maximum number of reasoning sets referenced by one registry write.
+    pub const MAX_SETS: u32 = 8;
+}
+
+/// Compare a scenario's measured `Metrics` against the committed baseline
+/// using the baseline's `Tolerance`.
+///
+/// Returns `Ok(())` when every field is within tolerance, or a descriptive
+/// `Err` naming the scenario and the offending metric(s). CPU and memory are
+/// only compared when the running `rustc` matches the one recorded in the
+/// baseline meta, so toolchain churn is visible but not a hard failure.
+pub fn check_regression(name: &str, measured: &Metrics, baseline: &Baseline) -> Result<(), String> {
+    let expected = baseline.scenarios.get(name).ok_or_else(|| {
+        format!(
+            "no baseline recorded for scenario `{name}` in {}; \
+             run `make budget-update` to record it (measured: {measured:?})",
+            baseline_path().display()
+        )
+    })?;
+
+    let tol = &baseline.tolerance;
+    let same_toolchain = baseline.meta.rustc.is_empty()
+        || baseline.meta.rustc == "unknown"
+        || baseline.meta.rustc == compile_time_rustc();
+
+    let mut failures: Vec<String> = Vec::new();
+    let mut check = |metric: &str, got: u64, want: u64, tolerance: f64, enabled: bool| {
+        if !enabled {
+            return;
+        }
+        let allowed = (want as f64) * (1.0 + tolerance);
+        if (got as f64) > allowed {
+            let pct = if want == 0 {
+                f64::INFINITY
+            } else {
+                ((got as f64 / want as f64) - 1.0) * 100.0
+            };
+            failures.push(format!(
+                "{metric}: {got} > {want} (+{pct:.2}%, tolerance {:.2}%)",
+                tolerance * 100.0
+            ));
+        }
+    };
+
+    check("cpu_insns", measured.cpu_insns, expected.cpu_insns, tol.cpu_insns, same_toolchain);
+    check("mem_bytes", measured.mem_bytes, expected.mem_bytes, tol.mem_bytes, same_toolchain);
+    check("read_entries", measured.read_entries as u64, expected.read_entries as u64, tol.read_entries, true);
+    check("write_entries", measured.write_entries as u64, expected.write_entries as u64, tol.write_entries, true);
+    check("read_bytes", measured.read_bytes as u64, expected.read_bytes as u64, tol.read_bytes, true);
+    check("write_bytes", measured.write_bytes as u64, expected.write_bytes as u64, tol.write_bytes, true);
+    check("events_bytes", measured.events_bytes as u64, expected.events_bytes as u64, tol.events_bytes, true);
+
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "budget regression for scenario `{name}`:\n  {}\nmeasured: {measured:?}\nbaseline: {expected:?}",
+            failures.join("\n  ")
+        ))
+    }
+}
+
 pub fn write_baseline(b: &Baseline) {
     let path = baseline_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).unwrap();
     }
     std::fs::write(path, serde_json::to_string_pretty(b).unwrap() + "\n").unwrap();
+}
+
+/// Build a baseline populated with the current toolchain metadata and wasm
+/// sizes, preserving any previously recorded scenarios/limits. Used by the
+/// `BUDGET_UPDATE=1` regeneration path so the committed file always records
+/// the `rustc`/`soroban-sdk` versions needed for reproducibility.
+pub fn refreshed_meta(previous: Option<&Baseline>) -> Meta {
+    let mut meta = previous.map(|b| b.meta.clone()).unwrap_or_default();
+    meta.soroban_sdk = env!("CARGO_PKG_VERSION").to_string();
+    meta.rustc = compile_time_rustc();
+    meta.stellar_cli = stellar_cli_version();
+    meta.wasm_bytes = wasm_bytes();
+    meta
 }
 
 /// Measure a cross-contract call path and assert it stays within the reviewed

@@ -1,4 +1,18 @@
-# Formal verification (`market-core` math)
+# Formal verification
+
+Formal verification in this repository is split into two independent tracks:
+
+| Track | Tool | Target | Entry point |
+| --- | --- | --- | --- |
+| Pricing math | [Kani](https://model-checking.github.io/kani/) | `contracts/market-core` FPMM arithmetic | `cargo kani -p market-core` |
+| Resolver lifecycle | TLC (TLA+ model checker) | `resolver` committee rotation, hybrid fallback, weighted keys, pending proposals | `make formal` |
+
+The sections below describe the Kani track. For the TLA+ resolver model —
+including the extended rotation/hybrid/weighted-key state model, its finite
+configurations, and the safety/liveness properties they check — see
+[`docs/formal/README.md`](formal/README.md).
+
+## Kani (`market-core` math)
 
 `contracts/market-core/src/math_proofs.rs` contains [Kani](https://model-checking.github.io/kani/)
 harnesses for the FPMM pricing engine. The harnesses are compiled only under
@@ -55,7 +69,9 @@ formally verify:
 * the Soroban host, token transfers, or the wasm runtime;
 * cross-contract authorization or state-machine reachability (covered by
   `contracts/integration-tests/tests/auth_matrix.rs`);
-* oracle freshness/dispute logic in `resolver`;
+* oracle freshness/dispute logic in `resolver` (the lifecycle-level model is
+  the TLA+ track described in [`docs/formal/README.md`](formal/README.md); it
+  does not verify the arithmetic of individual freshness checks);
 * treasury caps and NAV accounting (covered by unit tests and the stateful
   model in `model/system_model.py`);
 * storage TTL/rent behaviour.

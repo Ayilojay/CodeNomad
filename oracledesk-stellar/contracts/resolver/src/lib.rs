@@ -87,6 +87,94 @@ pub const ORACLE_GRACE_SECS: u64 = 86_400;
 pub const SIGNER_GRACE_SECS: u64 = 7 * 86_400;
 /// Maximum number of proposal cancellations per market allowed by the guardian.
 pub const MAX_CANCELS_PER_MARKET: u32 = 2;
+
+/// Configurable oracle source policy for price-mode markets (issue #12).
+///
+/// A committed price specification binds resolution parameters, but operators
+/// may need to reject unsupported or creator-controlled oracle configurations.
+/// This policy is evaluated against the *revealed* spec at
+/// `register_price_spec` / `resolve_price` time (and the hybrid price path), so
+/// permissionless commit-reveal is preserved: the policy constrains the oracle
+/// configuration, never the committer.
+///
+/// An empty `allow` list means "any oracle not explicitly denied". A non-empty
+/// `allow` list restricts resolution to exactly those oracle addresses. The
+/// `deny` list always wins over `allow`. `min_staleness`/`max_staleness` bound
+/// the spec's `max_staleness` (inclusive); `0` on either bound disables that
+/// side of the check. `require_asset_pair` restricts resolution to the listed
+/// asset pairs when non-empty.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OraclePolicy {
+    pub allow: Vec<Address>,
+    pub deny: Vec<Address>,
+    pub min_staleness: u64,
+    pub max_staleness: u64,
+    pub require_asset_pair: Vec<OracleAsset>,
+}
+
+impl OraclePolicy {
+    /// The permissive default: no allow/deny entries, no staleness bounds and
+    /// no asset-pair restriction. Stored on first `set_oracle_policy` so an
+    /// unset policy behaves identically to the pre-policy contract.
+    fn permissive() -> Self {
+        Self {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            min_staleness: 0,
+            max_staleness: 0,
+            require_asset_pair: Vec::new(),
+        }
+    }
+
+    /// Evaluates the policy against a revealed price configuration. Returns
+    /// `Ok(())` when the oracle configuration is acceptable, or the dedicated
+    /// [`Error::OraclePolicyViolation`] otherwise. Explicit and auditable: each
+    /// rejection path is a distinct branch, and the policy is a plain stored
+    /// value an operator can read back.
+    fn check(&self, reflector: &Address, asset: &OracleAsset, max_staleness: u64) -> Result<(), Error> {
+        // Deny list always wins, even if the address is also allowed.
+        for denied in self.deny.iter() {
+            if &denied == reflector {
+                return Err(Error::OraclePolicyViolation);
+            }
+        }
+        // A non-empty allow list restricts resolution to exactly those oracles.
+        if !self.allow.is_empty() {
+            let mut allowed = false;
+            for entry in self.allow.iter() {
+                if &entry == reflector {
+                    allowed = true;
+                    break;
+                }
+            }
+            if !allowed {
+                return Err(Error::OraclePolicyViolation);
+            }
+        }
+        // Staleness bounds (inclusive); 0 disables that side.
+        if self.min_staleness != 0 && max_staleness < self.min_staleness {
+            return Err(Error::OraclePolicyViolation);
+        }
+        if self.max_staleness != 0 && max_staleness > self.max_staleness {
+            return Err(Error::OraclePolicyViolation);
+        }
+        // Asset-pair restriction when configured.
+        if !self.require_asset_pair.is_empty() {
+            let mut matched = false;
+            for pair in self.require_asset_pair.iter() {
+                if &pair == asset {
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                return Err(Error::OraclePolicyViolation);
+            }
+        }
+        Ok(())
+    }
+}
 /// Maximum number of feed records a grid lookback may inspect per resolution
 /// attempt (issue #26). Bounds the cross-contract calls: a record older than
 /// `MAX_LOOKBACK_RECORDS * resolution()` is reported `StalePrice` even when
@@ -128,6 +216,14 @@ pub enum ExpiryMode {
 /// `decimals()` may report. `i128` holds `10^38` but not `10^39`, so any
 /// larger scale factor overflows on rescale (issue #26).
 pub const MAX_THRESHOLD_DECIMALS: u32 = 38;
+
+/// Storage key for the configurable [`OraclePolicy`] (issue #12). Lives in
+/// instance storage alongside the other admin-controlled configuration.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PolicyKey {
+    Oracle,
+}
 
 /// Decimal-explicit price rule (issue #26, goal 2). Unlike the legacy
 /// [`PriceConfig`] — re-exported here from `oracledesk-types`, whose
@@ -6801,6 +6897,137 @@ mod golden {
             .map(|b| format!("{b:02x}"))
             .collect();
         assert_eq!(signature_hex, "3f7bfc9882bbe894518d059b50326069523358f3da1d74b7ed90b8b395862367155ae6ac7934b3ae610e21c3dd595b7d99c2ab122037918917c96543c0cde002");
+    }
+
+    #[test]
+    fn oracle_policy_allow_and_deny() {
+        let env = Env::default();
+        let allowed = Address::generate(&env);
+        let denied = Address::generate(&env);
+        let other = Address::generate(&env);
+        let asset = OracleAsset::Other(Symbol::new(&env, "XLM"));
+
+        // Empty policy is permissive.
+        let permissive = OraclePolicy::permissive();
+        assert_eq!(permissive.check(&other, &asset, 10), Ok(()));
+
+        // Deny list rejects even when also allowed.
+        let policy = OraclePolicy {
+            allow: Vec::from_array(&env, [allowed.clone(), denied.clone()]),
+            deny: Vec::from_array(&env, [denied.clone()]),
+            min_staleness: 0,
+            max_staleness: 0,
+            require_asset_pair: Vec::new(),
+        };
+        assert_eq!(policy.check(&allowed, &asset, 10), Ok(()));
+        assert_eq!(
+            policy.check(&denied, &asset, 10),
+            Err(Error::OraclePolicyViolation)
+        );
+        // Non-empty allow list rejects an unlisted oracle.
+        assert_eq!(
+            policy.check(&other, &asset, 10),
+            Err(Error::OraclePolicyViolation)
+        );
+    }
+
+    #[test]
+    fn oracle_policy_staleness_bounds() {
+        let env = Env::default();
+        let oracle = Address::generate(&env);
+        let asset = OracleAsset::Other(Symbol::new(&env, "XLM"));
+        let policy = OraclePolicy {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            min_staleness: 5,
+            max_staleness: 100,
+            require_asset_pair: Vec::new(),
+        };
+        assert_eq!(
+            policy.check(&oracle, &asset, 4),
+            Err(Error::OraclePolicyViolation)
+        );
+        assert_eq!(policy.check(&oracle, &asset, 5), Ok(()));
+        assert_eq!(policy.check(&oracle, &asset, 100), Ok(()));
+        assert_eq!(
+            policy.check(&oracle, &asset, 101),
+            Err(Error::OraclePolicyViolation)
+        );
+    }
+
+    #[test]
+    fn oracle_policy_asset_pair_mismatch() {
+        let env = Env::default();
+        let oracle = Address::generate(&env);
+        let xlm = OracleAsset::Other(Symbol::new(&env, "XLM"));
+        let btc = OracleAsset::Other(Symbol::new(&env, "BTC"));
+        let policy = OraclePolicy {
+            allow: Vec::new(),
+            deny: Vec::new(),
+            min_staleness: 0,
+            max_staleness: 0,
+            require_asset_pair: Vec::from_array(&env, [xlm.clone()]),
+        };
+        assert_eq!(policy.check(&oracle, &xlm, 10), Ok(()));
+        assert_eq!(
+            policy.check(&oracle, &btc, 10),
+            Err(Error::OraclePolicyViolation)
+        );
+    }
+
+    #[test]
+    fn oracle_policy_rejects_creator_controlled_oracle_on_reveal() {
+        // A creator-controlled oracle is one the operator denies. The policy
+        // is checked against the revealed spec, not the committer, so a
+        // permissionless reveal of a denied oracle is rejected while an
+        // allowed oracle reveals fine.
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        let policy = OraclePolicy {
+            allow: Vec::new(),
+            deny: Vec::from_array(&f.env, [spec.reflector.clone()]),
+            min_staleness: 0,
+            max_staleness: 0,
+            require_asset_pair: Vec::new(),
+        };
+        f.env.as_contract(&f.resolver_id, || {
+            f.env
+                .storage()
+                .instance()
+                .set(&PolicyKey::Oracle, &policy);
+        });
+        assert_eq!(
+            f.resolver.try_register_price_spec(&f.market_id, &spec),
+            Err(Ok(Error::OraclePolicyViolation))
+        );
+    }
+
+    #[test]
+    fn oracle_policy_permissionless_reveal_of_allowed_oracle_succeeds() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let ResolutionSpec::Price(spec) = f.spec.clone() else {
+            unreachable!()
+        };
+        let policy = OraclePolicy {
+            allow: Vec::from_array(&f.env, [spec.reflector.clone()]),
+            deny: Vec::new(),
+            min_staleness: 0,
+            max_staleness: 0,
+            require_asset_pair: Vec::new(),
+        };
+        f.env.as_contract(&f.resolver_id, || {
+            f.env
+                .storage()
+                .instance()
+                .set(&PolicyKey::Oracle, &policy);
+        });
+        // No auth: reveal is permissionless and the policy only constrains the
+        // revealed oracle configuration.
+        f.env.set_auths(&[]);
+        f.resolver.register_price_spec(&f.market_id, &spec);
+        assert_eq!(f.resolver.state(&f.market_id), ResolutionState::Finalized);
     }
 
     #[contracttype]

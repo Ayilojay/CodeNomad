@@ -39,6 +39,15 @@
       "write_bytes": 1392,
       "events_bytes": 620
     },
+    "market_core.buy.max_size": {
+      "cpu_insns": 1248920,
+      "mem_bytes": 1302140,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
     "market_core.claim_pool_remainder": {
       "cpu_insns": 1009545,
       "mem_bytes": 1289402,
@@ -66,6 +75,15 @@
       "write_bytes": 2944,
       "events_bytes": 540
     },
+    "market_core.create_market.max_size": {
+      "cpu_insns": 1121068,
+      "mem_bytes": 1299480,
+      "read_entries": 10,
+      "write_entries": 6,
+      "read_bytes": 92,
+      "write_bytes": 3968,
+      "events_bytes": 540
+    },
     "market_core.redeem.void": {
       "cpu_insns": 924252,
       "mem_bytes": 1279012,
@@ -87,6 +105,15 @@
     "market_core.sell.partial": {
       "cpu_insns": 1234911,
       "mem_bytes": 1294888,
+      "read_entries": 11,
+      "write_entries": 5,
+      "read_bytes": 0,
+      "write_bytes": 1392,
+      "events_bytes": 620
+    },
+    "market_core.sell.max_size": {
+      "cpu_insns": 1247135,
+      "mem_bytes": 1301555,
       "read_entries": 11,
       "write_entries": 5,
       "read_bytes": 0,
@@ -121,6 +148,33 @@
       "events_bytes": 0
     },
     "market_core.view.quote_sell": {
+      "cpu_insns": 590012,
+      "mem_bytes": 1242449,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "market_core.view.get_market.max_size": {
+      "cpu_insns": 601558,
+      "mem_bytes": 1243877,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "market_core.view.quote_buy.max_size": {
+      "cpu_insns": 587952,
+      "mem_bytes": 1242177,
+      "read_entries": 3,
+      "write_entries": 0,
+      "read_bytes": 0,
+      "write_bytes": 0,
+      "events_bytes": 0
+    },
+    "market_core.view.quote_sell.max_size": {
       "cpu_insns": 590012,
       "mem_bytes": 1242449,
       "read_entries": 3,

@@ -1,9 +1,15 @@
-# Formal model: resolution lifecycle
+# Formal model: resolution lifecycle, rotation and hybrid fallback
 
 [`resolver.tla`](resolver.tla) is a TLA+ model of how one market goes from
 `Open` to a final state, checked with TLC. It is documentation as much as a
 proof artifact: each action mirrors one entrypoint of
 `contracts/resolver/src/lib.rs` or `contracts/market-core/src/lib.rs`.
+
+The model covers signer-mode resolution, price mode, committee rotation
+(`propose_committee` / `accept_committee`), pending resolution proposals
+interacting with a rotation, weighted signer keys and the hybrid mode's
+fallback opening. Each of these is a separate, switchable part of the state
+machine so a config can enable only what it checks.
 
 ```bash
 make formal            # runs every config, checks each outcome is the expected one
@@ -34,6 +40,11 @@ admin bypass, and time.
 | `ResolvePrice(o)`, `OracleFlip` | `resolve_price`; the oracle's outcome and availability are environment non-determinism |
 | `Expire` | `expire_market` (deadline; settles from a usable price; refuses while a quorum-backed proposal exists; otherwise voids) |
 | `AdminBypass` | market-core admin installs another resolver (`propose_resolver`/`accept_resolver`) which resolves; this resolver never sees it |
+| `ProposeCommittee(c, w)` | `propose_committee` (admin only, `CommitteeProposal` stored with `accept_after`) |
+| `AcceptCommittee` | `accept_committee` (after `accept_after`, replaces `signers`/`weights`, clears pending proposal) |
+| `ProposeResolution(o)` | `propose_resolution` (signer-mode proposal recorded without an attestation quorum; opens the dispute window) |
+| `FallbackOpen` | hybrid mode: `open_fallback` when the oracle is unavailable past `fallback_after` |
+| `WeightedAttest(s, o)` | `attest` with per-signer weights: quorum is `sum(weight) >= threshold`, not a signer count |
 | `Tick` | ledger time passing |
 
 **Atomic reverts.** Soroban rolls back an invocation on any error, so an error
@@ -49,16 +60,44 @@ proposal stores `age` (ticks since it was proposed) saturating at `W` instead
 of `proposed_at`, since `now < proposed_at + W ⇔ age < W`. This also keeps
 liveness checking finite.
 
+**Rotation.** `ProposeCommittee` stores a candidate committee and an
+`accept_after` time; `AcceptCommittee` is enabled only once `now >=
+accept_after` and the proposal is still pending. Accepting replaces the signer
+set and weights and **clears any pending resolution proposal** (the contract
+does this so a proposal backed by the old committee cannot be finalized by the
+new one). The model keeps the old committee's attestations in `votes` but they
+no longer count toward quorum because quorum is computed over the *current*
+signer set; `NoStaleCommitteeFinalize` checks this.
+
+**Pending proposals.** `ProposeResolution` records a proposal without a quorum
+(the admin/guardian path). It opens the dispute window exactly like a
+quorum-triggered proposal, so `Finalize` and `Cancel` treat both identically.
+`NoProposalSurvivesRotation` checks that accepting a committee removes it.
+
+**Weighted keys.** `WeightedAttest` uses `weights[s]` and the quorum predicate
+`sum(weights of attesters for o) >= threshold`. With all weights `1` this
+reduces to the count model, so the unweighted configs are a special case.
+`WeightedQuorumSound` checks that a finalized outcome had weighted quorum.
+
+**Hybrid fallback.** `FallbackOpen` is enabled only in hybrid mode, only while
+the oracle is unavailable, and only after `fallback_after`; it switches the
+market to signer mode. `NoFallbackBeforeDeadline` and
+`NoFallbackWhenOracleAvailable` check the guards. Once open, resolution
+proceeds through the signer actions unchanged.
+
 **Not modelled** (deliberately; each is orthogonal to the lifecycle): FPMM
 pricing, treasury and tokens, `SignersDisputable` bonds (`Disputed` state),
-weighted keys, committee rotation and the hybrid mode's fallback opening, and
-`u64` overflow (naturals are used; see Notes). Hybrid, weighted and committee
-resolution all end in the same `resolve`/`void_market` calls modelled here.
+and `u64` overflow (naturals are used; see Notes). Hybrid, weighted and
+committee resolution all end in the same `resolve`/`void_market` calls
+modelled here.
 
 **Bounds.** `Signers` is 2–4 model values, `T = 2`, `C = 1`, `W = 1`,
-`RG = OG = 2`, `SG = 3`, `D = 6`, `MaxCancels = 2` (the contract's value).
-Small constants are enough because behaviour only depends on the *order* of
-the thresholds; symmetry over signers is used for the safety configs.
+`RG = OG = 2`, `SG = 3`, `D = 6`, `MaxCancels = 2` (the contract's value),
+`AcceptAfter = 2`, `FallbackAfter = 3`. Small constants are enough because
+behaviour only depends on the *order* of the thresholds; symmetry over signers
+is used for the safety configs. Rotation configs use two committees of two
+signers each (`Signers = {s1, s2, s3, s4}`, `CommitteeA = {s1, s2}`,
+`CommitteeB = {s3, s4}`) so a rotation is observable in a short trace.
 
 ## Properties
 
@@ -77,10 +116,20 @@ the thresholds; symmetry over signers is used for the safety configs.
 | `Liveness` | `<>(status ∈ {Yes, No})` under fairness | temporal |
 | `NoStrandedQuorum` | witness: quorum exists but no proposal | invariant (expected to fail) |
 | `NoInvalidDisplacement` | witness: Invalid never displaces Yes/No | action property (expected to fail) |
+| `NoStaleCommitteeFinalize` | a proposal is finalized only by the committee that proposed it | invariant |
+| `NoProposalSurvivesRotation` | accepting a committee clears the pending proposal | action property |
+| `WeightedQuorumSound` | a Yes/No result had weighted quorum over the current committee | invariant |
+| `NoFallbackBeforeDeadline` | hybrid fallback opens only after `fallback_after` | invariant |
+| `NoFallbackWhenOracleAvailable` | hybrid fallback opens only while the oracle is unavailable | invariant |
+| `RotationLiveness` | `<>(status ∈ {Yes, No})` with a rotation in flight under fairness | temporal |
 
 Liveness assumptions (`LiveSpec`): time passes, the market gets configured,
 honest signers (who only ever vote Yes) attest when they can, a ready proposal
-is finalized, and the guardian, expiry and bypass are off.
+is finalized, and the guardian, expiry and bypass are off. `RotationLiveSpec`
+adds: a pending committee proposal is eventually accepted, and the accepting
+committee's honest members attest after acceptance. Without the acceptance
+assumption `RotationLiveness` fails (a rotation can stall the market forever),
+which is the documented liveness assumption for rotation.
 
 ## Results
 
@@ -93,14 +142,20 @@ is finalized, and the guardian, expiry and bypass are off.
 | `resolver_invalid.cfg` (N=T=2) | `NoInvalidDisplacement` fails | **violated** (exit 13) | 255 | < 1 s |
 | `resolver_bypass.cfg` (N=3) | `ResolvedOutcomeHadThreshold` fails | **violated** (exit 12) | 91 | ~1 s |
 | `resolver_live_invalid.cfg` (N=4, honest = 2) | `Liveness` fails | **violated** (exit 13) | 4,966 | ~1 s |
+| `resolver_rotation.cfg` (two committees, rotation in flight) | `NoStaleCommitteeFinalize`, `NoProposalSurvivesRotation` hold | **No error** | 12,884 | ~2 s |
+| `resolver_rotation_live.cfg` (rotation + `RotationLiveSpec`) | `RotationLiveness` holds | **No error** | 1,102 | < 1 s |
+| `resolver_weighted.cfg` (weights 1/2, T=3) | `WeightedQuorumSound` holds | **No error** | 8,431 | ~1 s |
+| `resolver_hybrid.cfg` (hybrid, oracle unavailable) | `NoFallbackBeforeDeadline`, `NoFallbackWhenOracleAvailable` hold | **No error** | 6,207 | ~1 s |
+| `resolver_rotation_stale.cfg` (rotation accepted mid-proposal) | `NoStaleCommitteeFinalize` fails | **violated** (exit 12) | 318 | < 1 s |
 
 State counts for the violated configs vary slightly from run to run (TLC stops
 at the first violation while several workers are exploring); the verdicts do not.
 
 The checks have teeth: dropping the window guard from `Finalize`, letting
-`Cancel` keep the proposal, dropping the `Open` guard from market-core, or
-allowing attestation before close each make one of the properties fail
-(mutation-tested while writing the model).
+`Cancel` keep the proposal, dropping the `Open` guard from market-core,
+allowing attestation before close, letting `AcceptCommittee` keep the pending
+proposal, or counting votes from the pre-rotation committee each make one of
+the properties fail (mutation-tested while writing the model).
 
 ## Findings
 
@@ -181,6 +236,43 @@ is trusted. Replayed by `model_trace_admin_bypass_resolves_without_threshold`.
   worth checking against the testnet deploy flow in
   `scripts/deploy-testnet.sh`.
 
+### 5. Rotation clears pending proposals (confirmed, safety holds)
+
+`resolver_rotation.cfg`: `RegisterSigners, Tick, ProposeResolution(Yes),
+ProposeCommittee(B), Tick, Tick, AcceptCommittee`. `NoProposalSurvivesRotation`
+holds: `accept_committee` clears the pending proposal, so the old committee's
+proposal cannot be finalized by the new one. `resolver_rotation_stale.cfg`
+disables that clearing step and `NoStaleCommitteeFinalize` fails, confirming
+the guard is load-bearing. Replayed by
+`model_trace_rotation_clears_pending_proposal`.
+
+### 6. Rotation liveness needs an acceptance assumption (confirmed)
+
+`resolver_rotation_live.cfg` holds `RotationLiveness` only under
+`RotationLiveSpec`; without the "pending committee is eventually accepted"
+fairness assumption the market can stall with a proposal pending and no
+committee able to finalize. This is a liveness *assumption*, not a safety bug:
+the admin is trusted to complete a rotation it started. Documented here so
+operators know a half-finished rotation blocks resolution until accepted or
+cancelled.
+
+### 7. Weighted quorum is sound but weights are trusted (confirmed)
+
+`resolver_weighted.cfg` (weights `s1=1, s2=2, s3=1`, `T=3`) holds
+`WeightedQuorumSound`: a finalized Yes/No had weighted quorum over the current
+committee. The model does not check that weights are set sensibly; a single
+signer with weight `>= T` can resolve alone. That is the admin's
+responsibility (`propose_committee` validates weights are non-zero but not
+their distribution). Replayed by `model_trace_weighted_quorum_requires_weights`.
+
+### 8. Hybrid fallback guards hold (confirmed)
+
+`resolver_hybrid.cfg` holds `NoFallbackBeforeDeadline` and
+`NoFallbackWhenOracleAvailable`: `open_fallback` is only enabled after
+`fallback_after` and only while the oracle is unavailable. Once open, the
+market resolves through the signer path with no further oracle dependence.
+Replayed by `model_trace_hybrid_fallback_opens_after_deadline_only`.
+
 No contract behaviour was changed by this work.
 
 ## Conformance tests
@@ -199,6 +291,9 @@ contracts (two happy paths, plus one test per finding above):
 | `model_trace_guardian_void_blocks_later_attest_and_finalize` | `resolver.cfg` |
 | `model_trace_expire_blocked_by_valid_proposal` | `Expire` guard |
 | `model_trace_admin_bypass_resolves_without_threshold` | `resolver_bypass.cfg` |
+| `model_trace_rotation_clears_pending_proposal` | `resolver_rotation.cfg` |
+| `model_trace_weighted_quorum_requires_weights` | `resolver_weighted.cfg` |
+| `model_trace_hybrid_fallback_opens_after_deadline_only` | `resolver_hybrid.cfg` |
 
 ## Reproducing a counterexample
 
