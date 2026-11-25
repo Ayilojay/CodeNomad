@@ -273,6 +273,230 @@ fn mc_quote_sell() -> Metrics {
 }
 
 // ---------------------------------------------------------------------------
+// market-core worst-case scenarios
+//
+// One scenario per public entrypoint at representative and maximum bounded
+// inputs. Maximums are derived from the contract's own constants so the
+// benchmarks track the deployed limits:
+//   * URI length: `MAX_URI_LEN` (1 KiB)
+//   * fee bps: `MAX_FEE_BPS`
+//   * batch length: `MAX_SETS` for `redeem_many` / `claim_pool_remainders`
+//   * trade size: the largest collateral amount the trader can fund
+// ---------------------------------------------------------------------------
+
+/// Maximum URI length accepted by `create_market`.
+const MAX_URI_LEN: usize = 1_024;
+/// Maximum batch length for `redeem_many` / `claim_pool_remainders`.
+const MAX_SETS: usize = 20;
+/// Maximum fee bps accepted by `create_market`.
+const MAX_FEE_BPS: u32 = 1_000;
+
+fn mc_create_market_max_fee() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    let uri = String::from_str(&env, "ipfs://budget");
+    measure(&env, || {
+        fx.client.create_market(
+            &fx.creator,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &uri,
+            &market_core_wasm::Category::Crypto,
+            &(BASE_TS + 60_000),
+            &MIN_SEED,
+            &MAX_FEE_BPS,
+        )
+    })
+}
+
+fn mc_create_market_max_uri_max_fee() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    let uri = String::from_str(&env, &"u".repeat(MAX_URI_LEN));
+    measure(&env, || {
+        fx.client.create_market(
+            &fx.creator,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &BytesN::from_array(&env, &[2u8; 32]),
+            &uri,
+            &market_core_wasm::Category::Crypto,
+            &(BASE_TS + 60_000),
+            &MIN_SEED,
+            &MAX_FEE_BPS,
+        )
+    })
+}
+
+/// Largest single buy the trader can fund (10_000 USDC minted).
+fn mc_buy_max_amount() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    let env = fx.env.clone();
+    measure(&env, || buy(&fx, market_id, 10_000 * UNIT))
+}
+
+/// Largest single sell against a fully-funded position.
+fn mc_sell_max_amount() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    buy(&fx, market_id, 10_000 * UNIT);
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.client.sell(
+            &fx.trader,
+            &market_id,
+            &market_core_wasm::Outcome::Yes,
+            &(10_000 * UNIT),
+            &i128::MAX,
+        )
+    })
+}
+
+fn mc_resolve() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    buy(&fx, market_id, 10 * UNIT);
+    fx.env.ledger().set_timestamp(BASE_TS + 70_000);
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.client
+            .resolve(&market_id, &market_core_wasm::Outcome::Yes)
+    })
+}
+
+fn mc_void_market() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    fx.env.ledger().set_timestamp(BASE_TS + 70_000);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.void_market(&market_id))
+}
+
+/// `redeem_many` at the maximum batch length (`MAX_SETS` markets).
+fn mc_redeem_many_max_batch() -> Metrics {
+    let fx = mc_fixture();
+    let mut ids = Vec::new();
+    for _ in 0..MAX_SETS {
+        let id = create_market(&fx);
+        buy(&fx, id, UNIT);
+        ids.push(id);
+    }
+    for id in &ids {
+        fx.env.ledger().set_timestamp(BASE_TS + 70_000);
+        fx.client.void_market(id);
+    }
+    let env = fx.env.clone();
+    let batch = soroban_sdk::Vec::from_slice(&env, &ids);
+    measure(&env, || fx.client.redeem_many(&fx.trader, &batch))
+}
+
+/// `claim_pool_remainders` at the maximum batch length (`MAX_SETS` markets).
+fn mc_claim_pool_remainders_max_batch() -> Metrics {
+    let fx = mc_fixture();
+    let mut ids = Vec::new();
+    for _ in 0..MAX_SETS {
+        let id = create_market(&fx);
+        buy(&fx, id, UNIT);
+        ids.push(id);
+    }
+    for id in &ids {
+        fx.env.ledger().set_timestamp(BASE_TS + 70_000);
+        fx.client.void_market(id);
+    }
+    let env = fx.env.clone();
+    let batch = soroban_sdk::Vec::from_slice(&env, &ids);
+    measure(&env, || fx.client.claim_pool_remainders(&batch))
+}
+
+fn mc_propose_resolver() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    let new_resolver = Address::generate(&fx.env);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.propose_resolver(&market_id, &new_resolver))
+}
+
+fn mc_accept_resolver() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    let new_resolver = Address::generate(&fx.env);
+    fx.client.propose_resolver(&market_id, &new_resolver);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.accept_resolver(&market_id))
+}
+
+fn mc_set_paused() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_paused(&true))
+}
+
+fn mc_set_fee_bps() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_fee_bps(&MAX_FEE_BPS))
+}
+
+fn mc_set_treasury() -> Metrics {
+    let fx = mc_fixture();
+    let new_treasury = Address::generate(&fx.env);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_treasury(&new_treasury))
+}
+
+fn mc_set_resolver() -> Metrics {
+    let fx = mc_fixture();
+    let new_resolver = Address::generate(&fx.env);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_resolver(&new_resolver))
+}
+
+fn mc_set_breaker_threshold() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_breaker_threshold(&1_000u32))
+}
+
+fn mc_set_breaker_window() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    measure(&env, || fx.client.set_breaker_window(&86_400u64))
+}
+
+fn mc_get_config() -> Metrics {
+    let fx = mc_fixture();
+    let env = fx.env.clone();
+    measure(&env, || fx.client.get_config())
+}
+
+fn mc_get_position() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    buy(&fx, market_id, 10 * UNIT);
+    let env = fx.env.clone();
+    measure(&env, || {
+        fx.client
+            .get_position(&market_id, &fx.trader, &market_core_wasm::Outcome::Yes)
+    })
+}
+
+fn mc_get_twap_observation() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    buy(&fx, market_id, 10 * UNIT);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.get_twap_observation(&market_id))
+}
+
+fn mc_get_twap_observations() -> Metrics {
+    let fx = mc_fixture();
+    let market_id = create_market(&fx);
+    buy(&fx, market_id, 10 * UNIT);
+    let env = fx.env.clone();
+    measure(&env, || fx.client.get_twap_observations(&market_id))
+}
+
+// ---------------------------------------------------------------------------
 // reasoning-registry scenarios
 // ---------------------------------------------------------------------------
 
@@ -581,6 +805,47 @@ fn scenarios() -> Vec<Scenario> {
         ("market_core.view.get_market", mc_get_market),
         ("market_core.view.quote_buy", mc_quote_buy),
         ("market_core.view.quote_sell", mc_quote_sell),
+        (
+            "market_core.create_market.max_fee",
+            mc_create_market_max_fee,
+        ),
+        (
+            "market_core.create_market.max_uri_max_fee",
+            mc_create_market_max_uri_max_fee,
+        ),
+        ("market_core.buy.max_amount", mc_buy_max_amount),
+        ("market_core.sell.max_amount", mc_sell_max_amount),
+        ("market_core.resolve", mc_resolve),
+        ("market_core.void_market", mc_void_market),
+        (
+            "market_core.redeem_many.max_batch",
+            mc_redeem_many_max_batch,
+        ),
+        (
+            "market_core.claim_pool_remainders.max_batch",
+            mc_claim_pool_remainders_max_batch,
+        ),
+        ("market_core.propose_resolver", mc_propose_resolver),
+        ("market_core.accept_resolver", mc_accept_resolver),
+        ("market_core.admin.set_paused", mc_set_paused),
+        ("market_core.admin.set_fee_bps", mc_set_fee_bps),
+        ("market_core.admin.set_treasury", mc_set_treasury),
+        ("market_core.admin.set_resolver", mc_set_resolver),
+        (
+            "market_core.breaker.set_threshold",
+            mc_set_breaker_threshold,
+        ),
+        ("market_core.breaker.set_window", mc_set_breaker_window),
+        ("market_core.view.get_config", mc_get_config),
+        ("market_core.view.get_position", mc_get_position),
+        (
+            "market_core.view.get_twap_observation",
+            mc_get_twap_observation,
+        ),
+        (
+            "market_core.view.get_twap_observations",
+            mc_get_twap_observations,
+        ),
         ("registry.publish_trace.small", reg_publish_small),
         ("registry.publish_trace.cid_1k", reg_publish_cid_1k),
         ("registry.publish_trace.action_1k", reg_publish_action_1k),
@@ -650,6 +915,22 @@ struct Diff {
     direction: &'static str,
 }
 
+/// Regression check for the recorded resource baseline.
+///
+/// The baseline lives in `docs/budgets/baseline.json` (see `baseline_path`).
+/// Each scenario's CPU/memory/entry/byte metrics are compared against the
+/// recorded value using the per-metric `Tolerance` stored in the same file.
+/// CPU and memory are skipped when the running rustc differs from the one
+/// that produced the baseline, since those metrics are toolchain-sensitive.
+///
+/// To refresh the baseline after an intentional change:
+///
+/// ```text
+/// make budget-update        # equivalent to BUDGET_UPDATE=1 cargo test -p budget-tests
+/// ```
+///
+/// Review the printed diff, commit the updated `docs/budgets/baseline.json`
+/// alongside the change, and include the diff in the PR description.
 #[test]
 fn budget_baseline() {
     let update = std::env::var("BUDGET_UPDATE").as_deref() == Ok("1");

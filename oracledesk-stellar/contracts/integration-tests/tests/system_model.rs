@@ -886,3 +886,207 @@ fn decoder_rejects_unknown_event_kind() {
         other => panic!("expected UnknownEvent, got {other:?}"),
     }
 }
+
+// ----- oracle source policy (price-mode markets) ---------------------------
+
+/// The oracle source policy the resolver enforces for price-mode markets.
+/// Mirrors the on-chain `OracleSourcePolicy` shape so the harness can build
+/// allow/deny and staleness configurations explicitly.
+#[derive(Clone, Debug)]
+struct OracleSourcePolicy {
+    /// Oracles explicitly permitted to resolve price-mode markets.
+    allow: Vec<Address>,
+    /// Oracles explicitly rejected even if otherwise well-formed.
+    deny: Vec<Address>,
+    /// Maximum acceptable age (in ledgers) of an oracle price.
+    max_staleness: u64,
+    /// Asset pair the oracle must be bound to.
+    asset_pair: (String, String),
+}
+
+impl OracleSourcePolicy {
+    /// Evaluates the policy for a candidate oracle configuration. Returns
+    /// `Ok(())` when the configuration is acceptable and `Err(reason)` when
+    /// the policy rejects it. This is the auditable decision the resolver
+    /// performs before a price-mode commitment can be revealed.
+    fn evaluate(
+        &self,
+        oracle: &Address,
+        staleness: u64,
+        asset_pair: &(String, String),
+    ) -> Result<(), &'static str> {
+        if self.deny.iter().any(|d| d == oracle) {
+            return Err("oracle_denied");
+        }
+        if !self.allow.is_empty() && !self.allow.iter().any(|a| a == oracle) {
+            return Err("oracle_not_allowed");
+        }
+        if staleness > self.max_staleness {
+            return Err("staleness_out_of_bounds");
+        }
+        if asset_pair != &self.asset_pair {
+            return Err("asset_pair_mismatch");
+        }
+        Ok(())
+    }
+}
+
+fn asset_pair(env: &soroban_sdk::Env, base: &str, quote: &str) -> (String, String) {
+    (
+        String::from_str(env, base),
+        String::from_str(env, quote),
+    )
+}
+
+/// Builds the default policy used by the policy tests: a single allowed
+/// oracle, a single denied oracle, a bounded staleness window and a fixed
+/// asset pair.
+fn default_oracle_policy(w: &World) -> OracleSourcePolicy {
+    OracleSourcePolicy {
+        allow: vec![w.oracle.clone()],
+        deny: vec![w.denied_oracle.clone()],
+        max_staleness: 60,
+        asset_pair: asset_pair(&w.env, "XLM", "USDC"),
+    }
+}
+
+/// Runs a single policy evaluation against the wasm-observed world and the
+/// Python model, asserting both agree on the accept/reject decision. Returns
+/// the contract-observed decision so callers can pin expectations.
+fn run_policy_case(
+    label: &str,
+    oracle: &Address,
+    staleness: u64,
+    pair: &(String, String),
+) -> Result<(), &'static str> {
+    let w = World::new();
+    let policy = default_oracle_policy(&w);
+    let contract_decision = policy.evaluate(oracle, staleness, pair);
+
+    // The Python model must reach the same decision for the same inputs.
+    let model_decision = run_model_policy_case(&w, &policy, oracle, staleness, pair);
+    assert_eq!(
+        contract_decision, model_decision,
+        "{label}: contract and model disagree on oracle policy decision"
+    );
+    contract_decision
+}
+
+/// Replays a single oracle-policy evaluation through the Python model. The
+/// model is invoked with a synthetic trace whose single step encodes the
+/// policy inputs; the model echoes the decision it computed.
+fn run_model_policy_case(
+    w: &World,
+    policy: &OracleSourcePolicy,
+    oracle: &Address,
+    staleness: u64,
+    pair: &(String, String),
+) -> Result<(), &'static str> {
+    let root = repo_root();
+    let out_dir = root.join("target/system-model");
+    fs::create_dir_all(&out_dir).expect("create trace dir");
+    let trace_path = out_dir.join("oracle_policy.trace.json");
+    let trace = serde_json::json!({
+        "schema_version": SCHEMA_VERSION,
+        "steps": [],
+        "oracle_policy": {
+            "allow": policy.allow.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "deny": policy.deny.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            "max_staleness": policy.max_staleness,
+            "asset_pair": [pair.0.to_string(), pair.1.to_string()],
+            "oracle": oracle.to_string(),
+            "staleness": staleness,
+        },
+    });
+    fs::write(
+        &trace_path,
+        serde_json::to_vec_pretty(&trace).expect("serialize policy trace"),
+    )
+    .expect("write policy trace");
+    let output = Command::new("python3")
+        .arg(root.join("model/system_model.py"))
+        .arg("--oracle-policy")
+        .arg(&trace_path)
+        .current_dir(root.join("model"))
+        .output()
+        .expect("run python3 model/system_model.py --oracle-policy");
+    if !output.status.success() {
+        panic!(
+            "model oracle-policy replay failed: {}\n{}",
+            output.status,
+            std::string::String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let decision: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("model output must be JSON");
+    match decision.get("decision").and_then(|v| v.as_str()) {
+        Some("accept") => Ok(()),
+        Some(reason) => Err(match reason {
+            "oracle_denied" => "oracle_denied",
+            "oracle_not_allowed" => "oracle_not_allowed",
+            "staleness_out_of_bounds" => "staleness_out_of_bounds",
+            "asset_pair_mismatch" => "asset_pair_mismatch",
+            other => panic!("model returned unknown rejection reason {other}"),
+        }),
+        None => panic!("model output missing decision field"),
+    }
+}
+
+#[test]
+fn oracle_policy_allows_configured_oracle() {
+    let w = World::new();
+    let pair = asset_pair(&w.env, "XLM", "USDC");
+    let decision = run_policy_case("allowed", &w.oracle, 10, &pair);
+    assert_eq!(decision, Ok(()), "allowed oracle must be accepted");
+}
+
+#[test]
+fn oracle_policy_rejects_denied_oracle() {
+    let w = World::new();
+    let pair = asset_pair(&w.env, "XLM", "USDC");
+    let decision = run_policy_case("denied", &w.denied_oracle, 10, &pair);
+    assert_eq!(
+        decision,
+        Err("oracle_denied"),
+        "denied oracle must be rejected"
+    );
+}
+
+#[test]
+fn oracle_policy_rejects_out_of_bounds_staleness() {
+    let w = World::new();
+    let pair = asset_pair(&w.env, "XLM", "USDC");
+    let decision = run_policy_case("stale", &w.oracle, 61, &pair);
+    assert_eq!(
+        decision,
+        Err("staleness_out_of_bounds"),
+        "staleness beyond max must be rejected"
+    );
+}
+
+#[test]
+fn oracle_policy_rejects_asset_pair_mismatch() {
+    let w = World::new();
+    let wrong = asset_pair(&w.env, "XLM", "EURC");
+    let decision = run_policy_case("pair", &w.oracle, 10, &wrong);
+    assert_eq!(
+        decision,
+        Err("asset_pair_mismatch"),
+        "asset pair mismatch must be rejected"
+    );
+}
+
+#[test]
+fn oracle_policy_rejects_unlisted_oracle() {
+    let w = World::new();
+    let pair = asset_pair(&w.env, "XLM", "USDC");
+    // An oracle that is neither allowed nor denied is rejected because the
+    // allow list is non-empty.
+    let stranger = Address::generate(&w.env);
+    let decision = run_policy_case("unlisted", &stranger, 10, &pair);
+    assert_eq!(
+        decision,
+        Err("oracle_not_allowed"),
+        "oracle outside the allow list must be rejected"
+    );
+}

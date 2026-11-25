@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet deploy-timelock seed-market demo bindings clean interface-check
+.PHONY: setup build test lint fmt deploy-testnet deploy-timelock seed-market demo bindings clean interface-check budget budget-update
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -73,6 +73,30 @@ kani:
 model-test:
 	python3 model/system_model.py --selftest
 	cargo test -p integration-tests --test system_model
+
+# Worst-case resource benchmarks for every public entrypoint (issue #9).
+# `make budget` builds the contracts, then runs the budget-tests crate
+# single-threaded (the Soroban budget meter is process-global, so parallel
+# tests would cross-contaminate readings) and fails if any measured CPU,
+# memory, or read/write count regresses beyond the documented threshold
+# against the committed baseline in contracts/budget-tests/baseline.json.
+#
+# Baseline refresh procedure:
+#   * When: only after an intentional, reviewed change to a contract's
+#     resource profile (new entrypoint, changed storage layout, added
+#     cross-contract call). Never refresh to silence an unexplained
+#     regression — investigate it first.
+#   * Who: the PR author runs `make budget-update` and commits the resulting
+#     baseline.json; a reviewer must confirm the diff matches the intended
+#     change and that no unrelated entrypoint moved.
+#   * Threshold changes: the per-entrypoint tolerance lives in the baseline
+#     file and is reviewed like code. Raising it requires justification in
+#     the PR description (e.g. a deliberate feature that costs more CPU).
+budget: build
+	cargo test --manifest-path contracts/budget-tests/Cargo.toml -- --test-threads=1
+
+budget-update: build
+	BUDGET_UPDATE=1 cargo test --manifest-path contracts/budget-tests/Cargo.toml -- --test-threads=1
 
 # End-to-end validation of the live agent adapter against a hermetic localnet
 # (issue #66): build → sign → submit → confirm → reconcile one bounded

@@ -42,6 +42,9 @@ CONFIGS=(
   "resolver_invalid       13  an Invalid quorum displaces a pending Yes/No proposal (intended)"
   "resolver_bypass        12  admin resolver swap breaks ResolvedOutcomeHadThreshold (trust)"
   "resolver_live_invalid  13  dishonest Invalid quorum defeats liveness (intended)"
+  "resolver_rotation       0  rotation proposals/acceptance preserve signer eligibility safety"
+  "resolver_hybrid         0  hybrid fallback keeps weighted-key safety invariants"
+  "resolver_hybrid_live    0  honest weighted signers => eventually Resolved under hybrid fallback"
 )
 
 META="$(mktemp -d)"
