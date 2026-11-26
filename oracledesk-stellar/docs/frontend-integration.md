@@ -342,3 +342,26 @@ at least a patch. Read each package's `CHANGELOG.md` and `interface.json` before
 syncing. The manifest describes functions, named/tuple types, numeric errors and
 event payloads directly from the built WASM. Hash-critical resolver types carry
 ADR 0001 compatibility implications. See CONTRIBUTING's interface workflow.
+### Redemption expiry and sweep status
+
+Simulate `settle_state(market_id)` and use the simulation ledger timestamp.
+For a supported market, this single view provides the state needed to render
+redemption timing. `finalized_at == 0` means the market is awaiting resolution
+or void. Once resolved or voided, the expiry is `finalized_at + horizon_secs`
+(saturating u64 addition). The separate `redeem_deadline(market_id)` view exposes
+the same timestamp as an option.
+
+| State | Meaning for claims |
+| --- | --- |
+| `closed == true` | Finalization has swept the remaining collateral |
+| `closed == false`, timestamp at or after expiry | The market is eligible for a sweep. Claims can still be paid until that sweep succeeds |
+| `closed == false`, resolved or voided, timestamp before expiry | Redemption window is open |
+| `finalized_at == 0` | No deadline has been set yet |
+| `NotSupported` | Legacy market with no deadline or expiry sweep. Existing claim rules apply |
+| `MarketNotFound` | Unknown market ID |
+
+An archived-entry response requires a footprint restore before a reliable read.
+A missing deadline alone cannot distinguish an open market from a legacy market
+or an unknown ID. Both views preserve their deployed signatures and data
+layouts. They now read without extending storage TTL. Settlement transactions
+continue to extend TTL through the existing storage helpers.

@@ -1795,19 +1795,28 @@ impl MarketCore {
         Self::load_position(&env, market_id, &holder, close_time)
     }
 
-    /// Outstanding-share accounting for a market (issue #14).
+    /// Outstanding-share accounting for a market, without extending TTL.
     /// `NotSupported` for markets created before this bookkeeping existed.
     pub fn settle_state(env: Env, market_id: u64) -> Result<SettleState, Error> {
-        Self::load_market(&env, market_id)?;
-        Self::load_settle(&env, market_id)
+        let storage = env.storage().persistent();
+        if !storage.has(&DataKey::Market(market_id)) {
+            return Err(Error::MarketNotFound);
+        }
+        storage
+            .get(&DataKey::Settle(market_id))
+            .ok_or(Error::NotSupported)
     }
 
     /// Timestamp after which unredeemed shares are forfeit (see
     /// `finalize_market`). `None` while the market is still Open — its
     /// deadline is not known yet — and for legacy markets, which have no
-    /// deadline and cannot be finalized.
+    /// deadline and cannot be finalized. This view does not extend TTL.
     pub fn redeem_deadline(env: Env, market_id: u64) -> Option<u64> {
-        match Self::load_settle_opt(&env, market_id) {
+        match env
+            .storage()
+            .persistent()
+            .get::<_, SettleState>(&DataKey::Settle(market_id))
+        {
             Some(s) if s.finalized_at > 0 => Some(s.finalized_at.saturating_add(s.horizon_secs)),
             _ => None,
         }
@@ -4081,7 +4090,37 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
+    fn redemption_views_report_expiry_and_closure_without_extending_ttl() {
+        let (env, client, creator, _, _, _) = setup_market();
+        env.ledger().set_max_entry_ttl(1_000);
+        env.ledger().set_min_persistent_entry_ttl(10);
+        let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
+        assert_eq!(client.redeem_deadline(&market_id), None);
+        assert!(!client.settle_state(&market_id).closed);
+
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
+        client.resolve(&market_id, &Outcome::Yes);
+        advance_ledgers(&env, 600 * ttl::LEDGER_SECS);
+        let market = DataKey::Market(market_id);
+        let settle = DataKey::Settle(market_id);
+        let market_ttl = persistent_ttl(&env, &client.address, &market);
+        let settle_ttl = persistent_ttl(&env, &client.address, &settle);
+        assert!(market_ttl < ttl::threshold_for(ttl::long_lived_target(&env)));
+        assert!(settle_ttl < ttl::threshold_for(ttl::long_lived_target(&env)));
+        let deadline = client.redeem_deadline(&market_id).unwrap();
+        assert!(!client.settle_state(&market_id).closed);
+        assert_eq!(persistent_ttl(&env, &client.address, &market), market_ttl);
+        assert_eq!(persistent_ttl(&env, &client.address, &settle), settle_ttl);
+
+        env.ledger().set_timestamp(deadline);
+        assert!(!client.settle_state(&market_id).closed);
+        client.finalize_market(&market_id);
+        assert!(client.settle_state(&market_id).closed);
+        assert_eq!(client.redeem_deadline(&market_id), Some(deadline));
+    }
+
+    #[test]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4090,7 +4129,10 @@ mod test {
         client.resolve(&market_id, &Outcome::Yes);
         let deadline = client.redeem_deadline(&market_id).unwrap();
         env.ledger().set_timestamp(deadline - 1);
-        client.finalize_market(&market_id);
+        assert_eq!(
+            client.try_finalize_market(&market_id),
+            Err(Ok(Error::RedemptionWindowOpen))
+        );
     }
 
     #[test]
