@@ -4072,17 +4072,22 @@ mod test {
     #[test]
     fn redemption_views_report_expiry_and_closure_without_extending_ttl() {
         let (env, client, creator, _, _, _) = setup_market();
+        env.ledger().set_max_entry_ttl(1_000);
+        env.ledger().set_min_persistent_entry_ttl(10);
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
         assert_eq!(client.redeem_deadline(&market_id), None);
         assert!(!client.settle_state(&market_id).closed);
 
-        advance_ledgers(&env, ttl::DAY_SECS);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + 60_001);
         client.resolve(&market_id, &Outcome::Yes);
-        advance_ledgers(&env, ttl::DAY_SECS);
+        advance_ledgers(&env, 600 * ttl::LEDGER_SECS);
         let market = DataKey::Market(market_id);
         let settle = DataKey::Settle(market_id);
         let market_ttl = persistent_ttl(&env, &client.address, &market);
         let settle_ttl = persistent_ttl(&env, &client.address, &settle);
+        assert!(market_ttl < ttl::threshold_for(ttl::long_lived_target(&env)));
+        assert!(settle_ttl < ttl::threshold_for(ttl::long_lived_target(&env)));
         let deadline = client.redeem_deadline(&market_id).unwrap();
         assert!(!client.settle_state(&market_id).closed);
         assert_eq!(persistent_ttl(&env, &client.address, &market), market_ttl);
@@ -4096,7 +4101,6 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #24)")]
     fn finalize_before_deadline_rejected() {
         let (env, client, creator, _, _, _) = setup_market();
         let market_id = create_market_with(&env, &client, &creator, 5000, 60_000);
@@ -4105,7 +4109,10 @@ mod test {
         client.resolve(&market_id, &Outcome::Yes);
         let deadline = client.redeem_deadline(&market_id).unwrap();
         env.ledger().set_timestamp(deadline - 1);
-        client.finalize_market(&market_id);
+        assert_eq!(
+            client.try_finalize_market(&market_id),
+            Err(Ok(Error::RedemptionWindowOpen))
+        );
     }
 
     #[test]

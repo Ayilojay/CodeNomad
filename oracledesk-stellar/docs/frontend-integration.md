@@ -354,7 +354,7 @@ the same timestamp as an option.
 | State | Meaning for claims |
 | --- | --- |
 | `closed == true` | Finalization has swept the remaining collateral |
-| `closed == false`, timestamp at or after expiry | Claims have expired and the market is eligible for a sweep |
+| `closed == false`, timestamp at or after expiry | The market is eligible for a sweep. Claims can still be paid until that sweep succeeds |
 | `closed == false`, resolved or voided, timestamp before expiry | Redemption window is open |
 | `finalized_at == 0` | No deadline has been set yet |
 | `NotSupported` | Legacy market with no deadline or expiry sweep. Existing claim rules apply |
