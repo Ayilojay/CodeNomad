@@ -2298,6 +2298,7 @@ impl Resolver {
             return Err(Error::WrongMode);
         }
         Self::require_admin(&env)?;
+        Self::require_escalation_open(&env, market_id, config.escalation_timeout)?;
         Self::apply_verdict(&env, market_id, verdict)
     }
 
@@ -2317,7 +2318,7 @@ impl Resolver {
         if !Self::contains(&members, &member) {
             return Err(Error::NotSigner);
         }
-        Self::open_dispute(&env, market_id)?;
+        Self::require_escalation_open(&env, market_id, config.escalation_timeout)?;
         let vote = DataKey::EscalationVote(market_id, member);
         if env.storage().persistent().has(&vote) {
             return Err(Error::AlreadyAttested);
@@ -2473,6 +2474,14 @@ impl Resolver {
             return Err(Error::AlreadyFinalized);
         }
         Ok(dispute)
+    }
+
+    fn require_escalation_open(env: &Env, market_id: u64, timeout: u64) -> Result<(), Error> {
+        let dispute = Self::open_dispute(env, market_id)?;
+        if env.ledger().timestamp() >= dispute.opened_at.saturating_add(timeout) {
+            return Err(Error::DisputeWindowClosed);
+        }
+        Ok(())
     }
 
     /// Marks an open dispute's bond as refundable to its disputer (a no-op if
@@ -5197,6 +5206,30 @@ mod test {
         d.f.resolver.claim_dispute_bond(&d.f.market_id);
         assert_eq!(balance(&d, &d.disputer), 2 * BOND);
         assert_escrow(&d, 0);
+    }
+
+    #[test]
+    fn escalation_timeout_excludes_late_rulings_and_votes() {
+        for committee in [false, true] {
+            let d = dispute_fixture(committee);
+            open(&d);
+            let deadline = d.f.env.ledger().timestamp() + 1_000;
+            d.f.env.ledger().set_timestamp(deadline);
+            let result = if committee {
+                d.f.resolver
+                    .try_escalation_attest(&d.f.market_id, &d.members[0], &Verdict::No)
+            } else {
+                d.f.resolver.try_settle_dispute(&d.f.market_id, &Verdict::No)
+            };
+            assert_eq!(result, Err(Ok(Error::DisputeWindowClosed)));
+            assert_eq!(status(&d), MarketStatus::Open);
+            assert_escrow(&d, BOND);
+            d.f.resolver.expire_dispute(&d.f.market_id);
+            d.f.resolver.claim_dispute_bond(&d.f.market_id);
+            assert_eq!(status(&d), MarketStatus::Void);
+            assert_eq!(balance(&d, &d.disputer), 2 * BOND);
+            assert_escrow(&d, 0);
+        }
     }
 
     #[test]
